@@ -591,6 +591,7 @@ class NormalGate:
 
 def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           smoothing_sigma=1.0, gradient_sigma=None, use_normal_gate=True,
+                          speed_floor=None,
                           num_integration_points=None, gradient_gate=None,
                           gate_sigma_scale=2.0, gate_coherence_threshold=0.7,
                           gate_mode='soft', verbose=False):
@@ -604,6 +605,7 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
     # Only Velocity.nii.gz is read back (below); the cumulative Forward/Inverse
     # fields are never touched by the propagation and cost more than the solve.
     kwargs = dict(verbose=verbose, smoothing_sigma=smoothing_sigma,
+                  speed_floor=speed_floor,
                    velocity_field_prefix=out_prefix, ref_img=ref_img,
                    cumulative_fields=False, return_velocity=True)
     if gradient_gate is not None:
@@ -1389,7 +1391,9 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
               escape_clearance=0.25, edge_floor=False, edge_ts=(0.5,),
               face_floor=False,
               retract_from_round=None, retract_step=0.25, retract_min_s=1.0,
-              retract_rings=0, retract_stats=None):
+              retract_rings=0, retract_stats=None,
+              damp_on_intersect=False, damp_factor=0.5, damp_from_round=0,
+              damp_on_wm=False, damp_wm_floor=None, damp_stats=None):
     """mode='naive': single-pass, 10-step propagation with the raw
     (un-smoothed) vertex normals used only as a floor projection against
     inward motion — i.e. the shipped/obvious approach with none of this
@@ -1534,6 +1538,8 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
     if pin_mask is not None and pin_mask.any():
         pin_w = _pin_weights(pin_mask, Wm, pin_feather)[:, None]
     cur = white_verts
+    speed = np.ones(len(white_verts)) if (damp_on_intersect or damp_on_wm) else None
+    damp_info = dict(damped=0, rounds_damped=0, min_speed=1.0, damped_wm=0)
     keep_traj = return_trajectory or retract_from_round is not None
     traj = [np.asarray(white_verts, float).copy()] if keep_traj else None
     for rnd in range(rounds):
@@ -1581,7 +1587,10 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
                 step_tkr[escaping] = need[:, None] * N[escaping]
             else:
                 step_tkr[escaping] = np.minimum(mag[escaping], need)[:, None] * N[escaping]
+        if speed is not None:
+            step_tkr = step_tkr * speed[:, None]
         stepped = cur + step_tkr
+        prev_round = np.asarray(cur, float).copy()
         if floor_after is None or rnd < floor_after_round:
             round_floor = floor
         elif np.ndim(floor_after) > 0:
@@ -1608,6 +1617,36 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
                 stats=repair_stats)
             if pin_w is not None:
                 cur = pin_w * pinned_start + (1.0 - pin_w) * cur
+        if speed is not None and rnd >= damp_from_round:
+            bad = np.zeros(len(cur), bool)
+            if damp_on_intersect:
+                sel = _self_intersecting_faces(cur, faces)
+                if sel is not None and sel.any():
+                    bad[np.unique(faces[sel])] = True
+            if damp_on_wm:
+                thr = (round_floor if damp_wm_floor is None else damp_wm_floor)
+                thr = (np.full(len(cur), float(thr)) if np.isscalar(thr)
+                       else np.asarray(thr, float))
+                sd_now = map_coordinates(sdt, tovox(cur).T, order=1, mode='nearest')
+                sd_was = map_coordinates(sdt, tovox(prev_round).T, order=1, mode='nearest')
+                # APPROACHING, not merely near: every vertex starts ON the white
+                # surface at signed distance ~0, so a bare proximity test fires on the
+                # whole surface at round 0 and brakes everything (measured: cortex half
+                # as thick). Requiring the distance to have DECREASED this round
+                # restricts it to vertices the field is driving inward.
+                near = (sd_now < thr) & (sd_now < sd_was)
+                if no_push is not None:
+                    near &= ~no_push
+                bad |= near
+                damp_info['damped_wm'] = int(near.sum())
+            if pin_w is not None:
+                bad &= (pin_w[:, 0] if pin_w.ndim > 1 else pin_w) < 1.0
+            if bad.any():
+                cur[bad] = prev_round[bad]
+                speed[bad] *= damp_factor
+                damp_info['damped'] = int((speed < 1.0).sum())
+                damp_info['rounds_damped'] += 1
+                damp_info['min_speed'] = float(speed.min())
         if traj is not None:
             traj.append(np.asarray(cur, float).copy())
         if retract_from_round is not None and rnd >= retract_from_round:
@@ -1791,6 +1830,11 @@ class PipelineConfig:
     # and moves 0.55% of vertices at all (whole-surface mean 0.0003 mm). Its earlier
     # validation was measured through the half-voxel frame error.
     use_escape: bool = False  # mode='best' only; see propagate()
+    damp_on_intersect: bool = False  # preventive; costs one exact test per round
+    damp_on_wm: bool = False         # measured NOT to work -- see the commit message
+    damp_wm_floor: float = None
+    damp_factor: float = 0.5
+    speed_floor: float = None        # clamp DiReCT's speed term; None = ANTs behaviour
 
 
 NAIVE_CONFIG = PipelineConfig(
@@ -1848,7 +1892,8 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
             gradient_gate=config.gradient_gate,
             use_normal_gate=config.use_normal_gate,
             gate_sigma_scale=config.gate_sigma_scale,
-            gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode)
+            gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode,
+            speed_floor=config.speed_floor)
 
     if thickness_dir is not None and thickness is not None:
         # seg does not depend on the solve, so it is always valid to write.
@@ -1917,7 +1962,11 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
                           no_push=mask,
                           pin_mask=pin, step_scale=config.step_scale,
                           pin_feather=config.pin_feather,
-                          escape_in_no_push=config.escape_in_no_cortex)
+                          escape_in_no_push=config.escape_in_no_cortex,
+                          damp_on_intersect=config.damp_on_intersect,
+                          damp_on_wm=config.damp_on_wm,
+                          damp_wm_floor=config.damp_wm_floor,
+                          damp_factor=config.damp_factor)
         if out_dir:
             nib.freesurfer.io.write_geometry(
                 os.path.join(out_dir, '%s.pial.%s' % (hemi, tag)),
@@ -2045,6 +2094,16 @@ def main():
                          "always come from the crisp mask, so what this changes is only that the "
                          "solve's WM/GM priors carry the sub-voxel boundary fraction, with total "
                          "tissue conserved.")
+    p.add_argument('--damp-on-intersect', action='store_true',
+                    help='revert and slow any vertex in an intersecting face after each round')
+    p.add_argument('--damp-on-wm', action='store_true',
+                    help='same for vertices approaching WM. Measured not to work; see the docs.')
+    p.add_argument('--damp-wm-floor', type=float, default=None,
+                    help='threshold for --damp-on-wm (default: the round floor)')
+    p.add_argument('--damp-factor', type=float, default=0.5,
+                    help='step multiplier applied each time a vertex offends (default 0.5)')
+    p.add_argument('--speed-floor', type=float, default=None, metavar='V',
+                    help="clamp DiReCT's speed term at V. DEVIATES FROM ANTs.")
     p.add_argument('--seg-wm', action='store_true',
                     help="take white matter for the solve, the floor and the escape rule from the "
                          "segmentation (seg == 3 on the WM logits) instead of from the white "
@@ -2147,6 +2206,11 @@ def main():
     naive_config = dataclasses.replace(NAIVE_CONFIG)
     best_config = dataclasses.replace(BEST_CONFIG, smoothing_sigma=args.sigma, dip_threshold=args.dip_threshold,
                                        use_escape=args.escape,
+                                       damp_on_intersect=args.damp_on_intersect,
+                                       damp_on_wm=args.damp_on_wm,
+                                       damp_wm_floor=args.damp_wm_floor,
+                                       damp_factor=args.damp_factor,
+                                       speed_floor=args.speed_floor,
                                        gradient_sigma=args.grad_sigma,
                                        propagation_rounds=args.rounds,
                                        num_integration_points=args.integration_points,

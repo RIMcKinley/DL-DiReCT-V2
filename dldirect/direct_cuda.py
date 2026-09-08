@@ -394,6 +394,7 @@ def kelly_kapowski_cuda(
     cumulative_fields=True,
     return_velocity=False,
     gradient_gate=1e-3,
+    speed_floor=None,
     ref_img=None,
     voxel_size=None,
 ):
@@ -625,6 +626,12 @@ def kelly_kapowski_cuda(
 
             # NaN protection
             speed = torch.where(torch.isfinite(speed), speed, torch.zeros_like(speed))
+            if speed_floor is not None:
+                # DEVIATION FROM ANTs. speed = -(warped_wm - gm) * gm goes negative
+                # where the warped white matter has overtaken the grey-matter prior,
+                # which reverses the displacement. Flooring forbids that reversal.
+                # itkDiReCTImageFilter.hxx applies no such floor.
+                speed = speed.clamp(min=speed_floor)
 
             # Update forward incremental field (voxel-space displacement)
             forward_incremental = forward_incremental + grad_safe * speed

@@ -591,7 +591,10 @@ class NormalGate:
 
 def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           smoothing_sigma=1.0, gradient_sigma=None, use_normal_gate=True,
-                          speed_floor=None,
+                          speed_floor=None, freeze_wm_field=False,
+                          freeze_wm_direction=False, wm_project_smoothing=False,
+                          freeze_wm_release_final=False, freeze_wm_until=None,
+                          freeze_wm_weight=1.0,
                           num_integration_points=None, gradient_gate=None,
                           gate_sigma_scale=2.0, gate_coherence_threshold=0.7,
                           gate_mode='soft', verbose=False):
@@ -605,7 +608,12 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
     # Only Velocity.nii.gz is read back (below); the cumulative Forward/Inverse
     # fields are never touched by the propagation and cost more than the solve.
     kwargs = dict(verbose=verbose, smoothing_sigma=smoothing_sigma,
-                  speed_floor=speed_floor,
+                  speed_floor=speed_floor, freeze_wm_field=freeze_wm_field,
+                  freeze_wm_direction=freeze_wm_direction,
+                  wm_project_smoothing=wm_project_smoothing,
+                  freeze_wm_release_final=freeze_wm_release_final,
+                  freeze_wm_until=freeze_wm_until,
+                  freeze_wm_weight=freeze_wm_weight,
                    velocity_field_prefix=out_prefix, ref_img=ref_img,
                    cumulative_fields=False, return_velocity=True)
     if gradient_gate is not None:
@@ -1835,6 +1843,12 @@ class PipelineConfig:
     damp_wm_floor: float = None
     damp_factor: float = 0.5
     speed_floor: float = None        # clamp DiReCT's speed term; None = ANTs behaviour
+    freeze_wm_field: bool = False    # hold the WM-side field at its iteration-1 value
+    freeze_wm_direction: bool = False # hold only its ORIENTATION; magnitude evolves
+    wm_project_smoothing: bool = False # in WM, project the smoothing update onto the existing axis
+    freeze_wm_release_final: bool = False # release the freeze for the last iterations
+    freeze_wm_until: int = None      # freeze only the first N solve iterations
+    freeze_wm_weight: float = 1.0    # 1 = overwrite with the frozen field, 0.5 = average
 
 
 NAIVE_CONFIG = PipelineConfig(
@@ -1893,7 +1907,12 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
             use_normal_gate=config.use_normal_gate,
             gate_sigma_scale=config.gate_sigma_scale,
             gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode,
-            speed_floor=config.speed_floor)
+            speed_floor=config.speed_floor, freeze_wm_field=config.freeze_wm_field,
+            freeze_wm_direction=config.freeze_wm_direction,
+            wm_project_smoothing=config.wm_project_smoothing,
+            freeze_wm_release_final=config.freeze_wm_release_final,
+            freeze_wm_until=config.freeze_wm_until,
+            freeze_wm_weight=config.freeze_wm_weight)
 
     if thickness_dir is not None and thickness is not None:
         # seg does not depend on the solve, so it is always valid to write.
@@ -2102,6 +2121,26 @@ def main():
                     help='threshold for --damp-on-wm (default: the round floor)')
     p.add_argument('--damp-factor', type=float, default=0.5,
                     help='step multiplier applied each time a vertex offends (default 0.5)')
+    p.add_argument('--freeze-wm-weight', type=float, default=1.0, metavar='W',
+                    help='weight of the frozen field when blending with the smoothed one in WM '
+                         '(1 = overwrite, 0.5 = average, 0 = no freeze).')
+    p.add_argument('--freeze-wm-until', type=int, default=None, metavar='N',
+                    help='with --freeze-wm-field, freeze only the first N solve iterations, '
+                         'then let the WM shell be re-established by ordinary smoothing.')
+    p.add_argument('--release-final', action='store_true',
+                    help='with --freeze-wm-field, release the freeze for the final iterations so '
+                         'the field the surface samples comes from ordinary gated smoothing.')
+    p.add_argument('--wm-project-smoothing', action='store_true',
+                    help='inside white matter, keep only the component of the smoothed field '
+                         'along the direction it already had, so smoothing can change its '
+                         'magnitude but not rotate it. DEVIATES FROM ANTs.')
+    p.add_argument('--freeze-wm-direction', action='store_true',
+                    help='hold the ORIENTATION of the WM-side field at its first-iteration '
+                         'value while letting its magnitude evolve. DEVIATES FROM ANTs.')
+    p.add_argument('--freeze-wm-field', action='store_true',
+                    help='hold the velocity inside white matter at its first-iteration value. '
+                         'WM velocity is only smoothing spill-over from cortex, and about half '
+                         'the white-surface vertices sample it. DEVIATES FROM ANTs.')
     p.add_argument('--speed-floor', type=float, default=None, metavar='V',
                     help="clamp DiReCT's speed term at V. DEVIATES FROM ANTs.")
     p.add_argument('--seg-wm', action='store_true',
@@ -2211,6 +2250,12 @@ def main():
                                        damp_wm_floor=args.damp_wm_floor,
                                        damp_factor=args.damp_factor,
                                        speed_floor=args.speed_floor,
+                                       freeze_wm_field=args.freeze_wm_field,
+                                       freeze_wm_direction=args.freeze_wm_direction,
+                                       wm_project_smoothing=args.wm_project_smoothing,
+                                       freeze_wm_release_final=args.release_final,
+                                       freeze_wm_until=args.freeze_wm_until,
+                                       freeze_wm_weight=args.freeze_wm_weight,
                                        gradient_sigma=args.grad_sigma,
                                        propagation_rounds=args.rounds,
                                        num_integration_points=args.integration_points,

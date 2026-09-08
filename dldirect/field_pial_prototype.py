@@ -1803,7 +1803,7 @@ class PipelineConfig:
     gate_sigma_scale: float = 2.0
     gate_coherence_threshold: float = 0.7
     gate_mode: str = 'soft'
-    gate_everywhere: str = None      # None | 'wide' | 'same': mask-average outside bipolar too
+    gate_everywhere: str = 'same'    # None | 'wide' | 'same': mask-average outside bipolar too
     # 1.0 matches the shipped solver, keeping --write-thickness comparable to
     # stock DiReCT; 0.35 was the surface-tested best. See module docstring (2).
     smoothing_sigma: float = 1.0
@@ -1859,10 +1859,10 @@ class PipelineConfig:
     damp_wm_floor: float = None
     damp_factor: float = 0.5
     speed_floor: float = None        # clamp DiReCT's speed term; None = ANTs behaviour
-    freeze_wm_field: bool = False    # hold the WM-side field at its iteration-1 value
+    freeze_wm_field: bool = True     # hold the WM-side field at its iteration-1 value
     freeze_wm_direction: bool = False # hold only its ORIENTATION; magnitude evolves
     wm_project_smoothing: bool = False # in WM, project the smoothing update onto the existing axis
-    freeze_wm_release_final: bool = False # release the freeze for the last iterations
+    freeze_wm_release_final: bool = True  # release the freeze for the last iteration
     freeze_wm_until: int = None      # freeze only the first N solve iterations
     freeze_wm_weight: float = 1.0    # 1 = overwrite with the frozen field, 0.5 = average
 
@@ -2093,11 +2093,11 @@ def main():
                          'unchanged -- i.e. take more, shorter steps rather than travelling further')
     p.add_argument('--no-sulcal-sheet', action='store_true',
                     help='disable the fractional sulcal-CSF-sheet repair (fix #3). Diagnostic.')
-    p.add_argument('--gate-everywhere', choices=('wide','same'), default=None,
+    p.add_argument('--gate-everywhere', choices=('wide','same','off'), default=None,
                     help="apply the normal-masked averaging at EVERY voxel, not only where the "
                          "WM-normal coherence is below threshold. 'wide' uses the widened sigma "
                          "the bipolar branch uses; 'same' uses the plain sigma so only the "
-                         "direction weighting changes.")
+                         "direction weighting changes. 'off' restores the shipped behaviour of gating only the bipolar voxels. Default: same.")
     p.add_argument('--no-normal-gate', action='store_true',
                     help='disable the interface-normal gating of velocity smoothing (fix #1) and '
                          "use the solver's plain isotropic smoothing. Diagnostic.")
@@ -2159,6 +2159,9 @@ def main():
     p.add_argument('--freeze-wm-direction', action='store_true',
                     help='hold the ORIENTATION of the WM-side field at its first-iteration '
                          'value while letting its magnitude evolve. DEVIATES FROM ANTs.')
+    p.add_argument('--no-freeze-wm', action='store_true',
+                    help='disable the WM-field freeze (on by default, released for the final '
+                         'iteration so the field the surface rides is ordinarily smoothed).')
     p.add_argument('--freeze-wm-field', action='store_true',
                     help='hold the velocity inside white matter at its first-iteration value. '
                          'WM velocity is only smoothing spill-over from cortex, and about half '
@@ -2272,10 +2275,11 @@ def main():
                                        damp_wm_floor=args.damp_wm_floor,
                                        damp_factor=args.damp_factor,
                                        speed_floor=args.speed_floor,
-                                       freeze_wm_field=args.freeze_wm_field,
+                                       freeze_wm_field=(not args.no_freeze_wm),
                                        freeze_wm_direction=args.freeze_wm_direction,
                                        wm_project_smoothing=args.wm_project_smoothing,
-                                       freeze_wm_release_final=args.release_final,
+                                       freeze_wm_release_final=(True if not args.release_final
+                                                                else True),
                                        freeze_wm_until=args.freeze_wm_until,
                                        freeze_wm_weight=args.freeze_wm_weight,
                                        gradient_sigma=args.grad_sigma,
@@ -2288,7 +2292,10 @@ def main():
                                        exclude_no_cortex=not args.no_exclude,
                                        pin_scope=args.pin_scope,
                                        use_normal_gate=not args.no_normal_gate,
-                                       gate_everywhere=args.gate_everywhere,
+                                       gate_everywhere=(BEST_CONFIG.gate_everywhere
+                                                        if args.gate_everywhere is None else
+                                                        (None if args.gate_everywhere == 'off'
+                                                         else args.gate_everywhere)),
                                        use_sulcal_sheet=not args.no_sulcal_sheet,
                                        pin_feather=args.pin_feather,
                                        pin_rings=args.pin_rings,

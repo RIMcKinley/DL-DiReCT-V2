@@ -519,11 +519,13 @@ class NormalGate:
     own direction — unreliable exactly where it matters) with a gate on
     the WM interface normal (purely geometric)."""
 
-    def __init__(self, seg, sigma_scale=2.0, coherence_threshold=0.7, mode='soft'):
+    def __init__(self, seg, sigma_scale=2.0, coherence_threshold=0.7, mode='soft',
+                 everywhere=None):
         self.seg = seg
         self.sigma_scale = sigma_scale
         self.coherence_threshold = coherence_threshold
         self.mode = mode
+        self.everywhere = everywhere
         self._orig = None
         self._bipolar_cache = {}
         self._nu_t = None
@@ -573,7 +575,19 @@ class NormalGate:
             bipolar = self._bipolar_cache[key]
             masked = normal_masked_smooth(vol, sigma * self.sigma_scale, dev,
                                            truncate=truncate / self.sigma_scale, mode=self.mode)
-            out = torch.where(bipolar, masked, plain)
+            if self.everywhere == 'wide':
+                # Normal-masked averaging EVERYWHERE, at the widened sigma the
+                # bipolar branch uses. The shipped gate applies it only where the
+                # WM-normal coherence is below threshold (11.9% of the boundary
+                # band); elsewhere a plain Gaussian mixes freely across banks.
+                out = masked
+            elif self.everywhere == 'same':
+                # Masked averaging everywhere at the UNWIDENED sigma, so the only
+                # difference from `plain` is the direction weighting.
+                out = normal_masked_smooth(vol, sigma, dev, truncate=truncate,
+                                           mode=self.mode)
+            else:
+                out = torch.where(bipolar, masked, plain)
             return (out, float(bipolar.float().mean())) if return_stats else out
 
         self._orig = _direct_cuda_module.selective_masked_smooth_3d
@@ -591,6 +605,7 @@ class NormalGate:
 
 def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           smoothing_sigma=1.0, gradient_sigma=None, use_normal_gate=True,
+                          gate_everywhere=None,
                           num_integration_points=None, gradient_gate=None,
                           gate_sigma_scale=2.0, gate_coherence_threshold=0.7,
                           gate_mode='soft', verbose=False):
@@ -619,7 +634,8 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
         kwargs.update(velocity_smooth_selective=gate_coherence_threshold,
                        velocity_smooth_mask_mode=gate_mode)
         with NormalGate(seg, sigma_scale=gate_sigma_scale,
-                         coherence_threshold=gate_coherence_threshold, mode=gate_mode):
+                         coherence_threshold=gate_coherence_threshold, mode=gate_mode,
+                         everywhere=gate_everywhere):
             thickness, velocity = kelly_kapowski_cuda(seg, gm_prob, wm_prob, **kwargs)
     else:
         thickness, velocity = kelly_kapowski_cuda(seg, gm_prob, wm_prob, **kwargs)
@@ -1741,6 +1757,7 @@ class PipelineConfig:
     gate_sigma_scale: float = 2.0
     gate_coherence_threshold: float = 0.7
     gate_mode: str = 'soft'
+    gate_everywhere: str = None      # None | 'wide' | 'same': mask-average outside bipolar too
     # 1.0 matches the shipped solver, keeping --write-thickness comparable to
     # stock DiReCT; 0.35 was the surface-tested best. See module docstring (2).
     smoothing_sigma: float = 1.0
@@ -1848,7 +1865,8 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
             gradient_gate=config.gradient_gate,
             use_normal_gate=config.use_normal_gate,
             gate_sigma_scale=config.gate_sigma_scale,
-            gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode)
+            gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode,
+            gate_everywhere=config.gate_everywhere)
 
     if thickness_dir is not None and thickness is not None:
         # seg does not depend on the solve, so it is always valid to write.
@@ -2008,6 +2026,11 @@ def main():
                          'unchanged -- i.e. take more, shorter steps rather than travelling further')
     p.add_argument('--no-sulcal-sheet', action='store_true',
                     help='disable the fractional sulcal-CSF-sheet repair (fix #3). Diagnostic.')
+    p.add_argument('--gate-everywhere', choices=('wide','same'), default=None,
+                    help="apply the normal-masked averaging at EVERY voxel, not only where the "
+                         "WM-normal coherence is below threshold. 'wide' uses the widened sigma "
+                         "the bipolar branch uses; 'same' uses the plain sigma so only the "
+                         "direction weighting changes.")
     p.add_argument('--no-normal-gate', action='store_true',
                     help='disable the interface-normal gating of velocity smoothing (fix #1) and '
                          "use the solver's plain isotropic smoothing. Diagnostic.")
@@ -2157,6 +2180,7 @@ def main():
                                        exclude_no_cortex=not args.no_exclude,
                                        pin_scope=args.pin_scope,
                                        use_normal_gate=not args.no_normal_gate,
+                                       gate_everywhere=args.gate_everywhere,
                                        use_sulcal_sheet=not args.no_sulcal_sheet,
                                        pin_feather=args.pin_feather,
                                        pin_rings=args.pin_rings,

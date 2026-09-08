@@ -688,18 +688,6 @@ def kelly_kapowski_cuda(
             if verbose:
                 print(f"    Saved fields for iteration {iteration + 1}")
 
-        if velocity_field_prefix and iteration == max_iterations - 1:
-            if cumulative_fields:
-                _save_velocity_fields(velocity_field_prefix, ref_img,
-                                      inverse_field_snapshots, forward_field_snapshots)
-            # the underlying velocity field, which the integration composes
-            # num_integration_points times; [D, H, W, 3] in voxels (d, h, w)
-            vel = velocity_field[0].cpu().numpy().transpose(1, 2, 3, 0).astype(np.float32)
-            velocity_out = vel
-            vimg = nib.Nifti1Image(vel, ref_img.affine)
-            vimg.header['xyzt_units'] = 10
-            nib.save(vimg, '{}Velocity.nii.gz'.format(velocity_field_prefix))
-
         # ---- After inner loop: update velocity and thickness ----
 
         # Smooth hit and total images
@@ -750,6 +738,24 @@ def kelly_kapowski_cuda(
         else:
             velocity_field = gaussian_smooth_3d(
                 velocity_field, sigma_now, device, zero_boundary=False)
+
+        if velocity_field_prefix and iteration == max_iterations - 1:
+            # AFTER the increment, the thickness-prior scaling and the velocity
+            # smoothing -- this is the field the propagation actually rides.
+            # It used to be written before all three, so the saved field was one
+            # iteration stale: it omitted the final increment and had never been
+            # through the last smoothing pass (and with max_iterations=1 it wrote
+            # the initial zeros).
+            if cumulative_fields:
+                _save_velocity_fields(velocity_field_prefix, ref_img,
+                                      inverse_field_snapshots, forward_field_snapshots)
+            # the underlying velocity field, which the integration composes
+            # num_integration_points times; [D, H, W, 3] in voxels (d, h, w)
+            vel = velocity_field[0].cpu().numpy().transpose(1, 2, 3, 0).astype(np.float32)
+            velocity_out = vel
+            vimg = nib.Nifti1Image(vel, ref_img.affine)
+            vimg.header['xyzt_units'] = 10
+            nib.save(vimg, '{}Velocity.nii.gz'.format(velocity_field_prefix))
 
         # Constrain to active region
         velocity_field = velocity_field * active_mask

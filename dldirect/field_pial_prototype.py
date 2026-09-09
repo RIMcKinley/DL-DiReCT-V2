@@ -628,7 +628,8 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           freeze_wm_weight=1.0, gate_everywhere=None,
                           num_integration_points=None, gradient_gate=None,
                           gate_sigma_scale=2.0, gate_coherence_threshold=0.7,
-                          gate_mode='soft', gate_denominator='masked', verbose=False):
+                          gate_mode='soft', gate_denominator='masked',
+                          velocity_smooth_sigma=None, verbose=False):
     """Solve for the DiReCT velocity field. With `use_normal_gate=True`
     (the tested-best configuration) this installs NormalGate for the
     duration of the solve and requests the solver's masked-smoothing path;
@@ -649,6 +650,11 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                    cumulative_fields=False, return_velocity=True)
     if gradient_gate is not None:
         kwargs['gradient_gate'] = gradient_gate
+    if velocity_smooth_sigma is not None:
+        # ANTs' -b (m_SmoothingVelocityFieldVariance, default 1.5 -> sigma
+        # sqrt(1.5)). 0 disables velocity-field smoothing entirely:
+        # gaussian_smooth_3d returns the input unchanged at sigma <= 0.
+        kwargs['velocity_smooth_sigma'] = velocity_smooth_sigma
     if num_integration_points is not None:
         # The saved Velocity.nii.gz is a PER-INTEGRATION-POINT field: the solve
         # composes it num_integration_points times. propagate() applies it once
@@ -1823,6 +1829,8 @@ class PipelineConfig:
     # 'masked' = the shipped gate; 'plain' divides by the plain Gaussian weight
     # sum so opposing neighbours attenuate rather than being renormalised away.
     gate_denominator: str = 'masked'
+    # ANTs' -b, in voxels. None keeps the solver default sqrt(1.5) = 1.2247.
+    velocity_smooth_sigma: float = None
     gate_everywhere: str = 'same'    # None | 'wide' | 'same': mask-average outside bipolar too
     # 1.0 matches the shipped solver, keeping --write-thickness comparable to
     # stock DiReCT; 0.35 was the surface-tested best. See module docstring (2).
@@ -1944,6 +1952,7 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
             gate_sigma_scale=config.gate_sigma_scale,
             gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode,
             gate_denominator=config.gate_denominator,
+            velocity_smooth_sigma=config.velocity_smooth_sigma,
             speed_floor=config.speed_floor, freeze_wm_field=config.freeze_wm_field,
             freeze_wm_direction=config.freeze_wm_direction,
             wm_project_smoothing=config.wm_project_smoothing,
@@ -2119,6 +2128,11 @@ def main():
                          "WM-normal coherence is below threshold. 'wide' uses the widened sigma "
                          "the bipolar branch uses; 'same' uses the plain sigma so only the "
                          "direction weighting changes. 'off' restores the shipped behaviour of gating only the bipolar voxels. Default: same.")
+    p.add_argument('--velocity-smooth-sigma', type=float, default=None, metavar='B',
+                    help="ANTs' -b: sigma in voxels for the velocity-field smoothing "
+                         "(default sqrt(1.5) = 1.2247). 0 disables that smoothing "
+                         "entirely. Independent of --sigma, which sets the gradient "
+                         "and hit/total kernels.")
     p.add_argument('--gate-denominator', choices=('masked', 'plain'), default='masked',
                     help="how the normal-gated smoothing normalises. 'masked' (default, "
                          "shipped) divides by the sum of the direction weights, so a voxel "
@@ -2320,6 +2334,7 @@ def main():
                                        pin_scope=args.pin_scope,
                                        use_normal_gate=not args.no_normal_gate,
                                        gate_denominator=args.gate_denominator,
+                                       velocity_smooth_sigma=args.velocity_smooth_sigma,
                                        gate_everywhere=(BEST_CONFIG.gate_everywhere
                                                         if args.gate_everywhere is None else
                                                         (None if args.gate_everywhere == 'off'

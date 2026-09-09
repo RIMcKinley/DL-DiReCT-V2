@@ -520,12 +520,22 @@ class NormalGate:
     the WM interface normal (purely geometric)."""
 
     def __init__(self, seg, sigma_scale=2.0, coherence_threshold=0.7, mode='soft',
-                 everywhere=None):
+                 everywhere=None, denominator='masked'):
         self.seg = seg
         self.sigma_scale = sigma_scale
         self.coherence_threshold = coherence_threshold
         self.mode = mode
         self.everywhere = everywhere
+        # 'masked' (the shipped gate): divide by the sum of the DIRECTION
+        # weights, so a voxel whose neighbours mostly disagree still gets a
+        # full-magnitude average of the few that agree -- direction is cleaned
+        # but magnitude is renormalised back up.
+        # 'plain': divide by the plain Gaussian weight sum instead. Disagreeing
+        # neighbours then contribute ~nothing to the numerator while still
+        # counting in the divisor, so opposing fields slow each other down
+        # instead of being renormalised away. Direction still comes only from
+        # the agreeing neighbours.
+        self.denominator = denominator
         self._orig = None
         self._bipolar_cache = {}
         self._nu_t = None
@@ -548,6 +558,7 @@ class NormalGate:
             padded_nu = F.pad(self._nu_t, (r, r, r, r, r, r), mode='replicate')
             acc = torch.zeros_like(vol)
             wacc = torch.zeros((vol.shape[0], 1, D, H, W), device=dev)
+            pacc = 0.0                      # plain Gaussian weight sum (a scalar)
             for dz in range(-r, r + 1):
                 for dy in range(-r, r + 1):
                     for dx in range(-r, r + 1):
@@ -560,6 +571,12 @@ class NormalGate:
                         dw = (dot > 0).to(vol.dtype) if mode == 'hard' else ((1.0 + dot) * 0.5)
                         acc = acc + wgt * dw * sh
                         wacc = wacc + wgt * dw
+                        pacc = pacc + wgt
+            if self.denominator == 'plain':
+                # Same numerator, undivided by the agreement. Accumulated rather
+                # than assumed to be 1.0, so the weights skipped below 1e-6 are
+                # excluded from both sides consistently.
+                return acc / max(pacc, 1e-6)
             return torch.where(wacc > 1e-6, acc / wacc.clamp(min=1e-6), vol)
 
         def selective_normal(vol, sigma, dev, truncate=2.0, mode='hard',
@@ -611,7 +628,7 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           freeze_wm_weight=1.0, gate_everywhere=None,
                           num_integration_points=None, gradient_gate=None,
                           gate_sigma_scale=2.0, gate_coherence_threshold=0.7,
-                          gate_mode='soft', verbose=False):
+                          gate_mode='soft', gate_denominator='masked', verbose=False):
     """Solve for the DiReCT velocity field. With `use_normal_gate=True`
     (the tested-best configuration) this installs NormalGate for the
     duration of the solve and requests the solver's masked-smoothing path;
@@ -644,7 +661,7 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                        velocity_smooth_mask_mode=gate_mode)
         with NormalGate(seg, sigma_scale=gate_sigma_scale,
                          coherence_threshold=gate_coherence_threshold, mode=gate_mode,
-                         everywhere=gate_everywhere):
+                         everywhere=gate_everywhere, denominator=gate_denominator):
             thickness, velocity = kelly_kapowski_cuda(seg, gm_prob, wm_prob, **kwargs)
     else:
         thickness, velocity = kelly_kapowski_cuda(seg, gm_prob, wm_prob, **kwargs)
@@ -1803,6 +1820,9 @@ class PipelineConfig:
     gate_sigma_scale: float = 2.0
     gate_coherence_threshold: float = 0.7
     gate_mode: str = 'soft'
+    # 'masked' = the shipped gate; 'plain' divides by the plain Gaussian weight
+    # sum so opposing neighbours attenuate rather than being renormalised away.
+    gate_denominator: str = 'masked'
     gate_everywhere: str = 'same'    # None | 'wide' | 'same': mask-average outside bipolar too
     # 1.0 matches the shipped solver, keeping --write-thickness comparable to
     # stock DiReCT; 0.35 was the surface-tested best. See module docstring (2).
@@ -1923,6 +1943,7 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
             use_normal_gate=config.use_normal_gate,
             gate_sigma_scale=config.gate_sigma_scale,
             gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode,
+            gate_denominator=config.gate_denominator,
             speed_floor=config.speed_floor, freeze_wm_field=config.freeze_wm_field,
             freeze_wm_direction=config.freeze_wm_direction,
             wm_project_smoothing=config.wm_project_smoothing,
@@ -2098,6 +2119,12 @@ def main():
                          "WM-normal coherence is below threshold. 'wide' uses the widened sigma "
                          "the bipolar branch uses; 'same' uses the plain sigma so only the "
                          "direction weighting changes. 'off' restores the shipped behaviour of gating only the bipolar voxels. Default: same.")
+    p.add_argument('--gate-denominator', choices=('masked', 'plain'), default='masked',
+                    help="how the normal-gated smoothing normalises. 'masked' (default, "
+                         "shipped) divides by the sum of the direction weights, so a voxel "
+                         "whose neighbours mostly disagree is still renormalised to full "
+                         "magnitude. 'plain' divides by the plain Gaussian weight sum, so "
+                         "opposing fields slow each other down instead.")
     p.add_argument('--no-normal-gate', action='store_true',
                     help='disable the interface-normal gating of velocity smoothing (fix #1) and '
                          "use the solver's plain isotropic smoothing. Diagnostic.")
@@ -2292,6 +2319,7 @@ def main():
                                        exclude_no_cortex=not args.no_exclude,
                                        pin_scope=args.pin_scope,
                                        use_normal_gate=not args.no_normal_gate,
+                                       gate_denominator=args.gate_denominator,
                                        gate_everywhere=(BEST_CONFIG.gate_everywhere
                                                         if args.gate_everywhere is None else
                                                         (None if args.gate_everywhere == 'off'

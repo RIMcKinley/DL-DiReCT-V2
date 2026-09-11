@@ -58,8 +58,9 @@ fixes, implemented below:
    map this pipeline produces (via --write-thickness) stays comparable with
    stock DiReCT's. Pass --sigma 0.35 to recover the surface-tuned operating
    point. At 1.0, two differences from a stock DiReCT solve remain: the
-   normal-gated velocity smoothing in (1), and the sulcal CSF sheet in (3),
-   which alters the gm/wm probabilities fed to the solve.
+   normal-gated velocity smoothing in (1), and -- only if --sulcal-sheet is
+   passed, since the sheet is now off by default -- the sulcal CSF sheet in
+   (3), which alters the gm/wm probabilities fed to the solve.
 
 3. `detect_sulcal_csf_sheet()` — a purely geometric, non-circular repair
    for unresolved sulci: from every GM voxel adjacent to WM, march outward
@@ -71,7 +72,10 @@ fixes, implemented below:
    probabilities are weakened but its hard segmentation label is left
    alone, so no physical gap is carved and sulci are not visibly widened.
 
-   STILL PAYING ITS KEEP. Ablated (--no-sulcal-sheet, everything else default)
+   NOW OFF BY DEFAULT; pass --sulcal-sheet to enable it. The ablation below
+   was measured while it was on by default and still stands as measured.
+
+   Ablated (--no-sulcal-sheet, everything else default)
    on the development subject: without it transit rises 6.1%/5.8%, crossed_csf
    8.5%/7.0%, flipped_face_pct 16.6%/12.0% and self-intersections 20.5%/15.8%,
    with config_loss 7.5%/6.6% worse. Unlike the normal gate in (1), the mesh
@@ -212,7 +216,7 @@ from scipy import spatial
 from scipy.ndimage import distance_transform_edt, map_coordinates, binary_dilation
 
 from .direct_cuda import kelly_kapowski_cuda, gaussian_smooth_3d
-from .surface_frames import volume_info_from_prep
+from .surface_frames import volume_info_from_prep, volume_info_from_image
 from . import direct_cuda as _direct_cuda_module
 
 
@@ -304,6 +308,33 @@ def load_gm_wm_probability(prep_dir, gm_labels=None, wm_labels=None):
     gm_prob = np.where(gm_logit == 0, 0, ss.expit(gm_logit))
     wm_prob = np.where(wm_logit == 0, 0, ss.expit(wm_logit))
     return gm_prob.astype(np.float32), wm_prob.astype(np.float32), ref_img
+
+
+def close_tissue_probs(gm_prob, wm_prob, radius, thr=0.5):
+    """Morphologically CLOSE the GM+WM mask and relabel what the closing adds
+    as grey matter. A sensitivity test, not a pipeline step.
+
+    Sulcal CSF is a thin sheet between opposing banks. Closing the tissue mask
+    with a radius wide enough to span it removes that sheet, so the two banks
+    become continuous grey matter with nothing between them for the pial to stop
+    against. How much the surfaces move under that perturbation measures how
+    much of the result is actually being held in place by the CSF -- as opposed
+    to by the velocity field, the gate or the relaxation.
+
+    Voxels the closing adds get gm_prob = 1 - thr/2 and wm_prob = 0, i.e. they
+    read as confident cortex; existing labels are untouched.
+    """
+    from scipy.ndimage import binary_closing, generate_binary_structure, iterate_structure
+    tissue = (gm_prob > thr) | (wm_prob > thr)
+    st = iterate_structure(generate_binary_structure(3, 1), int(radius))
+    closed = binary_closing(tissue, structure=st)
+    added = closed & ~tissue
+    gm2, wm2 = gm_prob.copy(), wm_prob.copy()
+    gm2[added] = 1.0 - thr / 2.0
+    wm2[added] = 0.0
+    print('  closing radius %d: tissue %d -> %d voxels, %d CSF voxels relabelled as GM'
+          % (radius, int(tissue.sum()), int(closed.sum()), int(added.sum())))
+    return gm2, wm2, int(added.sum())
 
 
 def save_like_direct(arr, path, ref_img):
@@ -512,6 +543,81 @@ def apply_fractional_sheet(gm_prob, wm_prob, sheet_mask, frac=0.0):
 # Normal-gated velocity smoothing (fix #1)
 # ---------------------------------------------------------------------------
 
+def direction_weight(dot, mode, sig_slope=None, center_deg=None, xp=None):
+    """The gate's weight as a function of cos(theta) between two directions.
+
+    Shared by the velocity-smoothing gate (NormalGate, on a torch tensor) and
+    the vertex-sampling gate (gated_trilinear, on a numpy array) so the two
+    cannot drift apart: the trilinear interpolation that reads the field at an
+    off-grid vertex is the same kind of averaging as the smoothing, over the 8
+    surrounding voxels instead of a Gaussian neighbourhood, and it should
+    weight disagreeing contributors the same way.
+
+      'hard'    1 inside 90 degrees, 0 outside
+      'relu'    max(cos, 0)
+      'sigmoid' logistic in the ANGLE: half weight at `center_deg`, 0.9->0.1
+                across the width encoded in `sig_slope`
+      'soft'    (1 + cos) / 2
+    """
+    if xp is None:
+        xp = torch if isinstance(dot, torch.Tensor) else np
+    if mode == 'hard':
+        return (dot > 0).astype(dot.dtype) if xp is np else (dot > 0).to(dot.dtype)
+    if mode == 'relu':
+        return xp.clip(dot, 0.0, None) if xp is np else dot.clamp(min=0.0)
+    if mode == 'sigmoid':
+        if xp is np:
+            theta = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+            return 1.0 / (1.0 + np.exp(-sig_slope * (center_deg - theta)))
+        theta = torch.rad2deg(torch.acos(dot.clamp(-1.0, 1.0)))
+        return torch.sigmoid(sig_slope * (center_deg - theta))
+    return (1.0 + dot) * 0.5
+
+
+def gated_trilinear(field, nu, pos_vox, mode, sig_slope=None, center_deg=None,
+                    denominator='plain'):
+    """Trilinear sample of `field` at `pos_vox`, with the 8 corners weighted by
+    their direction agreement with the interface normal at the sample point.
+
+    Plain trilinear (what map_coordinates does) averages the 8 surrounding
+    velocity vectors on distance alone. Across a thin sulcal bank those corners
+    can carry near-opposing velocity, and the average cancels them -- the same
+    failure the velocity-smoothing gate exists to prevent, one grid cell wide.
+
+    `denominator='plain'` divides by the unweighted corner weights, so
+    disagreement attenuates the step; 'masked' renormalises to full magnitude;
+    'support' divides by the weight of the corners that survived the gate, so a
+    REJECTED corner dilutes nothing while a partially-disagreeing one still does.
+    """
+    D, H, W = field.shape[:3]
+    hi = np.array([D - 1, H - 1, W - 1])
+    base = np.floor(pos_vox).astype(np.int64)
+    frac = pos_vox - base
+    nu_at = np.stack([map_coordinates(nu[..., k], pos_vox.T, order=1, mode='nearest')
+                      for k in range(3)], axis=1)
+    nu_at /= np.maximum(np.linalg.norm(nu_at, axis=1, keepdims=True), 1e-9)
+    num = np.zeros((pos_vox.shape[0], field.shape[3]), dtype=np.float64)
+    wsum = np.zeros(pos_vox.shape[0], dtype=np.float64)
+    dsum = np.zeros(pos_vox.shape[0], dtype=np.float64)
+    ssum = np.zeros(pos_vox.shape[0], dtype=np.float64)
+    for dz in (0, 1):
+        for dy in (0, 1):
+            for dx in (0, 1):
+                idx = np.clip(base + np.array([dz, dy, dx]), 0, hi)
+                w = ((frac[:, 0] if dz else 1.0 - frac[:, 0]) *
+                     (frac[:, 1] if dy else 1.0 - frac[:, 1]) *
+                     (frac[:, 2] if dx else 1.0 - frac[:, 2]))
+                i0, i1, i2 = idx[:, 0], idx[:, 1], idx[:, 2]
+                dot = np.einsum('nc,nc->n', nu[i0, i1, i2], nu_at)
+                dw = direction_weight(dot, mode, sig_slope, center_deg, xp=np)
+                num += (w * dw)[:, None] * field[i0, i1, i2]
+                wsum += w
+                dsum += w * dw
+                ssum += w * (dw > 0)
+    den = {'plain': wsum, 'support': ssum}.get(denominator, dsum)
+    return num / np.maximum(den, 1e-9)[:, None]
+
+
 class NormalGate:
     """Context manager that monkeypatches
     dldirect.direct_cuda.selective_masked_smooth_3d for the duration of a
@@ -520,25 +626,309 @@ class NormalGate:
     the WM interface normal (purely geometric)."""
 
     def __init__(self, seg, sigma_scale=2.0, coherence_threshold=0.7, mode='soft',
-                 everywhere=None, denominator='masked'):
+                 everywhere=None, denominator='plain', dilution=None,
+                 combine=None, combine_beta=0.5, nu_scale=0.2, nu_scale_wm=None,
+                 nu_scale_decay=None, magnitude='gated', where='normal',
+                 fill_coherence=0.9, blade_thickness=3.0,
+                 sigmoid_width_deg=32.0, sigmoid_center_deg=90.0,
+                 reference='normal', field_eps=1e-3):
         self.seg = seg
+        # WHAT THE COSINE IS TAKEN AGAINST -- the one thing that distinguishes
+        # this gate from direct_cuda's own masked Gaussian:
+        #   'normal' the WM interface normal at the centre voxel (nu, below).
+        #            Purely geometric: it is the same every iteration, defined
+        #            everywhere, and says nothing about how the solve is going.
+        #   'field'  the velocity vector at the centre voxel, i.e. exactly
+        #            direct_cuda's criterion, but routed through this class so
+        #            the weighting mode, the denominator and the
+        #            everywhere/threshold branches are the same on both arms.
+        #            An ablation: it isolates the reference from all the rest.
+        # 'field' has a measured defect, and an attempted repair that FAILED.
+        # The defect: the solve's increment is GM-only (speed * gm_mask), so a
+        # WM-contour voxel has no velocity of its own, is guarded, is therefore
+        # left unsmoothed, and never receives velocity from its GM neighbours --
+        # a self-sustaining dead zone. Over 45 iterations |v| <= eps on 30.7% of
+        # active_mask under 'field' against 1.2% under 'normal', and 30.57% of
+        # active_mask IS the WM contour.
+        # The repair tried: reference the GAUSSIAN-SMOOTHED velocity, which is
+        # nonzero on the contour. It does remove the dead zone (0.0% guarded),
+        # but smoothing the reference makes it agree with ITSELF, so relu(cos)
+        # ~= 1 and the gate stops attenuating (ratio 0.994 vs 0.683). The
+        # surface then over-travels grossly -- 2.97mm against field's 2.48,
+        # transit 1.496 against 0.482, and the sulci visibly bulge outward.
+        # Removed. The dead zone is real but is NOT what drives 'field'
+        # self-intersections: removing it did not fix the surface.
+        #   'warped-normal'  nu recomputed each outer iteration from the WARPED
+        #            WM boundary, i.e. the interface as the current cumulative
+        #            deformation places it, rather than where it started.
+        #            'normal' uses a nu computed ONCE from the original boundary
+        #            and never updated, so deep in a sulcus it keeps asserting
+        #            "these are opposing banks" even after the front has
+        #            advanced -- which is a candidate explanation for why
+        #            'normal' holds sulci open (1.3% of vertices with an
+        #            opposing-bank gap <= 0.5mm, against FSR pial.raw's 8.3%).
+        #            Costs one signed-distance transform per outer iteration.
+        #   'warped-split'  the CENTRE and the NEIGHBOURS use different things,
+        #            and the centre switches on the WARPED WM boundary:
+        #              centre, exterior (outside warped WM): the warped WM
+        #                normal, negated so it points GM->WM like the velocity
+        #              centre, interior (the wake the front has already swept):
+        #                the field's own direction
+        #              neighbours: always the field's direction
+        #            Rationale: ahead of the front the warped boundary's geometry
+        #            is the meaningful statement about which way flow should go;
+        #            behind it that boundary describes a surface the front has
+        #            already passed, so the local field is the better reference.
+        #            Asymmetric (the weight from j to i differs from i to j),
+        #            which is fine for a filter.
+        #   'hybrid' nu inside the WM label, the unit velocity everywhere else.
+        #            nu is a boundary quantity -- it is the normal of the WM
+        #            signed-distance transform, so it is meaningful in the WM
+        #            and in the band just outside it; 'hybrid' uses it where it
+        #            is anchored and defers to the field beyond.
+        self.reference = reference
+        # 'field' and 'hybrid'. A velocity of near-zero magnitude has no direction --
+        # normalising it returns numerical noise, and under 'relu' noise scores
+        # about half weight on average rather than being ignored. So a centre
+        # voxel below `field_eps` (voxels) is left UNSMOOTHED, and a NEIGHBOUR
+        # below it contributes no weight. Inert for reference='normal', where
+        # nu is a unit vector everywhere by construction, and inert at the WM
+        # voxels of 'hybrid', which read nu rather than the field.
+        #
+        # Falling back to the plain Gaussian instead was tried and rejected: it
+        # smooths across the band edge into the ~85% of the volume the guard
+        # covers, and the surfaces were visibly bad.
+        self.field_eps = float(field_eps)
+        # Accumulated over EVERY call, not just the first: the velocity starts
+        # near zero, so the first call guards almost everything whatever
+        # `field_eps` is, and reporting it alone made two very different eps
+        # values look identical.
+        self._guard_frac = []
+        self._bipolar_frac = []
         self.sigma_scale = sigma_scale
         self.coherence_threshold = coherence_threshold
         self.mode = mode
         self.everywhere = everywhere
+        # mode='sigmoid': the weight is a logistic in the ANGLE between the two
+        # interface normals, not in their cosine:
+        #     dw = sigmoid((center_deg - theta_deg) * 2*ln9 / width_deg)
+        # so a neighbour exactly `center_deg` off-axis counts 0.5, one at
+        # center - width/2 counts 0.9 and one at center + width/2 counts 0.1.
+        #
+        # Angle rather than cosine BECAUSE THE TWO MUST BE INDEPENDENT: with a
+        # slope in cosine, a fixed sharpness spans a wider angular band the
+        # further the centre sits from 90 deg (cos flattens towards 0 and 180),
+        # so centre and sharpness are confounded and a grid over them is not a
+        # grid over what it appears to be. In angle the 0.1-0.9 band is
+        # `width_deg` at every centre, exactly.
+        self.sigmoid_width_deg = float(sigmoid_width_deg)
+        self.sigmoid_center_deg = float(sigmoid_center_deg)
+        # 2*ln(9) makes `width_deg` the 0.1-to-0.9 span rather than an
+        # arbitrary logistic scale.
+        self._sig_slope = 2.0 * float(np.log(9.0)) / max(self.sigmoid_width_deg, 1e-6)
+        # 'plain' (the default here): divide by the plain Gaussian weight sum.
+        # Disagreeing neighbours contribute ~nothing to the numerator while
+        # still counting in the divisor, so opposing fields slow each other
+        # down instead of being renormalised away. Direction still comes only
+        # from the agreeing neighbours.
         # 'masked' (the shipped gate): divide by the sum of the DIRECTION
         # weights, so a voxel whose neighbours mostly disagree still gets a
         # full-magnitude average of the few that agree -- direction is cleaned
         # but magnitude is renormalised back up.
-        # 'plain': divide by the plain Gaussian weight sum instead. Disagreeing
-        # neighbours then contribute ~nothing to the numerator while still
-        # counting in the divisor, so opposing fields slow each other down
-        # instead of being renormalised away. Direction still comes only from
-        # the agreeing neighbours.
+        # 'support': divide by the plain Gaussian weight of the neighbours the
+        # gate did NOT reject. Between the other two by construction, and
+        # proposed as a middle ground: 'masked' overshoots, 'plain' damps sulcal
+        # travel, and neither separates "this neighbour is excluded" from "this
+        # neighbour partly disagrees".
+        #
+        # MEASURED AND REJECTED -- kept so the experiment is not repeated. It is
+        # not a middle ground; it is 'masked' with a 6% discount. Measured on
+        # bert, GM voxels, on ONE converged field so the three are comparable,
+        # each divisor as a fraction of the plain Gaussian weight sum:
+        #
+        #                masked   support   plain
+        #     fundus      0.460    0.491     1.0
+        #     deepwall    0.570    0.583     1.0
+        #     crown       0.664    0.722     1.0
+        #
+        # Under relu a surviving neighbour contributes cos, and the survivors
+        # agree strongly (mean cos ~0.94 at fundi), so sum(w*dw) ~= sum_{dw>0} w.
+        # Essentially the whole gap between 'plain' and 'masked' is the weight of
+        # the REJECTED neighbours, and 'support' drops that weight too. So the
+        # choice is close to binary -- do rejected neighbours dilute or not --
+        # worth a factor ~2 at a fundus, and 'support' picks 'masked's side.
+        #
+        # Surfaces, bert lh (rh matches): displacement 4.34mm against plain's
+        # 2.50 and ungated's 3.25, crossed_csf 7414 against 597, flipped_face_pct
+        # 4.05 against 0.0079 -- a 500x increase in genuine local folds. Fundus
+        # vertices travel 4.54mm with 11.3% of them crossing sulcal CSF into the
+        # far bank. 'masked' is worse again (5.01mm, 10881, 4.65%).
+        #
+        # A real middle ground needs a knob on HOW MUCH a rejected neighbour
+        # dilutes, which is `dilution` below.
         self.denominator = denominator
+        # `dilution` (a), when not None, REPLACES the denominator choice with a
+        # continuum between the two ends that actually differ:
+        #
+        #     den = (1 - a) * sum(w)  +  a * sum_{dw > 0} w
+        #
+        # a=0 is 'plain' exactly (a rejected neighbour dilutes at full weight);
+        # a=1 is 'support' exactly (it dilutes not at all). Because the rejected
+        # weight is larger where more of the neighbourhood opposes the centre,
+        # raising a lifts the field MORE at a sulcal fundus than at a gyral
+        # crown -- measured on the converged default field, sum_{dw>0} w / sum(w)
+        # is 0.491 at fundus GM voxels against 0.722 at crowns, so the divisor
+        # goes as (1 - 0.509a) and (1 - 0.278a) respectively.
+        self.dilution = None if dilution is None else float(dilution)
+        # COMBINING THE TWO REFERENCES AT EVERY VOXEL, rather than partitioning
+        # space between them the way 'hybrid' does. b = combine_beta, and both
+        # modes reduce EXACTLY to reference='normal' at b=1 and reference='field'
+        # at b=0 (short-circuited, so the endpoints are verifiable).
+        #
+        #   'both'   dw = dw_nu**b * dw_v**(1-b), a weighted geometric mean of
+        #            the two verdicts. A neighbour must agree on BOTH the WM
+        #            interface geometry and the flow to carry weight, so this is
+        #            strictly more attenuating than either alone in the middle.
+        #            The two cosines are each taken within their own convention,
+        #            so the nu sign does not matter here.
+        #   'blend'  one cosine, taken against a MIXED direction
+        #            u = normalize(b * (-nu) + (1-b) * vhat) at centre and
+        #            neighbour alike. Interpolates the criterion instead of
+        #            multiplying the verdicts, so it is far less attenuating.
+        #            nu IS negated here -- it must be put in the velocity's
+        #            convention before the two can be added at all (see
+        #            hybrid-neg). Where the velocity is below field_eps the
+        #            field term drops out and u is just -nu, which is defined
+        #            everywhere, so 'blend' has NO dead shell for any b > 0.
+        #   'nuscale'  u = normalize(S * (-nu) + v), with v RAW rather than
+        #            unit. nu is scaled to a fixed magnitude S in velocity
+        #            units, so it dominates where |v| << S and backs off where
+        #            |v| >> S -- a confidence blend with ONE knob instead of a
+        #            mix plus a crossover, which are redundant. S=0 is
+        #            reference='field' exactly; large S tends to 'normal'
+        #            (cos is invariant to the global sign, so -nu and nu give
+        #            the same weights). Subsumes field_eps: as |v| -> 0,
+        #            u -> -nu, which is defined everywhere, so there is no dead
+        #            shell and no threshold cliff. combine_beta is unused here.
+        #            For scale: GM median |v| is 0.383 on bert (p10 0.206,
+        #            p90 0.592).
+        self.combine = combine
+        self.combine_beta = float(combine_beta)
+        self.nu_scale = float(nu_scale)
+        # DIAGNOSTIC. A SECOND nu scale used inside the WM label, so S can be
+        # spatially varying: a large value there is pure normal, while the rest
+        # of the volume keeps `nu_scale`. Exists to ask whether the reversal
+        # that small S introduces is generated on the WM side; it is not offered
+        # as a configuration. None = one S everywhere.
+        self.nu_scale_wm = None if nu_scale_wm is None else float(nu_scale_wm)
+        # DISTANCE-BLENDED S. With `nu_scale_decay` (L, in voxels) the two
+        # scales are interpolated by the signed distance to the WM boundary --
+        # the same sdt `nu` is built from, so it costs nothing:
+        #
+        #     S(x) = nu_scale + (nu_scale_wm - nu_scale) * exp(-max(d,0) / L)
+        #
+        # d <= 0 (inside WM) gives S = nu_scale_wm throughout, and S relaxes to
+        # nu_scale over ~L voxels into cortex. The hard WM-label switch above is
+        # the L -> 0 limit of this, and was measured to be indistinguishable
+        # from simply raising nu_scale everywhere (surfaces 0.029mm apart from
+        # the matching plain arm) -- the point of a finite L is to hold the
+        # normal for a BAND outside the interface rather than only within the
+        # label. Cortex is ~2.5mm, so L of 0.5-2 voxels is the meaningful range.
+        self.nu_scale_decay = None if nu_scale_decay is None else float(nu_scale_decay)
+        self._sdt_t = None
+        # WHAT SETS THE OUTPUT MAGNITUDE.
+        #   'gated'  (default, and every result before this) the magnitude falls
+        #            out of the same weighted average that sets the direction, so
+        #            the divisor choice decides it -- and that is where the loss
+        #            is: at fundus GM voxels the gate retains 0.805 of |v| per
+        #            iteration while a plain Gaussian retains 1.074.
+        #   'scalar' magnitude from a Gaussian smoothing of |v|, direction from
+        #            the gated average. |v| >= 0, so the scalar smoothing CANNOT
+        #            cancel across opposing banks -- measured, the plain vector
+        #            Gaussian already only loses ~2% to cancellation at fundi
+        #            (|G*v| / (G*|v|) = 0.98), so essentially none of the gate's
+        #            20% loss is cancellation; it is the divisor. This decouples
+        #            the two jobs the gate was doing at once.
+        #            NOTE this makes `denominator` INERT: 'plain', 'masked' and
+        #            'support' share a numerator and differ only by a positive
+        #            scalar, so they all give the same direction.
+        self.magnitude = magnitude
+        # WHICH COHERENCE DECIDES WHERE THE FILTER APPLIES (only consulted when
+        # `everywhere` is 'same' or None -- 'same-all' and 'wide' ignore it).
+        #   'normal' |G*nu| / (G*|nu|): geometry, computed once and cached, so
+        #            the mask is the same at every iteration. Chosen originally
+        #            to keep the gate_reference ablation clean, NOT because it
+        #            was the better criterion -- it had no effect at all until
+        #            the threshold was wired up.
+        #   'field'  |G*v| / (G*|v|) on the velocity ABOUT TO BE AVERAGED,
+        #            recomputed every call. This is direct_cuda's own native
+        #            criterion. It asks whether the neighbourhood actually
+        #            cancels, rather than whether the interface geometry
+        #            suggests it might, and it evolves with the solve.
+        #            Cannot be cached. The two live on different scales --
+        #            measured on converged fields, nu coherence has median 0.862
+        #            over the active region while field coherence sits at
+        #            0.93-0.99 -- so a threshold does NOT transfer between them.
+        self.where = where
+        # reference='field-fill' only. A guarded voxel (|v| <= field_eps) is
+        # FILLED FROM ITS NEIGHBOURS instead of being left alone -- the guard's
+        # premise (a zero vector has no direction) is right, but "leave it
+        # alone" is fatal for a voxel whose only input IS the average: the WM
+        # contour gets no increment (speed is masked to seg==2, verified: 0 of
+        # 225816 contour voxels ever receive one), so zero is a fixed point.
+        # How it is filled depends on whether the neighbourhood is coherent:
+        #   coh >= fill_coherence : plain Gaussian. Nothing threatens a
+        #                           reversal, so filtering would only attenuate.
+        #   coh <  fill_coherence : gated average referenced to -nu, the one
+        #                           direction that is defined when the voxel's
+        #                           own velocity is not. (Negated -- see
+        #                           hybrid-neg; measured cos(-nu, local smoothed
+        #                           field) = +0.957.)
+        # Limits: 1.0 is always-plain-fill, 0.0 is exactly reference='field-nu'.
+        self.fill_coherence = float(fill_coherence)
+        # where='blade' / 'field-or-blade': gate at voxels whose 5^3 averaging
+        # window SPANS a thin WM sheet, detected geometrically rather than hoped
+        # for as a by-product of a coherence. Inward distance transform gives the
+        # half-thickness of the sheet through each WM voxel; its local maximum in
+        # a 5^3 window is the half-thickness of the ridge that voxel belongs to;
+        # small everywhere nearby means a blade. Dilated by the smoothing radius
+        # because what matters is the window, not the voxel.
+        #
+        # MEASURED AND REJECTED -- kept so the experiment is not repeated. The
+        # premise was that the coherence masks miss thin blades and a geometric
+        # detector would catch what they leave out. BOTH HALVES ARE FALSE.
+        #
+        # (1) There is nothing to catch. The coherence already fires at blades,
+        #     essentially perfectly: of voxels IN a WM sheet <= 2mm thick,
+        #     100.0% have nu-coherence < 0.7; at <= 3mm, 98.1%. This is what the
+        #     geometry says must happen -- nu is grad of the signed distance, so
+        #     it reverses across a blade's medial axis, and a window centred
+        #     there sees antiparallel normals.
+        #     (An earlier measurement here claimed only ~30% fired. That was an
+        #     artefact of dilating the blade set by a 5^3 element to catch
+        #     "windows that span a blade": it inflated 12238 voxels to 184899,
+        #     94% of the result was ordinary WM, and 31.7% is simply the base
+        #     rate for all WM. Blades are 2.2% of WM -- 12238 voxels at <=3mm,
+        #     559 at <=2mm.)
+        #
+        # (2) Adding the mask actively hurts. field-or-blade vs field-coherence
+        #     alone agrees to a median 0.084mm but disagrees in a tail (p99
+        #     1.37mm, max 4.34mm), and on the top 1% of disagreement the blade
+        #     arm travels LESS FAR on 93.8% of them: ends-in-CSF collapses
+        #     20.4% -> 1.8% and travel 4.52 -> 2.58mm. 76.7% of those vertices
+        #     start inside the blade mask against 30.9% of all free vertices.
+        #     The aggregate alignment columns look BETTER for the blade arm
+        #     (median cos +0.838 vs +0.762, cos<0 1.9% vs 2.8%) only because a
+        #     vertex that barely moves cannot point the wrong way -- which is
+        #     how this hid in the summary metrics.
+        self.blade_thickness = float(blade_thickness)
+        self._blade_t = None
         self._orig = None
         self._bipolar_cache = {}
         self._nu_t = None
+        self._wm_t = None
+        self._warped_nu_t = None
+        self._warped_iter = None
 
     def __enter__(self):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -547,17 +937,178 @@ class NormalGate:
         grad = np.stack(np.gradient(sdt), axis=-1)
         nu = grad / np.maximum(np.linalg.norm(grad, axis=-1), 1e-9)[..., None]
         self._nu_t = torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
+        self._wm_t = torch.from_numpy(wmb[None, None].astype(bool)).to(device)
+        # the same signed distance, kept for the distance-blended nu scale
+        self._sdt_t = torch.from_numpy(sdt[None, None].astype(np.float32)).to(device)
+        if self.where in ('blade', 'field-or-blade'):
+            from scipy.ndimage import maximum_filter, binary_dilation
+            half = distance_transform_edt(wmb)            # half-thickness of the sheet
+            ridge = maximum_filter(half, size=5)          # of the ridge it belongs to
+            blade = wmb & (ridge <= self.blade_thickness / 2.0)
+            span = binary_dilation(blade, np.ones((5, 5, 5)))
+            self._blade_t = torch.from_numpy(span[None, None]).to(device)
+            print('  [gate] blade mask: WM sheets <= %.1fmm, %d voxels span one (%.1f%% of volume)'
+                  % (self.blade_thickness, int(span.sum()), 100 * span.mean()))
 
         def normal_masked_smooth(vol, sigma, dev, truncate=2.0, mode='hard'):
             r = max(1, int(truncate * sigma + 0.5))
+            # The direction volume the cosine is taken in. For 'normal' it is
+            # the static interface normal; for 'field' it is the unit velocity,
+            # recomputed on every call because the field changes each iteration.
+            # The endpoints are handled HERE rather than by falling through to
+            # self.reference, which would otherwise pick up whatever reference
+            # happened to be configured alongside --gate-combine.
+            _cb = self.combine
+            _b = self.combine_beta
+
+            def _field_ref():
+                _fm = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                _okf = _fm > self.field_eps
+                _rf = vol / _fm.clamp(min=max(self.field_eps, 1e-12))
+                return _rf, _rf, _okf, F.pad(_okf.to(vol.dtype), (r,)*6, mode='replicate')
+
+            if _cb == 'nuscale':
+                if self.nu_scale > 0:
+                    # u = normalize(S * (-nu) + v), with v RAW. nu is scaled to a
+                    # fixed magnitude S in velocity units, so it dominates where
+                    # |v| << S and backs off where |v| >> S. Defined everywhere,
+                    # so no field_eps guard and no dead shell.
+                    _S = self.nu_scale
+                    if self.nu_scale_wm is not None and self.nu_scale_decay is not None:
+                        _w = torch.exp(-self._sdt_t.clamp(min=0.0) / self.nu_scale_decay)
+                        _S = self.nu_scale + (self.nu_scale_wm - self.nu_scale) * _w
+                    elif self.nu_scale_wm is not None:
+                        _S = torch.where(self._wm_t,
+                                         torch.full_like(vol[:, :1], self.nu_scale_wm),
+                                         torch.full_like(vol[:, :1], self.nu_scale))
+                    _u = _S * (-self._nu_t) + vol
+                    ref_t = nbr_t = _u / _u.norm(dim=1, keepdim=True).clamp(min=1e-9)
+                    ok = padded_ok = None
+                else:
+                    ref_t, nbr_t, ok, padded_ok = _field_ref()   # S=0 IS 'field'
+                _cb = None
+            elif _cb is not None and _b >= 1.0:
+                ref_t = nbr_t = self._nu_t          # b=1 IS reference='normal'
+                ok = padded_ok = None
+                _cb = None
+            elif _cb is not None and _b <= 0.0:
+                ref_t, nbr_t, ok, padded_ok = _field_ref()       # b=0 IS 'field'
+                _cb = None
+            if _cb is not None:
+                b = self.combine_beta
+                fmag = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                has_v = fmag > self.field_eps
+                fhat = vol / fmag.clamp(min=max(self.field_eps, 1e-12))
+                if _cb == 'blend':
+                    u = b * (-self._nu_t) + (1.0 - b) * torch.where(has_v, fhat,
+                                                                    torch.zeros_like(fhat))
+                    u = u / u.norm(dim=1, keepdim=True).clamp(min=1e-9)
+                    ref_t, nbr_t, ok, padded_ok = u, u, None, None
+                else:                                     # 'both'
+                    ref_t, nbr_t = self._nu_t, self._nu_t
+                    ok = has_v
+                    ref2_t, nbr2_t = fhat, fhat
+                    padded_ok = F.pad(ok.to(vol.dtype), (r,)*6, mode='replicate')
+            elif self.combine is not None:
+                pass                                 # endpoint already resolved
+            elif self.reference == 'warped-split':
+                fmag = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                fhat = vol / fmag.clamp(min=max(self.field_eps, 1e-12))
+                has_v = fmag > self.field_eps
+                wn = self._warped_nu_t if self._warped_nu_t is not None else self._nu_t
+                w = _direct_cuda_module.GATE_STATE.get('warped_wm')
+                interior = ((w > 0.5) if w is not None else self._wm_t.expand_as(has_v))
+                # nu points AWAY from WM; the velocity points GM->WM. Negate so
+                # both the exterior-centre and the neighbours speak the same
+                # convention and one cosine compares them.
+                ctr_t = torch.where(interior, fhat, -wn)
+                nbr_t = fhat
+                # a centre needs a direction: the exterior always has one (nu is
+                # unit), the interior only where the field is non-negligible
+                ok = (~interior) | has_v
+                ref_t = ctr_t
+                padded_ok = F.pad(has_v.to(vol.dtype), (r, r, r, r, r, r), mode='replicate')
+            elif self.reference == 'field-fill':
+                _fm = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                _hv = _fm > self.field_eps
+                ref_t = torch.where(_hv, vol / _fm.clamp(min=max(self.field_eps, 1e-12)),
+                                    -self._nu_t)
+                nbr_t = ref_t
+                ok = padded_ok = None
+            elif self.reference in ('field-nu', 'field-nu-pos'):
+                # reference='field' with the DEAD SHELL REMOVED. The field_eps
+                # guard exists because a near-zero velocity has no direction; it
+                # answers that by leaving the voxel unsmoothed, which makes those
+                # voxels hold |v|==0 for the whole solve. Measured on bert: that
+                # shell is 51% of free vertices, and 88.9% (lh) / 94.2% (rh) of
+                # every free vertex whose displacement points INWARD sits in it.
+                # So instead of guarding, substitute the geometric direction --
+                # -nu, negated into the velocity's convention (see hybrid-neg).
+                # Every voxel then has a defined reference, nothing is left
+                # unsmoothed and no neighbour is dropped.
+                #
+                # This is the hard-threshold limit of --gate-combine nuscale as
+                # S -> 0+, which blends the same two directions smoothly; the
+                # point of the hard version is that it changes NOTHING except at
+                # the dead voxels, so it isolates the shell.
+                _fm = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                _hv = _fm > self.field_eps
+                # 'field-nu-pos' is the SIGN ABLATION: same thing with nu NOT
+                # negated. Kept because the unnegated form is what 'hybrid'
+                # shipped with, where it silently made the option inert.
+                _sgn = -1.0 if self.reference == 'field-nu' else 1.0
+                ref_t = torch.where(_hv, vol / _fm.clamp(min=max(self.field_eps, 1e-12)),
+                                    _sgn * self._nu_t)
+                nbr_t = ref_t
+                ok = padded_ok = None
+            elif self.reference in ('field', 'hybrid', 'hybrid-neg'):
+                src = vol
+                fmag = (src ** 2).sum(dim=1, keepdim=True).sqrt()
+                ok = fmag > self.field_eps
+                # clamp by a positive floor, NOT by field_eps: field_eps=0 is a
+                # legitimate request ("guard nothing") and dividing by it gave nan.
+                ref_t = src / fmag.clamp(min=max(self.field_eps, 1e-12))
+                nbr_t = ref_t
+                if self.reference in ('hybrid', 'hybrid-neg'):
+                    # nu where the segmentation says white matter, the unit
+                    # velocity elsewhere. The guard then only has to cover the
+                    # non-WM side: a WM voxel always has a usable direction.
+                    #
+                    # SIGN. nu is grad of the WM signed distance, so it points
+                    # AWAY from white matter; the DiReCT velocity points GM->WM.
+                    # Measured on this data they are near-antiparallel: median
+                    # cos(nu, vhat) is -0.81 at WM voxels and -0.92 at GM voxels
+                    # of an ungated solve, with only 3.8%/0.8% above zero. So
+                    # 'hybrid' compares a WM centre's nu against neighbours
+                    # carrying vhat in the OPPOSITE convention, and under relu
+                    # such a centre scores ~0 weight on nearly every neighbour.
+                    # 'warped-split' negates for exactly this reason (see -wn
+                    # there). 'hybrid-neg' is 'hybrid' with the negation, so the
+                    # two can be run paired to find out whether the unnegated
+                    # form is a bug or merely a different filter.
+                    _nu = self._nu_t if self.reference == 'hybrid' else -self._nu_t
+                    ref_t = torch.where(self._wm_t, _nu, ref_t)
+                    ok = ok | self._wm_t
+                padded_ok = F.pad(ok.to(vol.dtype), (r, r, r, r, r, r), mode='replicate')
+            elif self.reference == 'warped-normal' and self._warped_nu_t is not None:
+                ref_t, ok, padded_ok = self._warped_nu_t, None, None
+                nbr_t = ref_t
+            else:
+                ref_t, ok, padded_ok = self._nu_t, None, None
+                nbr_t = ref_t
             coords = torch.arange(-r, r + 1, device=dev, dtype=torch.float32)
             g1d = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
             g1d = g1d / g1d.sum()
             D, H, W = vol.shape[2:]
             padded = F.pad(vol, (r, r, r, r, r, r), mode='replicate')
-            padded_nu = F.pad(self._nu_t, (r, r, r, r, r, r), mode='replicate')
+            # neighbours are read from nbr_t, the centre from ref_t: for most
+            # references these are the same volume, for 'warped-split' they are not
+            padded_nu = F.pad(nbr_t, (r, r, r, r, r, r), mode='replicate')
+            padded_nu2 = (F.pad(nbr2_t, (r, r, r, r, r, r), mode='replicate')
+                           if (_cb == 'both') else None)
             acc = torch.zeros_like(vol)
             wacc = torch.zeros((vol.shape[0], 1, D, H, W), device=dev)
+            sacc = torch.zeros((vol.shape[0], 1, D, H, W), device=dev)
             pacc = 0.0                      # plain Gaussian weight sum (a scalar)
             for dz in range(-r, r + 1):
                 for dy in range(-r, r + 1):
@@ -567,20 +1118,115 @@ class NormalGate:
                             continue
                         sh = padded[:, :, r + dz:r + dz + D, r + dy:r + dy + H, r + dx:r + dx + W]
                         sn = padded_nu[:, :, r + dz:r + dz + D, r + dy:r + dy + H, r + dx:r + dx + W]
-                        dot = (sn * self._nu_t).sum(dim=1, keepdim=True)
-                        dw = (dot > 0).to(vol.dtype) if mode == 'hard' else ((1.0 + dot) * 0.5)
+                        dot = (sn * ref_t).sum(dim=1, keepdim=True)
+                        # 'relu' is continuous like 'soft' but zero from 90
+                        # degrees on, so a neighbour in the opposing half-space
+                        # contributes nothing at all. direct_cuda has the same
+                        # mode on the cosine between VELOCITY vectors; here it
+                        # is between WM interface normals, which is the point of
+                        # the gate -- geometry rather than the field's own
+                        # direction. Shared with the vertex-sampling gate.
+                        dw = direction_weight(dot, mode, self._sig_slope,
+                                               self.sigmoid_center_deg)
+                        if padded_nu2 is not None:
+                            sn2 = padded_nu2[:, :, r + dz:r + dz + D,
+                                              r + dy:r + dy + H, r + dx:r + dx + W]
+                            dw2 = direction_weight((sn2 * ref2_t).sum(dim=1, keepdim=True),
+                                                    mode, self._sig_slope,
+                                                    self.sigmoid_center_deg)
+                            b = self.combine_beta
+                            dw = dw.clamp(min=0).pow(b) * dw2.clamp(min=0).pow(1.0 - b)
+                        if padded_ok is not None:
+                            # a directionless neighbour carries no vote
+                            dw = dw * padded_ok[:, :, r + dz:r + dz + D,
+                                                 r + dy:r + dy + H, r + dx:r + dx + W]
                         acc = acc + wgt * dw * sh
                         wacc = wacc + wgt * dw
+                        sacc = sacc + wgt * (dw > 0).to(vol.dtype)
                         pacc = pacc + wgt
-            if self.denominator == 'plain':
+            a = self.dilution
+            if a is not None and a > 0.0:
+                den = (1.0 - a) * pacc + a * sacc
+                out = torch.where(den > 1e-6, acc / den.clamp(min=1e-6), vol)
+            elif self.denominator == 'plain' or a == 0.0:
+                # a == 0 IS 'plain', so take the same code path rather than the
+                # algebraically-equal one above. Dividing by a float32 tensor
+                # filled with pacc instead of by the float64 Python scalar seeds
+                # a ~1e-7 relative difference, and the 45-iteration loop
+                # amplifies it: measured max |diff| 0.047 at isolated voxels
+                # (mean 3.6e-06), moving crossed_csf 597->596 and
+                # self_intersections 252->253. Harmless, but it would make the
+                # sweep's endpoint merely near the default instead of provably
+                # it -- and this grid is known to amplify perturbations that
+                # small (see the distance-field normal instability).
+                out = acc / max(pacc, 1e-6)
                 # Same numerator, undivided by the agreement. Accumulated rather
                 # than assumed to be 1.0, so the weights skipped below 1e-6 are
                 # excluded from both sides consistently.
-                return acc / max(pacc, 1e-6)
-            return torch.where(wacc > 1e-6, acc / wacc.clamp(min=1e-6), vol)
+                out = acc / max(pacc, 1e-6)
+            elif self.denominator == 'neumann':
+                # NO-FLUX (Neumann) boundary at the slit the gate is detecting.
+                # The velocity lives on the cortical ribbon; a neighbour across
+                # the sulcal CSF is outside that domain, so it should contribute
+                # NO FLUX -- the centre's own value -- rather than contributing
+                # zero ('plain', a spurious sink) or being dropped from the
+                # divisor ('masked', a one-sided stencil):
+                #
+                #   out = sum_j w_j [ dw_j v_j + (1 - dw_j) v_c ] / sum_j w_j
+                #
+                # which is exactly what mode='replicate' padding already does at
+                # the VOLUME edge, applied at an internal boundary instead.
+                # Weights sum to one, so a locally CONSTANT field is reproduced
+                # exactly -- the property 'plain' lacks (it scales a constant
+                # field by wbar, which is the measured 0.805 per-iteration
+                # retention at fundi, worst where wbar is lowest). Limits are
+                # right: dw==1 gives the plain Gaussian, dw==0 the identity.
+                out = (acc + (pacc - wacc) * vol) / max(pacc, 1e-6)
+            elif self.denominator == 'support':
+                # The plain Gaussian weight of the neighbours that SURVIVED the
+                # gate. A neighbour the gate rejected outright (relu: cos <= 0,
+                # or a directionless one killed by padded_ok) leaves the divisor
+                # as well as the numerator, so it no longer dilutes; one that
+                # only partly disagrees still counts its full w in the divisor
+                # against a reduced w*dw in the numerator, so it still
+                # attenuates. Identical to 'masked' when dw is binary
+                # (mode='hard'), and bounded between the other two everywhere:
+                # sum(w*dw) <= sum_{dw>0} w <= sum(w).
+                out = torch.where(sacc > 1e-6, acc / sacc.clamp(min=1e-6), vol)
+            else:
+                out = torch.where(wacc > 1e-6, acc / wacc.clamp(min=1e-6), vol)
+            if self.reference == 'field-fill':
+                # a guarded voxel whose neighbourhood is coherent takes the
+                # plain Gaussian; only the bipolar ones get the -nu-gated average
+                _pl = gaussian_smooth_3d(vol, sigma, dev, zero_boundary=False,
+                                          truncate=truncate)
+                _sm = gaussian_smooth_3d((vol ** 2).sum(dim=1, keepdim=True).sqrt(),
+                                          sigma, dev, zero_boundary=False, truncate=truncate)
+                _coh = (_pl ** 2).sum(dim=1, keepdim=True).sqrt() / _sm.clamp(min=1e-6)
+                out = torch.where((~_hv) & (_coh >= self.fill_coherence), _pl, out)
+            if self.magnitude == 'scalar':
+                gmag = gaussian_smooth_3d(vol.norm(dim=1, keepdim=True), sigma, dev,
+                                           zero_boundary=False, truncate=truncate)
+                nrm = out.norm(dim=1, keepdim=True)
+                # where the gated average has no direction (no agreeing
+                # neighbour), fall back to the plain Gaussian's direction, and
+                # to the voxel's own if that is degenerate too
+                plainv = gaussian_smooth_3d(vol, sigma, dev, zero_boundary=False,
+                                             truncate=truncate)
+                pn = plainv.norm(dim=1, keepdim=True)
+                direction = torch.where(nrm > 1e-9, out / nrm.clamp(min=1e-9),
+                                        torch.where(pn > 1e-9, plainv / pn.clamp(min=1e-9),
+                                                    torch.zeros_like(out)))
+                out = direction * gmag
+            if ok is not None:
+                self._guard_frac.append(float((~ok).float().mean()))
+                out = torch.where(ok, out, vol)
+            return out
 
         def selective_normal(vol, sigma, dev, truncate=2.0, mode='hard',
                               coherence_threshold=0.5, gate='coherence', return_stats=False):
+            if self.reference in ('warped-normal', 'warped-split'):
+                self._refresh_warped_nu(dev)
             plain = gaussian_smooth_3d(vol, sigma, dev, zero_boundary=False, truncate=truncate)
             key = round(float(sigma), 4)
             if key not in self._bipolar_cache:
@@ -589,30 +1235,100 @@ class NormalGate:
                 smooth_mag = gaussian_smooth_3d(mag, sigma, dev, zero_boundary=False, truncate=truncate)
                 coh = (pn ** 2).sum(dim=1, keepdim=True).sqrt() / smooth_mag.clamp(min=1e-6)
                 self._bipolar_cache[key] = (coh < self.coherence_threshold) & (smooth_mag > 1e-6)
-            bipolar = self._bipolar_cache[key]
-            masked = normal_masked_smooth(vol, sigma * self.sigma_scale, dev,
-                                           truncate=truncate / self.sigma_scale, mode=self.mode)
-            if self.everywhere == 'wide':
-                # Normal-masked averaging EVERYWHERE, at the widened sigma the
-                # bipolar branch uses. The shipped gate applies it only where the
-                # WM-normal coherence is below threshold (11.9% of the boundary
-                # band); elsewhere a plain Gaussian mixes freely across banks.
-                out = masked
-            elif self.everywhere == 'same':
-                # Masked averaging everywhere at the UNWIDENED sigma, so the only
-                # difference from `plain` is the direction weighting.
-                out = normal_masked_smooth(vol, sigma, dev, truncate=truncate,
-                                           mode=self.mode)
+            if self.where in ('blade', 'field-or-blade'):
+                bl = self._blade_t.expand_as(plain[:, :1])
+                if self.where == 'blade':
+                    bipolar = bl
+                else:
+                    _m = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                    _sm = gaussian_smooth_3d(_m, sigma, dev, zero_boundary=False, truncate=truncate)
+                    _coh = (plain ** 2).sum(dim=1, keepdim=True).sqrt() / _sm.clamp(min=1e-6)
+                    bipolar = bl | ((_coh < self.coherence_threshold) & (_sm > 1e-6))
+            elif self.where == 'field':
+                # recomputed per call: the field changes every iteration
+                _m = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                _sm = gaussian_smooth_3d(_m, sigma, dev, zero_boundary=False, truncate=truncate)
+                _coh = (plain ** 2).sum(dim=1, keepdim=True).sqrt() / _sm.clamp(min=1e-6)
+                bipolar = (_coh < self.coherence_threshold) & (_sm > 1e-6)
             else:
-                out = torch.where(bipolar, masked, plain)
+                bipolar = self._bipolar_cache[key]
+            self._bipolar_frac.append(float(bipolar.float().mean()))
+            # NOTE the coherence mask is always computed from nu, on both
+            # settings of self.reference: only the direction WEIGHTING switches.
+            # Inert on the default branch ('same-all' ignores the threshold), so
+            # the reference ablation is clean there; on 'same'/'off' the two arms
+            # would share a normal-derived WHERE and differ only in the weights.
+
+            # Two independent choices: WHERE the masked averaging is applied
+            # (everywhere, or only the voxels the coherence threshold selects)
+            # and at WHICH sigma (widened by sigma_scale, or the plain one).
+            # All four combinations exist:
+            #   'wide'      everywhere, widened
+            #   'same-all'  everywhere, unwidened   (ignores the threshold)
+            #   'same'      gated,      unwidened
+            #   None/'off'  gated,      widened     (the shipped gate)
+            wide = lambda: normal_masked_smooth(vol, sigma * self.sigma_scale, dev,
+                                                 truncate=truncate / self.sigma_scale,
+                                                 mode=self.mode)
+            narrow = lambda: normal_masked_smooth(vol, sigma, dev, truncate=truncate,
+                                                   mode=self.mode)
+            if self.everywhere == 'wide':
+                out = wide()
+            elif self.everywhere == 'same-all':
+                # Masked averaging everywhere at the UNWIDENED sigma, so the only
+                # difference from `plain` is the direction weighting. The
+                # coherence threshold has no effect in this branch.
+                out = narrow()
+            elif self.everywhere == 'same':
+                out = torch.where(bipolar, narrow(), plain)
+            else:
+                out = torch.where(bipolar, wide(), plain)
             return (out, float(bipolar.float().mean())) if return_stats else out
 
         self._orig = _direct_cuda_module.selective_masked_smooth_3d
         _direct_cuda_module.selective_masked_smooth_3d = selective_normal
         return self
 
+    def _refresh_warped_nu(self, device):
+        """Recompute nu from the warped WM boundary, once per outer iteration.
+
+        The warped WM PROBABILITY alone is no good as a reference: its gradient
+        is ~0 away from the boundary, which is the dead zone that sank
+        reference='field' (see the comment above). Thresholding it at 0.5 and
+        taking the signed distance transform gives a unit normal everywhere, the
+        same construction as the static nu -- just of the deformed boundary.
+        """
+        st = getattr(_direct_cuda_module, 'GATE_STATE', {})
+        w = st.get('warped_wm')
+        it = st.get('iteration')
+        if w is None:
+            return                                  # first call: static nu stands in
+        if it is not None and it == self._warped_iter:
+            return                                  # already done for this iteration
+        wmb = (w[0, 0].detach().cpu().numpy() > 0.5)
+        if not wmb.any():
+            return
+        sdt = distance_transform_edt(~wmb) - distance_transform_edt(wmb)
+        grad = np.stack(np.gradient(sdt), axis=-1)
+        nu = grad / np.maximum(np.linalg.norm(grad, axis=-1), 1e-9)[..., None]
+        self._warped_nu_t = torch.from_numpy(
+            nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
+        self._warped_iter = it
+
     def __exit__(self, *exc):
         _direct_cuda_module.selective_masked_smooth_3d = self._orig
+        if self._bipolar_frac and self.everywhere in ('same', None, 'off'):
+            b = np.asarray(self._bipolar_frac) * 100.0
+            print('  [gate] where=%s, threshold %.2f selected %.1f%% of voxels for the '
+                  'bilateral filter (first %.1f%%, last %.1f%%); the rest got the plain Gaussian'
+                  % (self.where, self.coherence_threshold, b.mean(), b[0], b[-1]))
+        if self._guard_frac:
+            f = np.asarray(self._guard_frac) * 100.0
+            print('  [gate] reference=%s, guard |v| <= %g left %.1f%% of voxels '
+                  'unsmoothed on average over %d calls (first %.1f%%, last %.1f%%, '
+                  'min %.1f%%, max %.1f%%)'
+                  % (self.reference, self.field_eps, f.mean(), f.size,
+                     f[0], f[-1], f.min(), f.max()))
         return False
 
 
@@ -626,9 +1342,15 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           freeze_wm_direction=False, wm_project_smoothing=False,
                           freeze_wm_release_final=False, freeze_wm_until=None,
                           freeze_wm_weight=1.0, gate_everywhere=None,
-                          num_integration_points=None, gradient_gate=None,
+                          num_integration_points=None, gradient_gate=None, gradient_step=None,
                           gate_sigma_scale=2.0, gate_coherence_threshold=0.7,
-                          gate_mode='soft', gate_denominator='masked',
+                          gate_mode='soft', gate_denominator='plain', gate_dilution=None,
+                          gate_combine=None, gate_combine_beta=0.5, gate_nu_scale=0.2,
+                          gate_nu_scale_wm=None, gate_nu_scale_decay=None,
+                          gate_magnitude='gated', gate_where='normal',
+                          gate_fill_coherence=0.9, gate_blade_thickness=3.0,
+                          gate_sigmoid_width_deg=32.0, gate_sigmoid_center_deg=90.0,
+                          gate_reference='normal', gate_field_eps=1e-3,
                           velocity_smooth_sigma=None, verbose=False):
     """Solve for the DiReCT velocity field. With `use_normal_gate=True`
     (the tested-best configuration) this installs NormalGate for the
@@ -650,6 +1372,8 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                    cumulative_fields=False, return_velocity=True)
     if gradient_gate is not None:
         kwargs['gradient_gate'] = gradient_gate
+    if gradient_step is not None:
+        kwargs['gradient_step'] = gradient_step
     if velocity_smooth_sigma is not None:
         # ANTs' -b (m_SmoothingVelocityFieldVariance, default 1.5 -> sigma
         # sqrt(1.5)). 0 disables velocity-field smoothing entirely:
@@ -667,7 +1391,17 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                        velocity_smooth_mask_mode=gate_mode)
         with NormalGate(seg, sigma_scale=gate_sigma_scale,
                          coherence_threshold=gate_coherence_threshold, mode=gate_mode,
-                         everywhere=gate_everywhere, denominator=gate_denominator):
+                         everywhere=gate_everywhere, denominator=gate_denominator,
+                         dilution=gate_dilution, combine=gate_combine,
+                         combine_beta=gate_combine_beta, nu_scale=gate_nu_scale,
+                         nu_scale_wm=gate_nu_scale_wm,
+                         nu_scale_decay=gate_nu_scale_decay,
+                         magnitude=gate_magnitude, where=gate_where,
+                         fill_coherence=gate_fill_coherence,
+                         blade_thickness=gate_blade_thickness,
+                         sigmoid_width_deg=gate_sigmoid_width_deg,
+                         sigmoid_center_deg=gate_sigmoid_center_deg,
+                         reference=gate_reference, field_eps=gate_field_eps):
             thickness, velocity = kelly_kapowski_cuda(seg, gm_prob, wm_prob, **kwargs)
     else:
         thickness, velocity = kelly_kapowski_cuda(seg, gm_prob, wm_prob, **kwargs)
@@ -1439,7 +2173,11 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
               retract_from_round=None, retract_step=0.25, retract_min_s=1.0,
               retract_rings=0, retract_stats=None,
               damp_on_intersect=False, damp_factor=0.5, damp_from_round=0,
-              damp_on_wm=False, damp_wm_floor=None, damp_stats=None):
+              damp_on_wm=False, damp_wm_floor=None, damp_stats=None,
+              smooth_iters_final=None,
+              sample_gate=None, sample_gate_denominator='plain',
+              sample_sigmoid_width_deg=32.0, sample_sigmoid_center_deg=90.0,
+              sample_offset=False):
     """mode='naive': single-pass, 10-step propagation with the raw
     (un-smoothed) vertex normals used only as a floor projection against
     inward motion — i.e. the shipped/obvious approach with none of this
@@ -1546,12 +2284,29 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
         edge_arr = np.unique(np.sort(np.vstack([_f[:, [0, 1]], _f[:, [1, 2]],
                                                 _f[:, [2, 0]]]), axis=1), axis=0)
 
+    _samp_slope = (2.0 * float(np.log(9.0)) / max(sample_sigmoid_width_deg, 1e-6)
+                    if sample_gate == 'sigmoid' else None)
+
     def sample_field_vox(pos_vox):
         # velocity is stored with (d,h,w) components matching voxel-index
         # order 1:1 (verified against a known-good reference in this
         # investigation, r=0.998, no permutation needed).
-        return np.stack([map_coordinates(velocity[..., k], pos_vox.T, order=1, mode='nearest')
-                          for k in range(3)], axis=1)
+        #
+        # With `sample_gate` the 8 trilinear corners are weighted by their
+        # agreement with the interface normal at the sample point, exactly as
+        # the velocity smoothing weights its Gaussian neighbourhood. Plain
+        # trilinear averages opposing banks one grid cell apart: measured on
+        # sub-POBHC0001 at the white surface, 9.8%/9.3% of vertices (lh/rh)
+        # have at least one corner in the opposing half-space and 25% have one
+        # below cos 0.5, which attenuates the sampled magnitude to 0.941 of
+        # plain on average and turns it 0.56 deg (p99 6.3, max 177.6).
+        if sample_gate in (None, 'none'):
+            return np.stack([map_coordinates(velocity[..., k], pos_vox.T, order=1, mode='nearest')
+                              for k in range(3)], axis=1)
+        return gated_trilinear(velocity, gu, pos_vox, sample_gate,
+                                sig_slope=_samp_slope,
+                                center_deg=sample_sigmoid_center_deg,
+                                denominator=sample_gate_denominator)
 
     def outward_step_tkr(pos_vox, sample_vox=None):
         # DiReCT's velocity convention points from GM into WM, so the
@@ -1593,7 +2348,20 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
         dd = map_coordinates(sdt, pos.T, order=1, mode='nearest')
         in_wm = dd < 0
         sample_pos = pos.copy()
-        if in_wm.any():
+        # OFF BY DEFAULT since 2026-09-11. The offset was a workaround for the
+        # field being identically zero deep in WM, and it makes a vertex step on
+        # a field sampled ~0.5mm away from where the vertex actually is -- at
+        # rh 91538 that routes the sample past its own voxel onto a neighbour
+        # whose field points the wrong way. Measured cost of turning it off,
+        # bert lh/rh, reference='field': fundus travel 1.574/1.648 -> 1.376/1.446,
+        # fundus CSF arrival 5.3/6.7% -> 3.5/4.1%, crown arrival 55.7/52.8% ->
+        # 52.3/49.2%; self-intersections 252/116 -> 173/36 and flipped_face_pct
+        # 0.0079/0.0030 -> 0.0067/0.0015. So it trades reach for a cleaner mesh.
+        # The collapse the offset was guarding against does NOT happen -- the
+        # trilinear stencil still picks up live corners when the centre voxel is
+        # dead, so the "field is exactly zero more than ~1 voxel deep" rationale
+        # overstated its own necessity. Re-enable with --sample-offset.
+        if sample_offset and in_wm.any():
             offset = np.zeros(len(pos))
             offset[in_wm] = -dd[in_wm] + 0.25
             nu_vox = np.stack([map_coordinates(gu[..., k], pos.T, order=1, mode='nearest')
@@ -1645,8 +2413,17 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, mode='best',
             round_floor = floor_after
         else:
             round_floor = np.where(no_push, floor, floor_after)
+        # `smooth_iters_final` relaxes the LAST round differently from the rest.
+        # With 0 the final field step is left alone: the pial's smoothness then
+        # comes from the relaxation already applied on every earlier round,
+        # rather than from one more pass that also pulls the surface back in.
+        # Note iters=0 skips the floor projection too -- build_constrained_white
+        # enforces the floor inside the iteration loop, so a round with no
+        # iterations enforces nothing.
+        _iters = (smooth_iters if (smooth_iters_final is None or rnd < rounds - 1)
+                   else smooth_iters_final)
         cur = build_constrained_white(stepped, faces, seg, tovox, totkr,
-                                       floor=round_floor, iters=smooth_iters, lam=lam,
+                                       floor=round_floor, iters=_iters, lam=lam,
                                        cache=relax_cache, edges=edge_arr,
                                        edge_ts=edge_ts, face_floor=face_floor)
         if pin_w is not None:
@@ -1815,6 +2592,13 @@ def evaluate_surface(white_verts, pial_verts, faces, seg, tovox, n_samples=41,
 # five fixes can be searched over instead of only toggled as a bundle.
 # ---------------------------------------------------------------------------
 
+# The solver's own num_integration_points. The saved Velocity.nii.gz is a
+# PER-INTEGRATION-POINT field, so propagating it this many times at the full
+# step reproduces the solve's total deformation; step_scale below is measured
+# against that.
+NUM_INTEGRATION_POINTS = 10
+
+
 @dataclasses.dataclass
 class PipelineConfig:
     """Every free parameter in the field-propagated pial pipeline. The
@@ -1825,32 +2609,113 @@ class PipelineConfig:
     use_normal_gate: bool = True
     gate_sigma_scale: float = 2.0
     gate_coherence_threshold: float = 0.7
-    gate_mode: str = 'soft'
-    # 'masked' = the shipped gate; 'plain' divides by the plain Gaussian weight
-    # sum so opposing neighbours attenuate rather than being renormalised away.
-    gate_denominator: str = 'masked'
-    # ANTs' -b, in voxels. None keeps the solver default sqrt(1.5) = 1.2247.
-    velocity_smooth_sigma: float = None
-    gate_everywhere: str = 'same'    # None | 'wide' | 'same': mask-average outside bipolar too
+    # 'soft' (linear (1+cos)/2 ramp), 'hard' (cut at 90 degrees), 'relu'
+    # (max(cos, 0): continuous, but zero from 90 degrees on), or 'sigmoid':
+    # a neighbour `gate_sigmoid_center_deg` off-axis counts half, and the weight
+    # falls from 0.9 to 0.1 across `gate_sigmoid_width_deg` centred there. Both
+    # are degrees and independent of one another, so a grid over them is a grid
+    # over position and sharpness separately -- see NormalGate. A narrow width
+    # at 90 degrees reproduces 'hard'.
+    gate_mode: str = 'relu'
+    gate_sigmoid_center_deg: float = 90.0
+    gate_sigmoid_width_deg: float = 32.0
+    # 'plain' (default) divides by the plain Gaussian weight sum so opposing
+    # neighbours attenuate rather than being renormalised away; 'masked' is the
+    # shipped gate, which renormalises back to full magnitude; 'support' divides
+    # by the weight of the neighbours the gate did not reject, which is between
+    # the two; 'neumann' treats a rejected neighbour as a no-flux boundary and
+    # gives it the centre's value, which is the only one of the four that
+    # reproduces a constant field exactly -- see NormalGate.
+    gate_denominator: str = 'plain'
+    # None keeps `gate_denominator`; a number in [0, 1] replaces it with the
+    # continuum den = (1-a)*sum(w) + a*sum_{dw>0} w. a=0 == 'plain',
+    # a=1 == 'support'. See NormalGate.
+    gate_dilution: float = None
+    # None | 'both' | 'blend': use the normal AND field references at EVERY
+    # voxel instead of choosing one (or partitioning space, as 'hybrid' does).
+    # gate_combine_beta is the mix: 1.0 == reference 'normal', 0.0 == 'field'.
+    gate_combine: str = None
+    gate_combine_beta: float = 0.5
+    # 'gated' (default) or 'scalar': where the smoothed field's MAGNITUDE comes
+    # from. See NormalGate -- 'scalar' takes it from a Gaussian on |v| and uses
+    # the gate only for direction, which makes `gate_denominator` inert.
+    gate_magnitude: str = 'gated'
+    # 'normal' (geometry, cached) or 'field' (the velocity about to be averaged,
+    # recomputed each iteration) -- which coherence selects WHERE the bilateral
+    # filter applies. Only consulted when gate_everywhere is 'same' or off.
+    gate_where: str = 'normal'
+    # --gate-combine nuscale only: the magnitude nu is scaled to, in velocity
+    # units (voxels per integration point). 0 == reference 'field'.
+    gate_nu_scale: float = 0.2
+    # 'normal' (default) gates on the cosine between WM INTERFACE NORMALS;
+    # 'field' gates on the cosine between the VELOCITY vectors, which is
+    # direct_cuda's own criterion -- an ablation of the reference alone, every
+    # other part of the filter held fixed. `gate_field_eps` (voxels) guards
+    # against normalising a near-zero velocity: those centres are left
+    # unsmoothed and those neighbours get no weight. Inert when
+    # reference='normal'.
+    # 'hybrid' reads nu inside the WM label and the unit velocity outside it.
+    # The vertex sampler reads the field at off-grid positions by trilinear
+    # interpolation, which averages the 8 surrounding voxels on distance alone.
+    # `sample_gate` applies the same direction weighting the velocity smoothing
+    # uses to those 8 corners (see gated_trilinear); None/'none' keeps the plain
+    # interpolation. The sigmoid parameters are shared with the smoothing gate.
+    sample_gate: str = None
+    sample_gate_denominator: str = 'plain'
+    # DEFAULT 'field' since 2026-09-11, replacing 'normal'. The two were judged
+    # on raw self_intersections, which turned out to reward the WRONG surface:
+    # 'normal' scored 0 by holding opposing sulcal banks ~6mm apart so they never
+    # touch. Real sulci are closed. Scored against FSR's pial.raw (itself
+    # intersection-free), fraction of vertices whose opposing-bank gap is
+    # <= 0.5mm: pial.raw 8.3/8.4%, field 4.9/4.8%, normal 1.3/1.5%, and travel
+    # 2.56/2.59 vs 2.48/2.48 vs 2.29/2.29. Classifying every intersecting face
+    # by its nearest non-adjacent contact, 'field' is 97-100% opposing-bank
+    # contacts with ZERO local folds, at 0.009%/0.066% of faces -- against
+    # FreeSurfer's delivered pial at 2.3-2.4% of faces, two thirds of them
+    # genuine folds. So 'field' is both more anatomical and fold-free.
+    gate_reference: str = 'field'
+    gate_field_eps: float = 1e-3
+    # ANTs' -b, in voxels. None would keep the solver default sqrt(1.5) = 1.2247;
+    # 1.0 is a mild reduction, measured on one case to add ~0.31mm of travel in
+    # every gate mode. Below 1.0 the mesh tangles steeply (b=0.9 -> ~1700
+    # intersecting faces per hemisphere, b=0.8 -> ~8000) and refinement does not
+    # remove it.
+    velocity_smooth_sigma: float = 1.0
+    # None ('off') | 'wide' | 'same' | 'same-all'; see NormalGate.selective_normal
+    # for the four (where x sigma) combinations. 'same' honours
+    # gate_coherence_threshold; 'wide' and 'same-all' apply the averaging at
+    # every voxel and ignore it.
+    # 'same-all' is the default because it is what every result on this branch
+    # was actually measured with: before the threshold was wired up, 'same'
+    # ignored it and masked every voxel. Verified equivalent to the fixed
+    # 'same' at --gate-threshold 1.0 (bit-identical, 36 hemispheres' worth of
+    # solve on one case). Pass --gate-everywhere same to gate on the threshold.
+    gate_everywhere: str = 'same-all'
     # 1.0 matches the shipped solver, keeping --write-thickness comparable to
     # stock DiReCT; 0.35 was the surface-tested best. See module docstring (2).
     smoothing_sigma: float = 1.0
     gradient_sigma: float = None  # None = follow smoothing_sigma; see solve_velocity_field
-    use_sulcal_sheet: bool = True
+    use_sulcal_sheet: bool = False   # opt in with --sulcal-sheet
     dip_threshold: float = 0.95
     sheet_frac: float = 0.0
     # False: propagate from ?h.white directly. mode='best' samples the field
     # just outside WM for in-WM vertices, which covers fix #4's premise -- see
     # the module docstring note under (4).
     use_constrained_start: bool = False
-    constrained_floor: float = -0.5
-    # 0.5mm of clearance outside WM from round 2 on. Measured at sigma=0.35:
-    # non-exempt end-in-WM 142/174 -> 12/12 and vertices under 0.5mm clearance in
-    # real cortex 250/396 -> 0/3, for ~20% more flipped faces. Vertices with no
-    # cortex to move into are exempt (exclude_no_cortex), which is what keeps the
-    # constraint off hippocampus, midline and deep-WM closures -- unmasked it
-    # would act almost entirely where it is wrong. See propagate().
-    constrained_floor_after: float = 0.5
+    # THE FLOOR IS OFF BY DEFAULT. -inf never triggers the projection in
+    # build_constrained_white, so the per-round relaxation runs unconstrained
+    # and the pial goes where the field takes it. Restore the old behaviour
+    # with --floor -0.5 --floor-after 0.5.
+    constrained_floor: float = -np.inf
+    # None keeps `constrained_floor` for every round; a number is the clearance
+    # outside WM required from `constrained_floor_after_round` on. At 0.5,
+    # measured at sigma=0.35: non-exempt end-in-WM 142/174 -> 12/12 and vertices
+    # under 0.5mm clearance in real cortex 250/396 -> 0/3, for ~20% more flipped
+    # faces. Vertices with no cortex to move into are exempt
+    # (exclude_no_cortex), which is what keeps the constraint off hippocampus,
+    # midline and deep-WM closures -- unmasked it would act almost entirely
+    # where it is wrong. See propagate().
+    constrained_floor_after: float = None
     constrained_floor_after_round: int = 1  # 0-based round at which floor_after starts
     exclude_no_cortex: bool = True  # exempt hippocampus/midline/deep-WM; see build_no_push_mask
     # Which no-cortex vertices to hold at the white surface; see build_pin_mask.
@@ -1867,13 +2732,49 @@ class PipelineConfig:
     # over-constraint of medial temporal cortex -- see build_no_push_mask.
     pin_rings: int = 0
     escape_in_no_cortex: bool = False  # allow the escape substitution there
+    # Sample the field AT the vertex rather than just outside WM. False since
+    # 2026-09-11 -- the offset was a workaround for the dead WM shell; see
+    # propagate(). Costs reach, buys a cleaner mesh; --sample-offset restores it.
+    sample_offset: bool = False
+    # Taubin iterations for the ONE-OFF constrained start (use_constrained_start).
     constrained_iters: int = 8
+    # Taubin iterations for the PER-ROUND relaxation inside propagate(). These
+    # were two different things being conflated: constrained_iters was never
+    # passed to propagate, which silently used its own default of 8, so setting
+    # constrained_iters had no effect on the propagation at all.
+    # DEFAULT 2 (was 8) with relax_iters_final 1, since 2026-09-11. Validated at
+    # 36 hemispheres, each cell paired with its own 8/8 control on the same
+    # hemisphere, for all three gate references: transit, crossed_csf and
+    # end_in_wm all lower on 36/36 (35/36 on one cell). Self-intersections also
+    # fell 36/36 but that component is not interpretable on its own -- see the
+    # gate_reference note. Costs 0.033-0.041mm of travel on 36/36, which on the
+    # closed-sulci reading is a real cost rather than neutral.
+    relax_iters: int = 2
+    # Relaxation for the FINAL round only; None = same as relax_iters. 1 is an
+    # ODD count, so it ends on an unpaired Taubin shrink (lambda=+0.51) with no
+    # compensating inflation -- that is what makes it work, and why 0 (no
+    # relaxation and no floor projection on that round) is weaker.
+    relax_iters_final: int = 1
     constrained_lam: float = 0.51  # matched to pymeshlab's own filter — see build_constrained_white
     propagation_mode: str = 'best'  # 'naive' or 'best'
-    propagation_rounds: int = 10
+    # 20 rounds at half the step (see step_scale) rather than 10 at the full
+    # step: the same total deformation, taken more finely. Measured on one case
+    # at b=1.0, that cut self-intersections 178 -> 132 and moved the surface
+    # 0.010mm; at b=0.9 it cut them 1738 -> 1202. Past 20 they rise again.
+    propagation_rounds: int = 20
     num_integration_points: int = None  # None = solver default (10); ties to propagation_rounds
     gradient_gate: float = None  # None = solver default 1e-3; absolute, so it interacts with sigma
-    step_scale: float = None  # None = full field step per round; see propagate()
+    # The solver's Euler step in mm (direct_cuda default 0.025). It is NOT
+    # divided by num_integration_points: the inner loop composes one increment
+    # of this size per point, so the point count sets how far the descent runs,
+    # not how finely a fixed distance is covered. Halving this while doubling
+    # the points is what actually refines the integration at fixed total step.
+    gradient_step: float = None   # None = solver default
+    # None = the whole field step per round, so `rounds` multiplies the total
+    # deformation. NUM_INTEGRATION_POINTS/rounds instead keeps the total fixed
+    # and only refines the stepping, which is what --keep-total-step computes
+    # and what the default pairs with propagation_rounds=20.
+    step_scale: float = 0.5
     # OFF by default since the frame fix. Escape substitutes an outward step for a
     # vertex whose field step points into WM; with the field and the surface finally
     # sharing one WM boundary (--wm-from-surface) that case has largely stopped
@@ -1887,12 +2788,30 @@ class PipelineConfig:
     damp_wm_floor: float = None
     damp_factor: float = 0.5
     speed_floor: float = None        # clamp DiReCT's speed term; None = ANTs behaviour
-    freeze_wm_field: bool = True     # hold the WM-side field at its iteration-1 value
+    freeze_wm_field: bool = False    # opt in with --freeze-wm-field
     freeze_wm_direction: bool = False # hold only its ORIENTATION; magnitude evolves
     wm_project_smoothing: bool = False # in WM, project the smoothing update onto the existing axis
+    # Inert unless freeze_wm_field is on, which it is not by default.
     freeze_wm_release_final: bool = True  # release the freeze for the last iteration
     freeze_wm_until: int = None      # freeze only the first N solve iterations
     freeze_wm_weight: float = 1.0    # 1 = overwrite with the frozen field, 0.5 = average
+
+
+def describe_config(config, prefix='  '):
+    """The resolved configuration, one field per line, differences marked.
+
+    Printed by main() so a run's log says what produced it. Without this the
+    only record of which of the many reachable configurations an output
+    directory came from is the shell history that launched it, which does not
+    survive the session.
+    """
+    lines = []
+    ref = PipelineConfig()
+    for f in dataclasses.fields(config):
+        val = getattr(config, f.name)
+        mark = '' if val == getattr(ref, f.name) else '   <- non-default'
+        lines.append('%s%-28s %s%s' % (prefix, f.name, val, mark))
+    return '\n'.join(lines)
 
 
 NAIVE_CONFIG = PipelineConfig(
@@ -1947,11 +2866,21 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
             seg, gmT_use, wmT_use, ref_img, velocity_prefix,
             smoothing_sigma=config.smoothing_sigma, gradient_sigma=config.gradient_sigma,
             num_integration_points=config.num_integration_points,
-            gradient_gate=config.gradient_gate,
+            gradient_gate=config.gradient_gate, gradient_step=config.gradient_step,
             use_normal_gate=config.use_normal_gate,
             gate_sigma_scale=config.gate_sigma_scale,
             gate_coherence_threshold=config.gate_coherence_threshold, gate_mode=config.gate_mode,
+            gate_sigmoid_width_deg=config.gate_sigmoid_width_deg,
+            gate_sigmoid_center_deg=config.gate_sigmoid_center_deg,
             gate_denominator=config.gate_denominator,
+            gate_dilution=config.gate_dilution,
+            gate_combine=config.gate_combine,
+            gate_combine_beta=config.gate_combine_beta,
+            gate_magnitude=config.gate_magnitude,
+            gate_where=config.gate_where,
+            gate_nu_scale=config.gate_nu_scale,
+            gate_reference=config.gate_reference,
+            gate_field_eps=config.gate_field_eps,
             velocity_smooth_sigma=config.velocity_smooth_sigma,
             speed_floor=config.speed_floor, freeze_wm_field=config.freeze_wm_field,
             freeze_wm_direction=config.freeze_wm_direction,
@@ -2032,7 +2961,14 @@ def run_pipeline(config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
                           damp_on_intersect=config.damp_on_intersect,
                           damp_on_wm=config.damp_on_wm,
                           damp_wm_floor=config.damp_wm_floor,
-                          damp_factor=config.damp_factor)
+                          damp_factor=config.damp_factor,
+                          smooth_iters=config.relax_iters,
+                          smooth_iters_final=config.relax_iters_final,
+                          sample_offset=config.sample_offset,
+                          sample_gate=config.sample_gate,
+                          sample_gate_denominator=config.sample_gate_denominator,
+                          sample_sigmoid_width_deg=config.gate_sigmoid_width_deg,
+                          sample_sigmoid_center_deg=config.gate_sigmoid_center_deg)
         if out_dir:
             nib.freesurfer.io.write_geometry(
                 os.path.join(out_dir, '%s.pial.%s' % (hemi, tag)),
@@ -2113,32 +3049,180 @@ def main():
                     help="solver's absolute gradient-magnitude gate (default 1e-3). Lower it when "
                          "using a small --sigma, whose gradients are much smaller: 54%% of GM "
                          "voxels fall under the default gate at sigma=0.35 against 3.7%% at 1.0.")
+    p.add_argument('--gradient-step', type=float, default=None, metavar='MM',
+                    help="the solver's Euler step in mm (default 0.025). NOT divided by "
+                         "--integration-points: each integration point composes one increment "
+                         "of this size, so raising the point count runs the descent further "
+                         "rather than refining it. Halve this while doubling the points to "
+                         "refine the integration at a fixed total step.")
     p.add_argument('--integration-points', type=int, default=None,
                     help="solver's num_integration_points. The saved velocity field is "
                          "per-integration-point, so the matched --rounds equals this.")
-    p.add_argument('--rounds', type=int, default=10,
+    p.add_argument('--rounds', type=int, default=PipelineConfig.propagation_rounds,
                     help='propagation rounds (default 10, matching the solver\'s integration points)')
     p.add_argument('--keep-total-step', action='store_true',
-                    help='with --rounds, scale each step by 10/rounds so the total deformation is '
-                         'unchanged -- i.e. take more, shorter steps rather than travelling further')
+                    help='accepted and ignored; this is now the default (see --no-keep-total-step).')
+    p.add_argument('--no-keep-total-step', action='store_true',
+                    help='let each round apply the WHOLE field step, so --rounds multiplies the '
+                         'total deformation instead of only refining the stepping. The default '
+                         'scales each step by %d/rounds, keeping the total fixed.'
+                         % NUM_INTEGRATION_POINTS)
+    p.add_argument('--sulcal-sheet', action='store_true',
+                    help='enable the fractional sulcal-CSF-sheet repair (fix #3). OFF by default; '
+                         'see the module docstring for what the ablation measured.')
     p.add_argument('--no-sulcal-sheet', action='store_true',
-                    help='disable the fractional sulcal-CSF-sheet repair (fix #3). Diagnostic.')
-    p.add_argument('--gate-everywhere', choices=('wide','same','off'), default=None,
-                    help="apply the normal-masked averaging at EVERY voxel, not only where the "
-                         "WM-normal coherence is below threshold. 'wide' uses the widened sigma "
-                         "the bipolar branch uses; 'same' uses the plain sigma so only the "
-                         "direction weighting changes. 'off' restores the shipped behaviour of gating only the bipolar voxels. Default: same.")
+                    help='force the sulcal-CSF-sheet repair off. It is off by default, so this '
+                         'only overrides an explicit --sulcal-sheet.')
+    p.add_argument('--gate-everywhere', choices=('wide', 'same', 'same-all', 'off'), default=None,
+                    help="where the normal-masked averaging is applied, and at which sigma. "
+                         "'same-all' (default) applies it at EVERY voxel at the plain sigma, "
+                         "ignoring --gate-threshold; this is what every measured result on this "
+                         "branch used. 'same' is the same kernel but only at the voxels "
+                         "--gate-threshold selects (9.9%% of them at 0.7). 'wide' applies it "
+                         "everywhere at the widened sigma (sigma * gate_sigma_scale). 'off' is "
+                         "the shipped gate: threshold-selected voxels at the widened sigma.")
     p.add_argument('--velocity-smooth-sigma', type=float, default=None, metavar='B',
                     help="ANTs' -b: sigma in voxels for the velocity-field smoothing "
                          "(default sqrt(1.5) = 1.2247). 0 disables that smoothing "
                          "entirely. Independent of --sigma, which sets the gradient "
                          "and hit/total kernels.")
-    p.add_argument('--gate-denominator', choices=('masked', 'plain'), default='masked',
-                    help="how the normal-gated smoothing normalises. 'masked' (default, "
-                         "shipped) divides by the sum of the direction weights, so a voxel "
-                         "whose neighbours mostly disagree is still renormalised to full "
-                         "magnitude. 'plain' divides by the plain Gaussian weight sum, so "
-                         "opposing fields slow each other down instead.")
+    p.add_argument('--gate-mode', choices=('soft', 'hard', 'relu', 'sigmoid'), default=None,
+                    help="how a neighbour's agreement becomes a weight. 'soft' (default): the "
+                         "linear ramp (1+cos)/2, so an orthogonal neighbour still counts half. "
+                         "'hard': 1 inside 90 degrees, 0 outside. 'relu': max(cos, 0) -- "
+                         "continuous like soft but reaching zero at 90 degrees. 'sigmoid': "
+                         "a neighbour at --gate-sigmoid-center-deg off-axis counts half, and "
+                         "the weight falls 0.9 -> 0.1 over --gate-sigmoid-width-deg around it. "
+                         "Both are angles and are independent of each other.")
+    p.add_argument('--gate-sigmoid-width-deg', type=float, default=None, metavar='DEG',
+                    help='angular span over which the weight falls from 0.9 to 0.1, for '
+                         '--gate-mode sigmoid (default %.0f degrees). Independent of the centre: '
+                         'the span is the same number of degrees wherever the centre is put. '
+                         'Small values approach the hard cut.'
+                         % PipelineConfig.gate_sigmoid_width_deg)
+    p.add_argument('--gate-sigmoid-center-deg', type=float, default=None, metavar='DEG',
+                    help='ANGLE at which a neighbour counts half, for --gate-mode sigmoid '
+                         '(default %.0f degrees, where the hard cut sits). Below 90 demands '
+                         'closer agreement; above 90 admits neighbours past a right angle. '
+                         'Independent of --gate-sigmoid-width-deg.'
+                         % PipelineConfig.gate_sigmoid_center_deg)
+    p.add_argument('--gate-threshold', type=float, default=None, metavar='C',
+                    help='WM-normal coherence below which a voxel is treated as bipolar and gets '
+                         'the masked averaging (default %.2f). Lower = fewer voxels gated.'
+                         % PipelineConfig.gate_coherence_threshold)
+    p.add_argument('--gate-denominator', choices=('masked', 'plain', 'support', 'neumann'),
+                    default='plain',
+                    help="how the normal-gated smoothing normalises. 'plain' (default) "
+                         "divides by the plain Gaussian weight sum, so opposing fields slow "
+                         "each other down. 'masked' (the shipped gate) divides by the sum of "
+                         "the direction weights, so a voxel whose neighbours mostly disagree "
+                         "is still renormalised to full magnitude. 'support' divides by the "
+                         "plain weight of the neighbours the gate did not reject: a rejected "
+                         "neighbour dilutes nothing, a partly-disagreeing one still does. "
+                         "'neumann' gives a rejected neighbour the CENTRE's value (no flux), so "
+                         "the weights sum to one and a constant field is preserved exactly.")
+    p.add_argument('--gate-dilution', type=float, default=None, metavar='A',
+                    help='overrides --gate-denominator with a continuum: the divisor is '
+                         '(1-A)*sum(w) + A*sum_{dw>0}w, i.e. how much a neighbour the gate '
+                         'REJECTED still dilutes. A=0 is plain (full dilution, the default), '
+                         'A=1 is support (none). Lifts the field more where more of the '
+                         'neighbourhood opposes, i.e. more at a sulcal fundus than a crown.')
+    p.add_argument('--gate-combine', choices=('both', 'blend', 'nuscale'), default=None,
+                    help="use the normal AND field references at every voxel, instead of "
+                         "choosing one via --gate-reference. 'both' multiplies the two "
+                         "direction weights (a neighbour must agree on geometry AND flow); "
+                         "'blend' takes one cosine against a mixed direction. Both reduce to "
+                         "reference 'normal' at --gate-combine-beta 1 and 'field' at 0.")
+    p.add_argument('--gate-nu-scale', type=float, default=0.2, metavar='S',
+                    help='--gate-combine nuscale only: u = normalize(S*(-nu) + v) with v RAW, '
+                         'so the interface normal dominates where |v| << S and backs off where '
+                         '|v| >> S. S=0 is reference field; large S tends to normal. In velocity '
+                         'units -- GM median |v| is ~0.38 on 1mm data. Default %(default)g.')
+    p.add_argument('--gate-blade-thickness', type=float, default=3.0, metavar='MM',
+                    help='--gate-where blade/field-or-blade: WM sheets at or below this '
+                         'thickness count as blades. Default %(default)g mm.')
+    p.add_argument('--gate-where', choices=('normal', 'field', 'blade', 'field-or-blade'),
+                    default='normal',
+                    help="which coherence decides WHERE the bilateral filter applies, for "
+                         "--gate-everywhere same. 'normal' is |G*nu|/(G*|nu|), geometric and "
+                         "cached; 'field' is |G*v|/(G*|v|) on the velocity about to be averaged, "
+                         "recomputed each iteration. Thresholds do NOT transfer between them: "
+                         "nu coherence runs ~0.86 median, field coherence ~0.93-0.99.")
+    p.add_argument('--gate-magnitude', choices=('gated', 'scalar'), default='gated',
+                    help="where the smoothed velocity's MAGNITUDE comes from. 'gated' (default) "
+                         "reads it off the same weighted average that sets the direction, so the "
+                         "denominator decides it. 'scalar' takes it from a Gaussian on |v| and "
+                         "uses the gate for direction only; |v| cannot cancel, so opposing banks "
+                         "no longer attenuate. Makes --gate-denominator inert.")
+    p.add_argument('--gate-combine-beta', type=float, default=0.5, metavar='B',
+                    help='the mix for --gate-combine: 1.0 is all normal, 0.0 all field. '
+                         'Default %(default)g.')
+    p.add_argument('--close-tissue', type=int, default=0, metavar='RADIUS',
+                    help='SENSITIVITY TEST: morphologically close the GM+WM mask with this '
+                         'radius and relabel the voxels it adds as grey matter, erasing the thin '
+                         'sulcal CSF sheet between opposing banks. Measures how much of the pial '
+                         'is held in place by the CSF rather than by the field, the gate or the '
+                         'relaxation. 0 (default) disables it. Not a pipeline step.')
+    p.add_argument('--relax-iters', type=int, default=None,
+                    help='Taubin iterations in the per-round constrained relaxation inside '
+                         'propagate (PipelineConfig.relax_iters, default %d). NOTE odd and even '
+                         'counts are different operations: build_constrained_white alternates '
+                         'lambda=+0.51 (shrink) on even iterations with mu=-0.53 (inflate) on '
+                         'odd ones, so an ODD count ends on an unpaired shrink. Measured on one '
+                         'subject, every odd count gave zero self-intersections on both '
+                         'hemispheres while even counts rose with the iteration count. Do not '
+                         'compare an odd setting against an even one as if it were a ladder.'
+                         % BEST_CONFIG.relax_iters)
+    p.add_argument('--relax-iters-final', type=int, default=None,
+                    help='Taubin iterations for the LAST propagation round only; the default '
+                         'is whatever PipelineConfig.relax_iters_final says. 0 leaves the final field step unrelaxed, so the '
+                         "pial's smoothness comes from the earlier rounds instead of from a "
+                         'final pass that also pulls it back in. NOTE 0 also skips the floor '
+                         'projection on that round, which build_constrained_white only applies '
+                         'inside its iteration loop.')
+    p.add_argument('--sample-gate', choices=('none', 'soft', 'hard', 'relu', 'sigmoid'),
+                    default=None,
+                    help='apply the gate to the VERTEX SAMPLING as well as the velocity '
+                         'smoothing. propagate() reads the field at off-grid vertex positions '
+                         'by trilinear interpolation, which averages the 8 surrounding voxels on '
+                         'distance alone -- across a thin sulcal bank those can carry opposing '
+                         'velocity. This weights the 8 corners by agreement with the interface '
+                         "normal at the sample point, using the same weight function. 'none' "
+                         '(the default) keeps plain trilinear.')
+    p.add_argument('--sample-offset', action='store_true',
+                    help='restore the pre-2026-09-11 behaviour: for a vertex inside WM, sample '
+                         'the field just OUTSIDE the WM boundary rather than at the vertex. A '
+                         'workaround for the dead WM shell; costs accuracy where the two '
+                         'locations disagree. See propagate() for the measured trade.')
+    p.add_argument('--sample-gate-denominator', choices=('masked', 'plain', 'support'),
+                    default='plain',
+                    help="as --gate-denominator, for --sample-gate. 'plain' (default) attenuates "
+                         "the step where the corners disagree; 'masked' renormalises it; "
+                         "'support' ignores the rejected corners in the divisor.")
+    p.add_argument('--gate-reference',
+                    choices=('normal', 'field', 'field-nu', 'field-nu-pos', 'field-fill',
+                             'hybrid', 'hybrid-neg',
+                             'warped-normal', 'warped-split'),
+                    default=None,   # None -> PipelineConfig.gate_reference
+                    help="what the gate's cosine is taken against; the default is whatever "
+                         "PipelineConfig.gate_reference says. 'normal' is the WM "
+                         "interface normal at the centre voxel -- geometric, fixed for the whole "
+                         "solve. 'field' the velocity vector at the centre voxel, which is "
+                         "direct_cuda's own criterion; an ablation of the reference alone, with "
+                         'the weighting mode, denominator and everywhere/threshold branch '
+                         "unchanged. 'hybrid' takes the normal inside the WM label and the "
+                         "field everywhere else. 'warped-normal' recomputes the interface normal "
+                         'each outer iteration from the WARPED WM boundary instead of using the '
+                         'original one for the whole solve; costs one distance transform per '
+                         "iteration. 'warped-split' compares the CENTRE -- the warped WM normal "
+                         'outside the warped WM, the field inside it -- against the FIELD at the '
+                         'neighbours.')
+    p.add_argument('--gate-field-eps', type=float, default=1e-3,
+                    help='--gate-reference field/hybrid/hybrid-neg only: velocity magnitude '
+                         '(voxels) below '
+                         'which a '
+                         'voxel is treated as having no direction. Such a centre is left '
+                         'unsmoothed and such a neighbour gets no weight. Default %(default)g.')
     p.add_argument('--no-normal-gate', action='store_true',
                     help='disable the interface-normal gating of velocity smoothing (fix #1) and '
                          "use the solver's plain isotropic smoothing. Diagnostic.")
@@ -2151,10 +3235,15 @@ def main():
     p.add_argument('--no-exclude', action='store_true',
                     help='do NOT exempt hippocampus/amygdala/corpus-callosum/deep-WM vertices '
                          'from --floor-after (diagnostic; the exemption is on by default)')
-    p.add_argument('--floor-after', type=float, default=0.5,
-                    help='signed-distance floor for the per-round relaxation from round 2 '
-                         'onward (round 1 keeps --floor). 0.0 forbids the pial from sitting '
-                         'inside WM at all after the first round.')
+    p.add_argument('--floor', type=float, default=None, metavar='D',
+                    help='signed-distance floor for the per-round relaxation (negative = how '
+                         'far inside WM a vertex may sit). Omitted: no floor at all, which is '
+                         'the default. The tested-best configuration was --floor -0.5.')
+    p.add_argument('--floor-after', type=float, default=None,
+                    help='tighten the floor to this value from --floor-after-round on (round 1 '
+                         'by default), leaving --floor for the first round. Omitted: --floor '
+                         'holds throughout. The tested-best configuration was --floor-after 0.5; '
+                         '0.0 forbids the pial from sitting inside WM at all after round 1.')
     p.add_argument('--escape', action='store_true',
                     help="re-enable the escape mechanism, which substitutes an outward step for "
                          "a vertex whose field step points into WM. OFF by default since the "
@@ -2201,10 +3290,11 @@ def main():
                     help='hold the ORIENTATION of the WM-side field at its first-iteration '
                          'value while letting its magnitude evolve. DEVIATES FROM ANTs.')
     p.add_argument('--no-freeze-wm', action='store_true',
-                    help='disable the WM-field freeze (on by default, released for the final '
-                         'iteration so the field the surface rides is ordinarily smoothed).')
+                    help='force the WM-field freeze off. It is off by default, so this only '
+                         'overrides an explicit --freeze-wm-field.')
     p.add_argument('--freeze-wm-field', action='store_true',
-                    help='hold the velocity inside white matter at its first-iteration value. '
+                    help='hold the velocity inside white matter at its first-iteration value, '
+                         'released for the final iteration (see --release-final). OFF by default. '
                          'WM velocity is only smoothing spill-over from cortex, and about half '
                          'the white-surface vertices sample it. DEVIATES FROM ANTs.')
     p.add_argument('--speed-floor', type=float, default=None, metavar='V',
@@ -2231,6 +3321,10 @@ def main():
     # whole-brain quantities — solved ONCE and reused for every hemisphere,
     # rather than repeating the (expensive) GPU solve per hemisphere.
     gm_prob, wm_prob, ref_img = load_gm_wm_probability(args.prep_dir)
+    if args.close_tissue:
+        # Before build_seg_maps, so seg, gmT/wmT, the WM distance transform and
+        # the solve all see the closed tissue mask consistently.
+        gm_prob, wm_prob, _n_closed = close_tissue_probs(gm_prob, wm_prob, args.close_tissue)
     # Parcellation for the no-push exemption. Same cropped grid as seg, so no
     # resampling; absent files simply disable the exemption.
     soft_seg = id_map = None
@@ -2316,7 +3410,8 @@ def main():
                                        damp_wm_floor=args.damp_wm_floor,
                                        damp_factor=args.damp_factor,
                                        speed_floor=args.speed_floor,
-                                       freeze_wm_field=(not args.no_freeze_wm),
+                                       freeze_wm_field=(args.freeze_wm_field
+                                                        and not args.no_freeze_wm),
                                        freeze_wm_direction=args.freeze_wm_direction,
                                        wm_project_smoothing=args.wm_project_smoothing,
                                        freeze_wm_release_final=(True if not args.release_final
@@ -2327,23 +3422,63 @@ def main():
                                        propagation_rounds=args.rounds,
                                        num_integration_points=args.integration_points,
                                        gradient_gate=args.gradient_gate,
-                                       step_scale=(10.0/args.rounds) if args.keep_total_step else None,
+                                       gradient_step=args.gradient_step,
+                                       step_scale=(None if args.no_keep_total_step
+                                                   else NUM_INTEGRATION_POINTS / args.rounds),
+                                       constrained_floor=(-np.inf if args.floor is None
+                                                          else args.floor),
                                        constrained_floor_after=args.floor_after,
                                        constrained_floor_after_round=args.floor_after_round,
                                        exclude_no_cortex=not args.no_exclude,
                                        pin_scope=args.pin_scope,
                                        use_normal_gate=not args.no_normal_gate,
+                                       gate_coherence_threshold=(
+                                           BEST_CONFIG.gate_coherence_threshold
+                                           if args.gate_threshold is None else args.gate_threshold),
+                                       gate_mode=(BEST_CONFIG.gate_mode if args.gate_mode is None
+                                                  else args.gate_mode),
+                                       gate_sigmoid_width_deg=(
+                                           BEST_CONFIG.gate_sigmoid_width_deg
+                                           if args.gate_sigmoid_width_deg is None
+                                           else args.gate_sigmoid_width_deg),
+                                       gate_sigmoid_center_deg=(
+                                           BEST_CONFIG.gate_sigmoid_center_deg
+                                           if args.gate_sigmoid_center_deg is None
+                                           else args.gate_sigmoid_center_deg),
                                        gate_denominator=args.gate_denominator,
-                                       velocity_smooth_sigma=args.velocity_smooth_sigma,
+                                       gate_dilution=args.gate_dilution,
+                                       gate_combine=args.gate_combine,
+                                       gate_combine_beta=args.gate_combine_beta,
+                                       gate_magnitude=args.gate_magnitude,
+                                       gate_where=args.gate_where,
+                                       gate_nu_scale=args.gate_nu_scale,
+                                       relax_iters=(BEST_CONFIG.relax_iters
+                                                    if args.relax_iters is None
+                                                    else args.relax_iters),
+                                       relax_iters_final=(BEST_CONFIG.relax_iters_final
+                                                          if args.relax_iters_final is None
+                                                          else args.relax_iters_final),
+                                       sample_gate=args.sample_gate,
+                                       sample_gate_denominator=args.sample_gate_denominator,
+                                       gate_reference=(BEST_CONFIG.gate_reference
+                                                       if args.gate_reference is None
+                                                       else args.gate_reference),
+                                       gate_field_eps=args.gate_field_eps,
+                                       velocity_smooth_sigma=(
+                                           BEST_CONFIG.velocity_smooth_sigma
+                                           if args.velocity_smooth_sigma is None
+                                           else args.velocity_smooth_sigma),
                                        gate_everywhere=(BEST_CONFIG.gate_everywhere
                                                         if args.gate_everywhere is None else
                                                         (None if args.gate_everywhere == 'off'
                                                          else args.gate_everywhere)),
-                                       use_sulcal_sheet=not args.no_sulcal_sheet,
+                                       use_sulcal_sheet=(args.sulcal_sheet
+                                                         and not args.no_sulcal_sheet),
                                        pin_feather=args.pin_feather,
                                        pin_rings=args.pin_rings,
                                        use_constrained_start=args.constrained_start,
-                                       escape_in_no_cortex=args.escape_in_no_cortex)
+                                       escape_in_no_cortex=args.escape_in_no_cortex,
+                                       sample_offset=args.sample_offset)
 
     if args.skip_naive:
         print("\n=== naive baseline skipped (--skip-naive) ===")
@@ -2352,10 +3487,14 @@ def main():
         naive_results = run_pipeline(naive_config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
                                       hemi_surfaces, os.path.join(args.out_dir, 'naive_'),
                                       out_dir=args.out_dir, tag='field_naive',
-                                      volume_info=volume_info_from_prep(args.prep_dir))
+                                      volume_info=volume_info_from_image(ref_img, args.prep_dir))
         for hemi, metrics in naive_results.items():
             print("--- %s naive ---" % hemi)
             print(metrics)
+
+    print("\n=== configuration ===")
+    print(describe_config(best_config))
+    print("  (fields marked non-default differ from PipelineConfig's own defaults)")
 
     print("\n=== best (whole-brain solve) ===")
     best_results = run_pipeline(best_config, seg, gmT, wmT, gm_prob, wm_prob, ref_img, tovox, totkr,
@@ -2363,7 +3502,7 @@ def main():
                                  out_dir=args.out_dir, tag='field_best',
                                  thickness_dir=args.prep_dir if args.write_thickness else None,
                                  soft_seg=soft_seg, id_map=id_map,
-                                 volume_info=volume_info_from_prep(args.prep_dir),
+                                 volume_info=volume_info_from_image(ref_img, args.prep_dir),
                                  velocity_override=velocity_override)
     for hemi, metrics in best_results.items():
         print("--- %s best ---" % hemi)

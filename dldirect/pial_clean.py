@@ -121,15 +121,29 @@ def gated_velocity_smooth(vol, sigma, device):
     return torch.where(ok, out, vol)
 
 
-def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbose=True):
-    """DiReCT with the gated velocity smoothing. Returns (velocity, thickness).
+def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
+                           compute_thickness=True):
+    """The solve itself, returning the field as a TORCH TENSOR on its device.
 
-    velocity is [D, H, W, 3] in voxels, components in voxel-index order (d,h,w),
-    and is the PER-INTEGRATION-POINT field: the solve composes it
-    INTEGRATION_POINTS times, which is why the propagation below applies it
-    ROUNDS times at STEP_SCALE.
+    Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
+    thickness [1, 1, D, H, W]. Nothing is copied to the host, so a caller that
+    propagates on the GPU never moves the field across the bus.
+    solve_velocity_field() below is the numpy-returning wrapper.
+
+    compute_thickness=False skips the thickness map entirely and returns None in
+    its place. That removes two warp_image calls per integration point (20 per
+    iteration) and two Gaussian smooths per iteration.
+
+    It also removes the THICKNESS_PRIOR cap, which is derived from the same
+    hit/total accumulation: where the running thickness exceeds the prior the
+    velocity is scaled down by (prior/thickness)^2. On the data this has been
+    run on the cap never binds (max observed thickness 6.1 mm against a 10.0 mm
+    prior) and the field is bit-identical either way -- but that is a property
+    of the data, not a guarantee. If you need the pial surface from a subject
+    where cortex might exceed the prior, leave this on.
     """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device(device) if device is not None else \
+        torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     D, H, W = seg.shape
     t = lambda a: torch.from_numpy(a.astype(np.float32)).to(device).reshape(1, 1, D, H, W)
     seg_t, gm_t, wm_t = t(seg), t(gm_prob), t(wm_prob)
@@ -153,8 +167,9 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
         for pt in range(1, INTEGRATION_POINTS + 1):
             inverse = compose_fields(velocity * active, inverse, identity)
             warped_wm = warp_image(wm_t, inverse, identity)
-            warped_contour = warp_image(wm_contour, inverse, identity)
-            warped_thick = warp_image(thickness_img, inverse, identity)
+            if compute_thickness:
+                warped_contour = warp_image(wm_contour, inverse, identity)
+                warped_thick = warp_image(thickness_img, inverse, identity)
 
             grad = gaussian_gradient_3d(warped_wm, SMOOTH_SIGMA, device)
             gmag = (grad * grad).sum(dim=1, keepdim=True).sqrt()
@@ -164,13 +179,14 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
             speed = torch.where(torch.isfinite(speed), speed, torch.zeros_like(speed))
             increment = increment + direction * speed
 
-            if pt == 1:
-                thickness_img = integrated.norm(dim=1, keepdim=True) * wm_contour
-                hit = wm_contour.clone()
-                total = thickness_img.clone()
-            else:
-                hit = hit + warped_contour * gm_mask
-                total = total + warped_thick * gm_mask
+            if compute_thickness:
+                if pt == 1:
+                    thickness_img = integrated.norm(dim=1, keepdim=True) * wm_contour
+                    hit = wm_contour.clone()
+                    total = thickness_img.clone()
+                else:
+                    hit = hit + warped_contour * gm_mask
+                    total = total + warped_thick * gm_mask
 
             inverse = inverse * active
             velocity = velocity * active
@@ -181,31 +197,57 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
 
         velocity = velocity + increment
 
-        sh = gaussian_smooth_3d(hit, SMOOTH_SIGMA, device, zero_boundary=False)
-        st = gaussian_smooth_3d(total, SMOOTH_SIGMA, device, zero_boundary=False)
-        has = sh > 0.001
-        vals = torch.where(has, st / sh.clamp(min=0.001), torch.zeros_like(sh)).clamp(min=0)
-        over = has & (vals > THICKNESS_PRIOR) & (gm_mask > 0)
-        if over.any():
-            frac = THICKNESS_PRIOR / vals.clamp(min=1e-8)
-            velocity = velocity * torch.where(over, frac * frac, torch.ones_like(frac))
-        cortical_thickness = vals * gm_mask
+        if compute_thickness:
+            sh = gaussian_smooth_3d(hit, SMOOTH_SIGMA, device, zero_boundary=False)
+            st = gaussian_smooth_3d(total, SMOOTH_SIGMA, device, zero_boundary=False)
+            has = sh > 0.001
+            vals = torch.where(has, st / sh.clamp(min=0.001), torch.zeros_like(sh)).clamp(min=0)
+            over = has & (vals > THICKNESS_PRIOR) & (gm_mask > 0)
+            if over.any():
+                frac = THICKNESS_PRIOR / vals.clamp(min=1e-8)
+                velocity = velocity * torch.where(over, frac * frac, torch.ones_like(frac))
+            cortical_thickness = vals * gm_mask
 
         velocity = gated_velocity_smooth(velocity, VELOCITY_SIGMA, device)
         velocity = velocity * active          # MUST precede the save; see below
         if verbose and (iteration + 1) % 10 == 0:
-            print('  iteration %d/%d, mean thickness %.3f mm'
-                  % (iteration + 1, MAX_ITERATIONS,
-                     float(cortical_thickness[gm_mask > 0].mean())))
+            if compute_thickness:
+                print('  iteration %d/%d, mean thickness %.3f mm'
+                      % (iteration + 1, MAX_ITERATIONS,
+                         float(cortical_thickness[gm_mask > 0].mean())))
+            else:
+                print('  iteration %d/%d' % (iteration + 1, MAX_ITERATIONS))
 
-    vel = velocity[0].cpu().numpy().transpose(1, 2, 3, 0).astype(np.float32)
+    return velocity, (cortical_thickness if compute_thickness else None), device
+
+
+def velocity_to_numpy(velocity):
+    """[1, 3, D, H, W] tensor -> [D, H, W, 3] float32 array, as the propagation
+    and the NIfTI export both want it."""
+    return velocity[0].cpu().numpy().transpose(1, 2, 3, 0).astype(np.float32)
+
+
+def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbose=True,
+                         compute_thickness=True):
+    """DiReCT with the gated velocity smoothing. Returns (velocity, thickness).
+
+    velocity is [D, H, W, 3] in voxels, components in voxel-index order (d,h,w),
+    and is the PER-INTEGRATION-POINT field: the solve composes it
+    INTEGRATION_POINTS times, which is why the propagation below applies it
+    ROUNDS times at STEP_SCALE.
+    """
+    velocity, cortical_thickness, _ = solve_velocity_field_t(
+        seg, gm_prob, wm_prob, ref_img, verbose=verbose,
+        compute_thickness=compute_thickness)
+    vel = velocity_to_numpy(velocity)
     if out_prefix:
         # AFTER the active-region mask. Saving before it exported a 12% smoothing
         # halo into CSF, which the propagation then rode.
         img = nib.Nifti1Image(vel, ref_img.affine)
         img.header['xyzt_units'] = 10
         nib.save(img, out_prefix + 'Velocity.nii.gz')
-    return vel, cortical_thickness.squeeze().cpu().numpy()
+    return vel, (cortical_thickness.squeeze().cpu().numpy()
+                 if cortical_thickness is not None else None)
 
 
 def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=None):
@@ -242,27 +284,44 @@ def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=Non
     return cur
 
 
-def prepare(prep_dir, surf_dir, hemis=('lh', 'rh')):
-    """seg/gmT/wmT reconciled against the white surfaces, plus the transforms."""
+def prepare(prep_dir, surf_dir=None, hemis=('lh', 'rh'), surfaces=None):
+    """seg/gmT/wmT reconciled against the white surfaces, plus the transforms.
+
+    `surfaces` optionally supplies {hemi: (verts, faces)} already in the cropped
+    tkrRAS frame, in place of reading ?h.white from `surf_dir`. BOTH hemispheres
+    are still required: the WM label is reconciled against the union of the two
+    surfaces, so a one-hemisphere call would demote the other hemisphere's WM.
+    """
     import pandas as pd
     gm_prob, wm_prob, ref_img = load_gm_wm_probability(prep_dir)
     seg, gmT, wmT = build_seg_maps(gm_prob, wm_prob)
     tovox, totkr = make_transforms(ref_img)
     shape = tuple(ref_img.shape[:3])
 
+    given = dict(surfaces) if surfaces else None
+    if given is not None and set(given) != {'lh', 'rh'}:
+        sys.exit('surfaces= needs both hemispheres (got %s); the WM label is '
+                 'reconciled against their union' % sorted(given))
+    if given is None and not surf_dir:
+        sys.exit('give either surf_dir or surfaces=')
     surfaces = {}
     partial = np.zeros(shape, np.float32)
     crisp = np.zeros(shape, bool)
     for h in ('lh', 'rh'):
-        path = os.path.join(surf_dir, '%s.white' % h)
-        if not os.path.exists(path):
-            sys.exit('missing %s -- both white surfaces are needed to define WM' % path)
-        v, f, vinfo = nib.freesurfer.io.read_geometry(path, read_metadata=True)
-        if vinfo and 'volume' in vinfo and \
-                tuple(int(x) for x in vinfo['volume']) != shape:
-            sys.exit('%s.white was built on a %s grid, reference is %s: the tkrRAS frames '
-                     'differ by half a voxel per odd axis. Rebuild with preparedata.py '
-                     '--space cropped.' % (h, list(vinfo['volume']), list(shape)))
+        if given is not None:
+            v, f = given[h]
+            v = np.asarray(v, np.float64)
+            f = np.asarray(f)
+        else:
+            path = os.path.join(surf_dir, '%s.white' % h)
+            if not os.path.exists(path):
+                sys.exit('missing %s -- both white surfaces are needed to define WM' % path)
+            v, f, vinfo = nib.freesurfer.io.read_geometry(path, read_metadata=True)
+            if vinfo and 'volume' in vinfo and \
+                    tuple(int(x) for x in vinfo['volume']) != shape:
+                sys.exit('%s.white was built on a %s grid, reference is %s: the tkrRAS frames '
+                         'differ by half a voxel per odd axis. Rebuild with preparedata.py '
+                         '--space cropped.' % (h, list(vinfo['volume']), list(shape)))
         surfaces[h] = (v, f)
         crisp |= rasterize_mesh(tovox(v), f, shape)
         partial += rasterize_mesh_pv(tovox(v), f, shape, WM_SUPERSAMPLE)

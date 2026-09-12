@@ -629,7 +629,8 @@ class NormalGate:
                  everywhere=None, denominator='plain', dilution=None,
                  combine=None, combine_beta=0.5, nu_scale=0.2, nu_scale_wm=None,
                  nu_scale_decay=None, magnitude='gated', where='normal',
-                 fill_coherence=0.9, blade_thickness=3.0,
+                 fill_coherence=0.9, blade_thickness=3.0, nu_extra=None,
+                 nu_degen_thr=None, nu_degen_action='plain',
                  sigmoid_width_deg=32.0, sigmoid_center_deg=90.0,
                  reference='normal', field_eps=1e-3):
         self.seg = seg
@@ -923,6 +924,38 @@ class NormalGate:
         #     how this hid in the summary metrics.
         self.blade_thickness = float(blade_thickness)
         self._blade_t = None
+        # EXTRA LABELS TREATED AS WM WHEN BUILDING nu (not in the solve itself).
+        # nu is grad of the distance to seg==3, so every non-WM neighbour of a WM
+        # sheet is a boundary the gradient orients to -- including hippocampus
+        # and amygdala, which flank medial temporal WM and across which no
+        # cortical flow passes. Measured: of the voxels where -nu points into the
+        # opposing half-space from the local flow (4200, 1.9% of substitutions),
+        # 15.6% lie within 2 voxels of hippocampus/amygdala against 1.2% of the
+        # well-oriented ones -- a 13x enrichment. Unioning those labels into the
+        # mask removes that face, so the gradient is set by the cortical one.
+        self.nu_extra = nu_extra
+        # nu IS NOT A UNIT VECTOR EVERYWHERE, despite what the reference comment
+        # above claims. It is grad(sdt) / max(|grad(sdt)|, 1e-9), and on the
+        # medial axis of a WM sheet the gradient vanishes, so nu is whatever
+        # survives that division -- noise, or the zero vector. Measured: of the
+        # voxels where -nu opposes the local flow, 56.4% have |grad(sdt)| < 0.5
+        # against 6.1% of the well-oriented ones, a 9.2x enrichment, and 3720 of
+        # 3773 are plain cerebral WM (medial axes run through every sheet).
+        # With `nu_degen_thr` set, a voxel below it gets NO substituted reference
+        # -- neither the field nor the geometry defines a direction there, so
+        # there is nothing to gate on and it takes the plain Gaussian instead.
+        self.nu_degen_thr = None if nu_degen_thr is None else float(nu_degen_thr)
+        # what a degenerate voxel gets instead of a bogus -nu:
+        #   'plain' the plain Gaussian -- it fills, unfiltered, on the grounds
+        #           that with no direction from either source there is nothing
+        #           to gate on.
+        #   'dead'  nothing. The centre clause of the guard is reinstated for
+        #           these voxels only, so they keep their own value and stay at
+        #           zero -- on the grounds that a voxel we cannot orient should
+        #           not be allowed to inject an unfiltered average into a region
+        #           the gate exists to protect.
+        self.nu_degen_action = nu_degen_action
+        self._gn_t = None
         self._orig = None
         self._bipolar_cache = {}
         self._nu_t = None
@@ -933,10 +966,14 @@ class NormalGate:
     def __enter__(self):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         wmb = (self.seg == 3)
+        if self.nu_extra is not None:
+            wmb = wmb | np.asarray(self.nu_extra, bool)
         sdt = distance_transform_edt(~wmb) - distance_transform_edt(wmb)
         grad = np.stack(np.gradient(sdt), axis=-1)
-        nu = grad / np.maximum(np.linalg.norm(grad, axis=-1), 1e-9)[..., None]
+        _gnorm = np.linalg.norm(grad, axis=-1)
+        nu = grad / np.maximum(_gnorm, 1e-9)[..., None]
         self._nu_t = torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
+        self._gn_t = torch.from_numpy(_gnorm[None, None].astype(np.float32)).to(device)
         self._wm_t = torch.from_numpy(wmb[None, None].astype(bool)).to(device)
         # the same signed distance, kept for the distance-blended nu scale
         self._sdt_t = torch.from_numpy(sdt[None, None].astype(np.float32)).to(device)
@@ -1004,11 +1041,20 @@ class NormalGate:
                                                                     torch.zeros_like(fhat))
                     u = u / u.norm(dim=1, keepdim=True).clamp(min=1e-9)
                     ref_t, nbr_t, ok, padded_ok = u, u, None, None
-                else:                                     # 'both'
+                else:                                     # 'both' / 'both-nu'
+                    # Gate FIRST on geometry (do not mix fields coming from
+                    # different interface geometry), THEN on the flow. A
+                    # neighbour must pass both to carry weight.
                     ref_t, nbr_t = self._nu_t, self._nu_t
-                    ok = has_v
-                    ref2_t, nbr2_t = fhat, fhat
-                    padded_ok = F.pad(ok.to(vol.dtype), (r,)*6, mode='replicate')
+                    if _cb == 'both-nu':
+                        # the flow half uses the field-nu fallback, so the WM
+                        # contour is not silently excluded by having no field
+                        ref2_t = nbr2_t = torch.where(has_v, fhat, -self._nu_t)
+                        ok = padded_ok = None
+                    else:
+                        ok = has_v
+                        ref2_t, nbr2_t = fhat, fhat
+                        padded_ok = F.pad(ok.to(vol.dtype), (r,)*6, mode='replicate')
             elif self.combine is not None:
                 pass                                 # endpoint already resolved
             elif self.reference == 'warped-split':
@@ -1028,6 +1074,13 @@ class NormalGate:
                 ok = (~interior) | has_v
                 ref_t = ctr_t
                 padded_ok = F.pad(has_v.to(vol.dtype), (r, r, r, r, r, r), mode='replicate')
+            elif self.reference == 'field-noguard':
+                # DIAGNOSTIC: reference='field' with the guard simply DELETED --
+                # no centre clause, no neighbour clause, nothing substituted.
+                # Asks whether the guard is what holds the WM contour at zero.
+                _fm = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+                ref_t = nbr_t = vol / _fm.clamp(min=max(self.field_eps, 1e-12))
+                ok = padded_ok = None
             elif self.reference == 'field-fill':
                 _fm = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
                 _hv = _fm > self.field_eps
@@ -1061,6 +1114,11 @@ class NormalGate:
                                     _sgn * self._nu_t)
                 nbr_t = ref_t
                 ok = padded_ok = None
+                if self.nu_degen_thr is not None:
+                    _degen = (~_hv) & (self._gn_t < self.nu_degen_thr)
+                    if self.nu_degen_action == 'dead':
+                        # centre clause only -- neighbours still all vote
+                        ok = ~_degen
             elif self.reference in ('field', 'hybrid', 'hybrid-neg'):
                 src = vol
                 fmag = (src ** 2).sum(dim=1, keepdim=True).sqrt()
@@ -1105,7 +1163,7 @@ class NormalGate:
             # references these are the same volume, for 'warped-split' they are not
             padded_nu = F.pad(nbr_t, (r, r, r, r, r, r), mode='replicate')
             padded_nu2 = (F.pad(nbr2_t, (r, r, r, r, r, r), mode='replicate')
-                           if (_cb == 'both') else None)
+                           if (_cb in ('both', 'both-nu')) else None)
             acc = torch.zeros_like(vol)
             wacc = torch.zeros((vol.shape[0], 1, D, H, W), device=dev)
             sacc = torch.zeros((vol.shape[0], 1, D, H, W), device=dev)
@@ -1195,6 +1253,12 @@ class NormalGate:
                 out = torch.where(sacc > 1e-6, acc / sacc.clamp(min=1e-6), vol)
             else:
                 out = torch.where(wacc > 1e-6, acc / wacc.clamp(min=1e-6), vol)
+            if (self.reference in ('field-nu', 'field-nu-pos')
+                    and self.nu_degen_thr is not None
+                    and self.nu_degen_action == 'plain'):
+                out = torch.where(_degen, gaussian_smooth_3d(vol, sigma, dev,
+                                                             zero_boundary=False,
+                                                             truncate=truncate), out)
             if self.reference == 'field-fill':
                 # a guarded voxel whose neighbourhood is coherent takes the
                 # plain Gaussian; only the bipolar ones get the -nu-gated average
@@ -1349,6 +1413,8 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                           gate_nu_scale_wm=None, gate_nu_scale_decay=None,
                           gate_magnitude='gated', gate_where='normal',
                           gate_fill_coherence=0.9, gate_blade_thickness=3.0,
+                          gate_nu_extra=None, gate_nu_degen_thr=None,
+                          gate_nu_degen_action='plain',
                           gate_sigmoid_width_deg=32.0, gate_sigmoid_center_deg=90.0,
                           gate_reference='normal', gate_field_eps=1e-3,
                           velocity_smooth_sigma=None, verbose=False):
@@ -1398,7 +1464,9 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix,
                          nu_scale_decay=gate_nu_scale_decay,
                          magnitude=gate_magnitude, where=gate_where,
                          fill_coherence=gate_fill_coherence,
-                         blade_thickness=gate_blade_thickness,
+                         blade_thickness=gate_blade_thickness, nu_extra=gate_nu_extra,
+                         nu_degen_thr=gate_nu_degen_thr,
+                         nu_degen_action=gate_nu_degen_action,
                          sigmoid_width_deg=gate_sigmoid_width_deg,
                          sigmoid_center_deg=gate_sigmoid_center_deg,
                          reference=gate_reference, field_eps=gate_field_eps):
@@ -2517,6 +2585,10 @@ def _count_self_intersections(verts, faces):
         return n, -1.0
 
 
+SLIDE_MIN_MM = 1.0   # a vertex must actually move before "sideways" means anything
+SLIDE_FRAC = 0.8     # fraction of the displacement perpendicular to the normal
+
+
 def evaluate_surface(white_verts, pial_verts, faces, seg, tovox, n_samples=41,
                      no_push=None):
     """Self-consistency metrics only — see module docstring.
@@ -2573,7 +2645,42 @@ def evaluate_surface(white_verts, pial_verts, faces, seg, tovox, n_samples=41,
     n_selfint, selfint_pct = _count_self_intersections(pial_verts, faces)
     ends_wm = (line[:, -1] == 3)
     keep = np.ones(len(white_verts), bool) if no_push is None else ~no_push
+
+    # SLIDE and INWARD, per vertex, from the displacement and the white
+    # surface's smoothed outward normal -- the same normal propagate() steps
+    # against, so "outward" means the same thing in both.
+    #
+    #   out  = d . n            how far it went outward
+    #   lat  = |d - (d.n) n|    how far it went sideways
+    #   inward : out < 0
+    #   slide  : |d| > SLIDE_MIN_MM and lat/|d| > SLIDE_FRAC
+    #
+    # Added because nothing else here catches sideways motion. Measured across
+    # eight gate configurations, `inward_pct` spans only 0.60-0.88% -- it barely
+    # discriminates -- while `slide_pct` spans 0.11-2.07%, a 19-fold range that
+    # tracks reach: every arm that buys fundus travel buys some of it sideways.
+    # It reordered the arms against every other metric available here.
+    #
+    # THE THRESHOLDS ARE NOT VALIDATED. They were chosen to match one visually
+    # identified case. A vertex tracking a curved bank has a large lateral
+    # fraction legitimately, so some of what this counts is anatomy, not error;
+    # and lateral displacement rises with travel in every arm, so the two are
+    # not cleanly separable. Read it as a comparator between arms on one
+    # subject, not as an absolute defect rate.
+    _mesh_w, _Wm, _deg = _mesh_adjacency(white_verts, faces)
+    _n = _smoothed_normals(_mesh_w, _Wm, _deg, k=2, lam=0.3)
+    _d = np.asarray(pial_verts) - np.asarray(white_verts)
+    _mag = np.linalg.norm(_d, axis=1)
+    _out = np.einsum('ij,ij->i', _d, _n)
+    _lat = np.linalg.norm(_d - _out[:, None] * _n, axis=1)
+    _frac = _lat / np.maximum(_mag, 1e-9)
+    _slide = keep & (_mag > SLIDE_MIN_MM) & (_frac > SLIDE_FRAC)
+    _inward = keep & (_out < 0)
     return dict(
+        slide_pct=100 * float(_slide.sum() / max(keep.sum(), 1)),
+        slide_count=int(_slide.sum()),
+        inward_pct=100 * float(_inward.sum() / max(keep.sum(), 1)),
+        lateral_median_mm=float(np.median(_lat[keep])),
         end_in_wm_pinned=int((ends_wm & ~keep).sum()),
         transit_count=int(transit.sum()),
         transit_pct=100 * float(transit.mean()),
@@ -3127,7 +3234,8 @@ def main():
                          'REJECTED still dilutes. A=0 is plain (full dilution, the default), '
                          'A=1 is support (none). Lifts the field more where more of the '
                          'neighbourhood opposes, i.e. more at a sulcal fundus than a crown.')
-    p.add_argument('--gate-combine', choices=('both', 'blend', 'nuscale'), default=None,
+    p.add_argument('--gate-combine', choices=('both', 'both-nu', 'blend', 'nuscale'),
+                    default=None,
                     help="use the normal AND field references at every voxel, instead of "
                          "choosing one via --gate-reference. 'both' multiplies the two "
                          "direction weights (a neighbour must agree on geometry AND flow); "
@@ -3201,6 +3309,7 @@ def main():
                          "'support' ignores the rejected corners in the divisor.")
     p.add_argument('--gate-reference',
                     choices=('normal', 'field', 'field-nu', 'field-nu-pos', 'field-fill',
+                             'field-noguard',
                              'hybrid', 'hybrid-neg',
                              'warped-normal', 'warped-split'),
                     default=None,   # None -> PipelineConfig.gate_reference

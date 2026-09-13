@@ -195,7 +195,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=True,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                dtype=torch.float32, device=None):
+                topology='nighres', dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -211,6 +211,9 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     when neither surf_dir nor surfaces is given, so the whole
                     chain segmentation -> white -> field -> pial runs in one
                     process with nothing going through disk.
+    topology        'nighres' (default) or 'gpu' for the topology correction
+                    when building the white surfaces. See wm_surface for what
+                    'gpu' is and is not validated for.
     propagate_on    'cuda' keeps the field in GPU memory from solve to surface;
                     'cpu' uses the numpy reference implementation
     velocity        reuse a field instead of solving (tensor or [D,H,W,3] array)
@@ -234,11 +237,13 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         if surfaces is not None:
             raise ValueError('build_white=True and surfaces= are mutually exclusive')
         if verbose:
-            print('building the white surfaces (%d Taubin steps)...' % nsmooth)
+            print('building the white surfaces (%d Taubin steps, %s topology)...'
+                  % (nsmooth, topology))
         # Both hemispheres regardless of `hemis`: the WM label is reconciled
         # against their union.
         surfaces = wm_surface.build_white_surfaces(prep_dir, regions=('lh', 'rh'),
-                                                   nsmooth=nsmooth, verbose=verbose)
+                                                   nsmooth=nsmooth, verbose=verbose,
+                                                   topology=topology)
         surf_dir = None
 
     d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces)
@@ -314,6 +319,8 @@ def main():
     p.add_argument('--surf-dir', help='directory holding ?h.white; omit to build them')
     p.add_argument('--build-white', action='store_true',
                    help='build the white surfaces from the segmentation in-process')
+    p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu'],
+                   help='topology correction when building white surfaces')
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT,
                    help='Taubin steps for the white surface (default %d)'
                         % wm_surface.NSMOOTH_DEFAULT)
@@ -334,7 +341,8 @@ def main():
         reconstruct(args.prep_dir, args.surf_dir, hemis=tuple(args.hemi),
                     propagate_on=args.propagate_on, out_dir=args.out_dir, dtype=dtype,
                     compute_thickness=not args.no_thickness,
-                    build_white=args.build_white or None, nsmooth=args.nsmooth)
+                    build_white=args.build_white or None, nsmooth=args.nsmooth,
+                    topology=args.topology)
         return
 
     import time
@@ -342,7 +350,8 @@ def main():
     # separately below.
     r = reconstruct(args.prep_dir, args.surf_dir, hemis=tuple(args.hemi),
                     propagate_on='cpu', out_dir=None, verbose=True, pin=False,
-                    build_white=args.build_white or None, nsmooth=args.nsmooth)
+                    build_white=args.build_white or None, nsmooth=args.nsmooth,
+                    topology=args.topology)
     for hemi in args.hemi:
         white, faces = r['white'][hemi]
         cpu = r['surfaces'][hemi][0]

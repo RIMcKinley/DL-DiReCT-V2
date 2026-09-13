@@ -47,6 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from . import pial_clean as pc
+from . import surface_seg
 from . import wm_surface
 from .field_pial_prototype import (_pin_weights, build_no_push_mask,
                                    build_pin_mask, evaluate_surface, get_vox2ras_tkr)
@@ -195,7 +196,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=True,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='nighres', dtype=torch.float32, device=None):
+                topology='nighres', segmentation='logits',
+                dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -214,6 +216,14 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     topology        'nighres' (default) or 'gpu' for the topology correction
                     when building the white surfaces. See wm_surface for what
                     'gpu' is and is not validated for.
+    segmentation    'logits' (default) takes seg/gmT/wmT from the model output
+                    and reconciles the WM label against the white surface.
+                    'surface-pv' builds BOTH boundaries as surfaces and
+                    rasterises them as partial volume instead -- see
+                    surface_seg. The GM surface comes from the topology-
+                    corrected ribbon, so sulci whose CSF fell below detection
+                    are open. It supplies its own white surfaces, so surf_dir /
+                    surfaces / build_white / topology are ignored.
     propagate_on    'cuda' keeps the field in GPU memory from solve to surface;
                     'cpu' uses the numpy reference implementation
     velocity        reuse a field instead of solving (tensor or [D,H,W,3] array)
@@ -231,6 +241,22 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     """
     import pandas as pd
 
+    if str(segmentation).lower() == 'surface-pv':
+        if verbose:
+            print('building the segmentation from surfaces...')
+        sd = surface_seg.build_surface_segmentation(prep_dir, hemis=tuple(hemis),
+                                                    nsmooth=nsmooth, verbose=verbose)
+        d = dict(seg=sd['seg'], gmT=sd['gmT'], wmT=sd['wmT'], ref_img=sd['ref_img'],
+                 tovox=sd['tovox'], totkr=sd['totkr'], surfaces=sd['surfaces'],
+                 prep_dir=prep_dir)
+        return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
+                                    verbose, report, compute_thickness, dtype, device,
+                                    extra=dict(gm_surfaces=sd['gm_surfaces'],
+                                               found_csf=sd['found_csf']))
+    elif str(segmentation).lower() != 'logits':
+        raise ValueError("segmentation must be 'logits' or 'surface-pv', got %r"
+                         % (segmentation,))
+
     if build_white is None:
         build_white = surfaces is None and not surf_dir
     if build_white:
@@ -247,6 +273,16 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         surf_dir = None
 
     d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces)
+    return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
+                                verbose, report, compute_thickness, dtype, device)
+
+
+def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
+                         verbose, report, compute_thickness, dtype, device,
+                         extra=None):
+    """Shared tail: solve the field, propagate each hemisphere, report."""
+    import pandas as pd
+    hemis = tuple(d['surfaces'])
     seg, tovox, totkr, ref_img = d['seg'], d['tovox'], d['totkr'], d['ref_img']
     report = verbose if report is None else report
     on_gpu = str(propagate_on).lower() == 'cuda'
@@ -307,9 +343,12 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                   'flipped %.4f%%  [%s]'
                   % (hemi, m['mean_displacement_mm'], m['crossed_csf_count'],
                      m['self_intersections'], m['flipped_face_pct'], propagate_on))
-    return dict(surfaces=out, white=d['surfaces'], velocity=velocity,
-                thickness=thickness, seg=seg, ref_img=ref_img,
-                tovox=tovox, totkr=totkr)
+    res = dict(surfaces=out, white=d['surfaces'], velocity=velocity,
+               thickness=thickness, seg=seg, ref_img=ref_img,
+               tovox=tovox, totkr=totkr)
+    if extra:
+        res.update(extra)
+    return res
 
 
 def main():
@@ -319,6 +358,9 @@ def main():
     p.add_argument('--surf-dir', help='directory holding ?h.white; omit to build them')
     p.add_argument('--build-white', action='store_true',
                    help='build the white surfaces from the segmentation in-process')
+    p.add_argument('--segmentation', default='logits', choices=['logits', 'surface-pv'],
+                   help='surface-pv builds both boundaries as surfaces and rasterises '
+                        'them; the GM surface comes from the topology-corrected ribbon')
     p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu'],
                    help='topology correction when building white surfaces')
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT,
@@ -342,7 +384,8 @@ def main():
                     propagate_on=args.propagate_on, out_dir=args.out_dir, dtype=dtype,
                     compute_thickness=not args.no_thickness,
                     build_white=args.build_white or None, nsmooth=args.nsmooth,
-                    topology=args.topology)
+                    topology=args.topology,
+                    segmentation=args.segmentation)
         return
 
     import time
@@ -351,7 +394,8 @@ def main():
     r = reconstruct(args.prep_dir, args.surf_dir, hemis=tuple(args.hemi),
                     propagate_on='cpu', out_dir=None, verbose=True, pin=False,
                     build_white=args.build_white or None, nsmooth=args.nsmooth,
-                    topology=args.topology)
+                    topology=args.topology,
+                    segmentation=args.segmentation)
     for hemi in args.hemi:
         white, faces = r['white'][hemi]
         cpu = r['surfaces'][hemi][0]

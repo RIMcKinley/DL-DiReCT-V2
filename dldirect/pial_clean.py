@@ -75,53 +75,21 @@ INVERT_MAX_ITER = 20       # ANTs' cap on the inversion's fixed-point iterations
 INVERT_CHECK_EVERY = 4     # host syncs per that many iterations; see below
 
 
-def invert_field_gated(field, identity_grid, max_iter=INVERT_MAX_ITER, initial=None,
-                       check_every=INVERT_CHECK_EVERY):
-    """direct_cuda.invert_field with the convergence test evaluated on the GPU.
-
-    The original breaks out of the loop on `if max_error <= 0.1 or mean <= 0.001`,
-    which is a host synchronisation on every fixed-point iteration -- measured,
-    ~9800 of them per solve, and 16.8% of the function's time. Here the flag is
-    a sticky GPU scalar and the UPDATE is frozen once it is set:
-
-        done |= (max <= 0.1) | (mean <= 0.001)
-        inv  -= (~done) * eps * residual * scale
-
-    A frozen iteration adds exactly zero, so the result is what breaking would
-    have produced -- bit-identical, verified over a full 45-iteration solve
-    (max |diff| 0.000e+00 on the velocity field and 0.000 mm on both pials).
-
-    Freezing alone is not a win: it costs the full max_iter (mean is 10.84) and
-    came out 3.3% slower. The host is therefore still asked every `check_every`
-    iterations whether it can leave early, which cuts the syncs 4x while keeping
-    the arithmetic identical. Net: -26.4% on the solve.
-
-    Do NOT torch.compile this. The compiled body is accurate to 3e-08 per call,
-    but it reorders the max/mean reductions, which flips which iteration the
-    threshold stops on, and the solve then diverges -- measured 0.1995 on a
-    field whose maximum is 1.2.
-    """
-    inv = initial.clone() if initial is not None else torch.zeros_like(field)
-    done = torch.zeros((), dtype=torch.bool, device=field.device)
-    for i in range(max_iter):
-        residual = warp_image(field, inv, identity_grid) + inv
-        scaled_norm = (residual * residual).sum(dim=1, keepdim=True).sqrt()
-        max_error = scaled_norm.max()
-        done = done | (max_error <= 0.1) | (scaled_norm.mean() <= 0.001)
-        epsilon = 0.75 if i == 0 else 0.5
-        threshold = epsilon * max_error
-        # clamp bound and multiplication ORDER both copied from
-        # direct_cuda.invert_field: float multiply is not associative, and a
-        # last-bit difference here flips which iteration the threshold stops on.
-        clamp_scale = torch.where(scaled_norm > threshold,
-                                  threshold / scaled_norm.clamp(min=1e-10),
-                                  torch.ones_like(scaled_norm))
-        inv = inv - torch.where(done, torch.zeros_like(inv),
-                                epsilon * clamp_scale * residual)
-        if check_every and (i % check_every == check_every - 1) and bool(done):
-            break
-    return inv
-
+# invert_field's convergence test -- `if max_error <= 0.1 or mean <= 0.001` --
+# is a host synchronisation on every fixed-point iteration, ~9800 per solve and
+# 16.8% of the function's time, which is 44.7% of the solve. MEASURED AND
+# REJECTED: evaluating the test on the GPU (a sticky scalar flag freezing the
+# update, so the answer is bit-identical to breaking) and syncing only every 4th
+# iteration came out 10.3% SLOWER, 4/4 alternating repetitions. Freezing costs
+# whole iterations -- the mean is 10.84 and checking every 4th runs to ~12.7 --
+# and an iteration costs more than the sync it saves. Freezing with no sync at
+# all (always 20) was 3.3% slower again. Do not retry without a way to stop on
+# the exact iteration without asking the host.
+#
+# The first version of that experiment also reported -29.5%, which was
+# torch.compile warm-up being paid by whichever arm ran first. Benchmark the
+# solve by alternating arms and taking medians; a single A-then-B is worthless
+# here.
 
 def gated_velocity_smooth(vol, sigma, device):
     """Gaussian smoothing of the velocity field that refuses to average across a
@@ -144,6 +112,11 @@ def gated_velocity_smooth(vol, sigma, device):
     coords = torch.arange(-r, r + 1, device=device, dtype=torch.float32)
     g = torch.exp(-(coords ** 2) / (2.0 * sigma * sigma))
     g = g / g.sum()
+    # The tap weights are constants of the kernel. Reading them off the DEVICE,
+    # as float(g[i]*g[j]*g[k]) did, is a host synchronisation per tap: 125 per
+    # call, 5625 per solve. Multiply them here in float32, exactly as the device
+    # expression did, so the weights are the same bits.
+    gh = g.cpu().numpy()
 
     mag = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
     ok = mag > FIELD_EPS
@@ -153,22 +126,30 @@ def gated_velocity_smooth(vol, sigma, device):
     padded = F.pad(vol, (r,) * 6, mode='replicate')
     padded_ref = F.pad(ref, (r,) * 6, mode='replicate')
     padded_ok = F.pad(ok.to(vol.dtype), (r,) * 6, mode='replicate')
+    # Fold the neighbour's liveness into the field once instead of reading it
+    # back on every tap. ok is exactly 0.0 or 1.0, so this is bit-exact.
+    padded = padded * padded_ok
 
     acc = torch.zeros_like(vol)
     wsum = 0.0
     for dz in range(-r, r + 1):
         for dy in range(-r, r + 1):
             for dx in range(-r, r + 1):
-                w = float(g[dz + r] * g[dy + r] * g[dx + r])
+                w = float(gh[dz + r] * gh[dy + r] * gh[dx + r])
                 if w < 1e-6:
                     continue
                 sl = (slice(None), slice(None), slice(r + dz, r + dz + D),
                       slice(r + dy, r + dy + H), slice(r + dx, r + dx + W))
                 dw = (padded_ref[sl] * ref).sum(dim=1, keepdim=True).clamp(min=0.0)
-                acc = acc + w * dw * padded_ok[sl] * padded[sl]
+                acc = acc + w * dw * padded[sl]
                 wsum += w
     out = acc / max(wsum, 1e-6)
     return torch.where(ok, out, vol)
+
+    # Measured -16.6% and bit-identical. torch.compile on top of this adds
+    # nothing (-15.9% vs -16.6%): the loop is memory-bandwidth bound, not
+    # launch bound, so the only remaining lever is fewer taps, which would
+    # change the answer.
 
 
 def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
@@ -242,8 +223,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
             velocity = velocity * active
             if pt == 1:
                 integrated.zero_()
-            integrated = invert_field_gated(inverse, identity, initial=integrated)
-            inverse = invert_field_gated(integrated, identity, initial=inverse)
+            integrated = invert_field(inverse, identity, initial=integrated)
+            inverse = invert_field(integrated, identity, initial=inverse)
 
         velocity = velocity + increment
 

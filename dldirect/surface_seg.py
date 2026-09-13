@@ -44,12 +44,13 @@ from . import outer_surface as osf
 from . import wm_labels
 from . import wm_surface
 from .field_pial_prototype import (get_vox2ras_tkr, load_gm_wm_probability,
-                                   make_transforms, rasterize_mesh_pv)
+                                   make_transforms, rasterize_mesh, rasterize_mesh_pv)
 from .retarget_surface import tkr_to_tkr
 from .topology_gpu import correct_topology
 
 SUPERSAMPLE = 3            # partial-volume rasterisation, as the white reconciliation uses
 N_BANDS = 8                # priority bands for the ribbon correction
+PROTECT_ABOVE = 0.6        # never sacrifice tissue the model is this sure about
 PAD = 2
 
 
@@ -68,19 +69,24 @@ def hemisphere_ribbon(seg_labelled, df_labels, region, excluded):
     return np.isin(np.asarray(seg_labelled), sorted(set(ids)))
 
 
-def tissue_priority(gm_logit, wm_logit, ref_img, label_img):
+def tissue_priority(gm_prob, wm_prob, ref_img, label_img):
     """Per-voxel 'how sure is the model this is tissue', on the LABEL grid.
 
-    max(logit_wm, logit_ctx): high in the interior of either tissue, low at the
-    CSF boundary where both are weak. NOT P(WM|WM,cortex) -- that asks which
-    tissue, so on a GM+WM mask it ranks confident cortex as low confidence and
-    the growth cuts straight through the ribbon (measured: cuts at the ribbon's
-    own median confidence, i.e. no selectivity at all).
+    max(P_wm, P_ctx), a PROBABILITY in [0, 1]: load_gm_wm_probability already
+    applies expit() to the per-label logits, so these are sigmoid outputs, not
+    logits. On the cortical ribbon the distribution runs median 0.866, p25
+    0.707, p10 0.543, p01 0.080.
+
+    High in the interior of either tissue, low at the CSF boundary where both
+    are weak. NOT P(WM|WM,cortex) -- that asks WHICH tissue, so on a GM+WM mask
+    it ranks confident cortex as low confidence and the growth cuts straight
+    through the ribbon (measured: cuts at the ribbon's own median confidence,
+    i.e. no selectivity at all).
 
     Outside the reference image's extent the priority is set to the maximum, so
     those voxels are annexed first rather than sacrificed.
     """
-    raw = np.maximum(np.asarray(wm_logit), np.asarray(gm_logit)).astype(np.float32)
+    raw = np.maximum(np.asarray(wm_prob), np.asarray(gm_prob)).astype(np.float32)
     hi = float(raw.max())
     sh = tuple(label_img.shape[:3])
     if sh == tuple(ref_img.shape[:3]) and np.allclose(label_img.affine, ref_img.affine):
@@ -97,7 +103,8 @@ def tissue_priority(gm_logit, wm_logit, ref_img, label_img):
 
 def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
                                n_bands=N_BANDS, supersample=SUPERSAMPLE,
-                               correct_ribbon=True, verbose=True):
+                               correct_ribbon=True, gm_crisp=False,
+                               protect_above=PROTECT_ABOVE, verbose=True):
     """Surfaces -> (seg, gmT, wmT) on the solve's grid, plus the WM surfaces.
 
     Returns a dict with seg/gmT/wmT/ref_img/tovox/totkr, 'surfaces' (the WM
@@ -106,6 +113,20 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
 
     correct_ribbon=False meshes the raw ribbon instead, i.e. skips the
     sub-threshold CSF detection -- the control for it.
+
+    protect_above is a confidence floor on the ribbon correction: tissue at or
+    above it is never sacrificed, so the sulcus is only opened where the model
+    was unsure. The topology is then not guaranteed genus 0 -- which does not
+    matter here, since the GM surface is allowed defects. In the ribbon's units
+    (max of the WM and cortex logits) the ribbon median is ~0.87 and the voxels
+    the unprotected correction removes have median ~0.65.
+
+    gm_crisp=True takes the GM occupancy as the voxel-centre-inside test rather
+    than the partial-volume fraction. The PV fraction gives gmT a soft outer
+    edge, so DiReCT's speed term is still non-zero half a voxel beyond the GM
+    surface and the flow can push past it; the crisp mask stops exactly at the
+    surface. WM stays partial-volume either way, so the change is isolated to
+    the outer boundary.
     """
     nsmooth = wm_surface.NSMOOTH_DEFAULT if nsmooth is None else nsmooth
     gm, wm, ref_img = load_gm_wm_probability(prep_dir)
@@ -126,7 +147,7 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
         if correct_ribbon:
             corr, info = correct_topology(np.pad(ribbon, PAD), verbose=False, pair='26-6',
                                           priority=np.pad(prio, PAD, constant_values=hi),
-                                          n_bands=n_bands)
+                                          n_bands=n_bands, protect_above=protect_above)
             corr = corr[PAD:-PAD, PAD:-PAD, PAD:-PAD]
             found[h] = int((ribbon & ~corr).sum())
             if verbose:
@@ -141,7 +162,9 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
         gv, wv = to_ref(gv), to_ref(wv)
         gm_surfaces[h] = (gv, np.asarray(gf))
         wm_surfaces[h] = (wv, np.asarray(wf))
-        pv_gm += rasterize_mesh_pv(tovox(gv), np.asarray(gf), shape, supersample)
+        pv_gm += (rasterize_mesh(tovox(gv), np.asarray(gf), shape).astype(np.float32)
+                  if gm_crisp else
+                  rasterize_mesh_pv(tovox(gv), np.asarray(gf), shape, supersample))
         pv_wm += rasterize_mesh_pv(tovox(wv), np.asarray(wf), shape, supersample)
 
     pv_gm = np.clip(pv_gm, 0.0, 1.0)
@@ -150,8 +173,9 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     gmT = np.clip(pv_gm - pv_wm, 0.0, 1.0).astype(np.float32)
     wmT = pv_wm.astype(np.float32)
     if verbose:
-        print('surface-derived segmentation: WM %d, GM %d voxels'
-              % (int((seg == 3).sum()), int((seg == 2).sum())))
+        print('surface-derived segmentation (%s GM): WM %d, GM %d voxels'
+              % ('crisp' if gm_crisp else 'PV',
+                 int((seg == 3).sum()), int((seg == 2).sum())))
     return dict(seg=seg, gmT=gmT, wmT=wmT, ref_img=ref_img, tovox=tovox, totkr=totkr,
                 surfaces={h: wm_surfaces[h] for h in hemis},
                 gm_surfaces={h: gm_surfaces[h] for h in hemis},

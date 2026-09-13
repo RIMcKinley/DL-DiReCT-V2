@@ -196,7 +196,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=True,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='nighres', segmentation='logits',
+                topology='nighres', segmentation='surface-pv',
+                velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
@@ -216,10 +217,10 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     topology        'nighres' (default) or 'gpu' for the topology correction
                     when building the white surfaces. See wm_surface for what
                     'gpu' is and is not validated for.
-    segmentation    'logits' (default) takes seg/gmT/wmT from the model output
-                    and reconciles the WM label against the white surface.
-                    'surface-pv' builds BOTH boundaries as surfaces and
-                    rasterises them as partial volume instead -- see
+    segmentation    'surface-pv' (default) builds BOTH boundaries as surfaces
+                    and rasterises them as partial volume; 'logits' takes
+                    seg/gmT/wmT from the model output and reconciles the WM
+                    label against the white surface. See
                     surface_seg. The GM surface comes from the topology-
                     corrected ribbon, so sulci whose CSF fell below detection
                     are open. It supplies its own white surfaces, so surf_dir /
@@ -251,6 +252,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                  prep_dir=prep_dir)
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
+                                    velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
                                                found_csf=sd['found_csf']))
     elif str(segmentation).lower() != 'logits':
@@ -274,12 +276,14 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
 
     d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces)
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
-                                verbose, report, compute_thickness, dtype, device)
+                                verbose, report, compute_thickness, dtype, device,
+                                velocity_sigma=velocity_sigma, blend_beta=blend_beta)
 
 
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
-                         extra=None):
+                         velocity_sigma=pc.VELOCITY_SIGMA,
+                         blend_beta=pc.GATE_BLEND_BETA, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
     hemis = tuple(d['surfaces'])
@@ -293,7 +297,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             print('solving the velocity field (%d iterations)...' % pc.MAX_ITERATIONS)
         vel_t, thick_t, _dev = pc.solve_velocity_field_t(
             seg, d['gmT'], d['wmT'], ref_img, verbose=verbose, device=device,
-            compute_thickness=compute_thickness)
+            compute_thickness=compute_thickness, velocity_sigma=velocity_sigma,
+            blend_beta=blend_beta)
         thickness = thick_t.squeeze().cpu().numpy() if thick_t is not None else None
         # Only leave the GPU if something actually needs the host copy.
         velocity = vel_t if (on_gpu and not out_dir) else pc.velocity_to_numpy(vel_t)
@@ -358,7 +363,14 @@ def main():
     p.add_argument('--surf-dir', help='directory holding ?h.white; omit to build them')
     p.add_argument('--build-white', action='store_true',
                    help='build the white surfaces from the segmentation in-process')
-    p.add_argument('--segmentation', default='logits', choices=['logits', 'surface-pv'],
+    p.add_argument('--velocity-sigma', type=float, default=pc.VELOCITY_SIGMA,
+                   help='ANTs -b, the velocity smoothing sigma (default %.2f)'
+                        % pc.VELOCITY_SIGMA)
+    p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
+                   help='nu/field direction blend (default %.2f; 0 = plain field gate)'
+                        % pc.GATE_BLEND_BETA)
+    p.add_argument('--segmentation', default='surface-pv',
+                   choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')
     p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu'],
@@ -385,7 +397,9 @@ def main():
                     compute_thickness=not args.no_thickness,
                     build_white=args.build_white or None, nsmooth=args.nsmooth,
                     topology=args.topology,
-                    segmentation=args.segmentation)
+                    segmentation=args.segmentation,
+                    velocity_sigma=args.velocity_sigma,
+                    blend_beta=args.blend_beta)
         return
 
     import time
@@ -395,7 +409,9 @@ def main():
                     propagate_on='cpu', out_dir=None, verbose=True, pin=False,
                     build_white=args.build_white or None, nsmooth=args.nsmooth,
                     topology=args.topology,
-                    segmentation=args.segmentation)
+                    segmentation=args.segmentation,
+                    velocity_sigma=args.velocity_sigma,
+                    blend_beta=args.blend_beta)
     for hemi in args.hemi:
         white, faces = r['white'][hemi]
         cpu = r['surfaces'][hemi][0]

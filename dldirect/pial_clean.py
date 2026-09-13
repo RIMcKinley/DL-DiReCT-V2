@@ -192,7 +192,8 @@ def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
 
 
 def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
-                           compute_thickness=True, blend_beta=GATE_BLEND_BETA):
+                           compute_thickness=True, blend_beta=GATE_BLEND_BETA,
+                           velocity_sigma=VELOCITY_SIGMA):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -279,7 +280,7 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                 velocity = velocity * torch.where(over, frac * frac, torch.ones_like(frac))
             cortical_thickness = vals * gm_mask
 
-        velocity = gated_velocity_smooth(velocity, VELOCITY_SIGMA, device,
+        velocity = gated_velocity_smooth(velocity, velocity_sigma, device,
                                          nu=nu_t, beta=blend_beta)
         velocity = velocity * active          # MUST precede the save; see below
         if verbose and (iteration + 1) % 10 == 0:
@@ -300,7 +301,8 @@ def velocity_to_numpy(velocity):
 
 
 def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbose=True,
-                         compute_thickness=True, blend_beta=GATE_BLEND_BETA):
+                         compute_thickness=True, blend_beta=GATE_BLEND_BETA,
+                         velocity_sigma=VELOCITY_SIGMA):
     """DiReCT with the gated velocity smoothing. Returns (velocity, thickness).
 
     velocity is [D, H, W, 3] in voxels, components in voxel-index order (d,h,w),
@@ -310,7 +312,8 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
     """
     velocity, cortical_thickness, _ = solve_velocity_field_t(
         seg, gm_prob, wm_prob, ref_img, verbose=verbose,
-        compute_thickness=compute_thickness, blend_beta=blend_beta)
+        compute_thickness=compute_thickness, blend_beta=blend_beta,
+        velocity_sigma=velocity_sigma)
     vel = velocity_to_numpy(velocity)
     if out_prefix:
         # AFTER the active-region mask. Saving before it exported a 12% smoothing

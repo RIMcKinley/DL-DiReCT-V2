@@ -140,7 +140,8 @@ def _face_dilate(x):
 
 
 def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
-                     comp_iters=12, pair='26-6', priority=None, n_bands=8):
+                     comp_iters=12, pair='26-6', priority=None, n_bands=8,
+                     protect_above=None):
     """Genus-0 subset of `mask`, grown by adding simple points only.
 
     mask      [D,H,W] boolean/int array
@@ -158,6 +159,15 @@ def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
               cut is forced onto the least confident voxels in the loop.
     n_bands   number of descending priority bands; each is grown to exhaustion
               before the next is admitted. Ignored when priority is None.
+    protect_above
+              a priority floor. Tissue at or above it is never sacrificed: once
+              the topology-preserving growth has converged, any remaining mask
+              voxel above the floor that touches the current set is added
+              REGARDLESS of whether it is simple. The result is then no longer
+              guaranteed genus 0 -- the defect is accepted instead of being paid
+              for in confident tissue. Without it the growth's only currency is
+              tissue, so a mask with many defects necessarily loses some.
+              Needs `priority`; the floor is in that array's units.
 
     Returns (corrected [D,H,W] bool, info dict).
     """
@@ -234,8 +244,25 @@ def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
             if added_round == 0:
                 break
 
+    protected = 0
+    if protect_above is not None:
+        if Pf is None:
+            raise ValueError('protect_above needs priority=')
+        keep = Mf & (Pf >= float(protect_above))
+        for _ in range(max_rounds):
+            front = _face_dilate(Xf.reshape(1, 1, Dp, Hp, Wp).float()).reshape(-1) > 0
+            cand = keep & ~Xf & front
+            k = int(cand.sum())
+            if k == 0:
+                break
+            Xf[cand] = True          # unconditional: topology is not preserved here
+            protected += k
+        if verbose:
+            print('  protected %d voxels at or above %.4f' % (protected, protect_above))
+
     out = Xf.reshape(Dp, Hp, Wp)[1:-1, 1:-1, 1:-1].cpu().numpy()
-    info = dict(rounds=rounds, added=added_total, filled=int(out.sum()),
+    info = dict(rounds=rounds, added=added_total, protected=protected,
+                filled=int(out.sum()),
                 mask=int(m.sum().item()),
                 coverage=float(out.sum()) / max(int(m.sum().item()), 1))
     if verbose:

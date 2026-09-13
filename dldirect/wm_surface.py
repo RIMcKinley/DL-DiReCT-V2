@@ -74,7 +74,7 @@ def rec_surf(binary, affine, r):
     return vertices, faces
 
 
-def rec_surf_gpu(binary, affine, r, pad=2):
+def rec_surf_gpu(binary, affine, r, pad=2, priority=None, n_bands=8):
     """rec_surf's contract, with the topology correction done on the GPU.
 
     topology_gpu.correct_topology grows a genus-0 seed by adding only simple
@@ -100,7 +100,10 @@ def rec_surf_gpu(binary, affine, r, pad=2):
     from .topology_gpu import correct_topology
 
     b = np.pad(np.asarray(binary) > 0, pad)
-    corrected, info = correct_topology(b, verbose=False, pair='26-6')
+    pr = None if priority is None else np.pad(np.asarray(priority, np.float32), pad,
+                                              constant_values=1.0)
+    corrected, info = correct_topology(b, verbose=False, pair='26-6',
+                                       priority=pr, n_bands=n_bands)
     levelset = (distance_transform_edt(~corrected)
                 - distance_transform_edt(corrected)).astype(np.float32)
     l2m = nighres.surface.levelset_to_mesh(nib.Nifti1Image(levelset, affine),
@@ -130,7 +133,7 @@ def hemisphere_binary(seg, df_labels, region, excluded):
 
 
 def build_hemisphere(seg, df_labels, affine, region, excluded, nsmooth=NSMOOTH_DEFAULT,
-                     topology='nighres'):
+                     topology='nighres', priority=None):
     """Segmentation -> (vertices, faces) for one hemisphere's white surface.
 
     Topology correction, marching cubes, the tkrRAS affine, then `nsmooth`
@@ -148,7 +151,7 @@ def build_hemisphere(seg, df_labels, affine, region, excluded, nsmooth=NSMOOTH_D
     """
     binary = hemisphere_binary(seg, df_labels, region, excluded)
     if topology == 'gpu':
-        vertices, faces = rec_surf_gpu(binary, affine, region)
+        vertices, faces = rec_surf_gpu(binary, affine, region, priority=priority)
     elif topology == 'nighres':
         vertices, faces = rec_surf(binary, affine, region)
     else:
@@ -167,9 +170,9 @@ def build_hemisphere(seg, df_labels, affine, region, excluded, nsmooth=NSMOOTH_D
 
 
 def _build_one(job):
-    seg, df_labels, affine, region, excluded, nsmooth, topology = job
+    seg, df_labels, affine, region, excluded, nsmooth, topology, priority = job
     return region, build_hemisphere(seg, df_labels, affine, region, excluded, nsmooth,
-                                    topology=topology)
+                                    topology=topology, priority=priority)
 
 
 def load_inputs(prep_dir):
@@ -193,7 +196,7 @@ def load_inputs(prep_dir):
 
 
 def build_white_surfaces(prep_dir, regions=('lh', 'rh'), nsmooth=NSMOOTH_DEFAULT,
-                         parallel=True, verbose=True, topology='nighres'):
+                         parallel=True, verbose=True, topology='nighres', priority=None):
     """{region: (vertices, faces)} built from a prep directory.
 
     The two hemispheres are independent, so they run in a process pool by
@@ -204,7 +207,7 @@ def build_white_surfaces(prep_dir, regions=('lh', 'rh'), nsmooth=NSMOOTH_DEFAULT
     seg, df_labels, affine, excluded = load_inputs(prep_dir)
     if verbose:
         print('WM fill excludes: %s' % ', '.join(excluded))
-    jobs = [(seg, df_labels, affine, r, excluded, nsmooth, topology) for r in regions]
+    jobs = [(seg, df_labels, affine, r, excluded, nsmooth, topology, priority) for r in regions]
     if parallel and len(jobs) > 1 and topology != 'gpu':
         from multiprocessing.pool import Pool
         with Pool(len(jobs)) as pool:

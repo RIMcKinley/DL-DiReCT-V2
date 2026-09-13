@@ -140,12 +140,24 @@ def _face_dilate(x):
 
 
 def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
-                     comp_iters=12, pair='26-6'):
+                     comp_iters=12, pair='26-6', priority=None, n_bands=8):
     """Genus-0 subset of `mask`, grown by adding simple points only.
 
-    mask   [D,H,W] boolean/int array
-    seed   optional [D,H,W] boolean start set; must itself be genus 0. Defaults
-           to the single deepest voxel of the mask, which trivially is.
+    mask      [D,H,W] boolean/int array
+    seed      optional [D,H,W] boolean start set; must itself be genus 0.
+              Defaults to the single deepest voxel of the mask, which trivially
+              is.
+    priority  optional [D,H,W] float, higher = admit sooner. Without it the
+              front advances by distance, so WHERE a handle gets cut is decided
+              by traversal geometry -- arbitrary. The segmentation this runs on
+              is a hard argmax of a soft model output, and on the fill rim 25.8%
+              of voxels sit at P in [0.4, 0.6]; the disputed spur that made the
+              GPU and nighres corrections disagree on one measured hemisphere
+              had P(WM) = 0.514 with 0.501 and 0.507 beside it. Growing in
+              descending confidence closes the confident tissue first, so the
+              cut is forced onto the least confident voxels in the loop.
+    n_bands   number of descending priority bands; each is grown to exhaustion
+              before the next is admitted. Ignored when priority is None.
 
     Returns (corrected [D,H,W] bool, info dict).
     """
@@ -181,28 +193,46 @@ def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
 
     Xf = X.reshape(-1)
     Mf = M.reshape(-1)
+
+    if priority is None:
+        bands = [None]
+        Pf = None
+    else:
+        P = torch.zeros_like(M, dtype=torch.float32)
+        P[1:-1, 1:-1, 1:-1] = torch.as_tensor(np.asarray(priority, np.float32)).to(device)
+        Pf = P.reshape(-1)
+        vals = Pf[Mf]
+        # descending band edges, by quantile so each band holds comparable mass
+        qs = torch.linspace(1.0, 0.0, n_bands + 1, device=device)[1:]
+        bands = [float(torch.quantile(vals, q)) for q in qs]
+        bands[-1] = float(vals.min()) - 1.0            # last band admits everything
+        if verbose:
+            print('  priority bands: %s' % ' '.join('%.3f' % b for b in bands))
+
     added_total = 0
     rounds = 0
-    for rnd in range(max_rounds):
-        rounds = rnd + 1
-        added_round = 0
-        for sub in range(8):
-            front = _face_dilate(Xf.reshape(1, 1, Dp, Hp, Wp).float()).reshape(-1) > 0
-            cand = (Mf & ~Xf & front & (parity == sub)).nonzero(as_tuple=True)[0]
-            if cand.numel() == 0:
-                continue
-            occ = Xf[cand.unsqueeze(1) + off_flat.unsqueeze(0)]
-            ok = is_simple(occ, T, comp_iters, pair=pair)
-            sel = cand[ok]
-            if sel.numel():
-                Xf[sel] = True
-                added_round += int(sel.numel())
-        added_total += added_round
-        if verbose and (rnd + 1) % 20 == 0:
-            print('  round %3d: %8d voxels (+%d this round)'
-                  % (rnd + 1, int(Xf.sum()), added_round))
-        if added_round == 0:
-            break
+    for thr in bands:
+        allowed = Mf if thr is None else (Mf & (Pf >= thr))
+        for rnd in range(max_rounds):
+            rounds += 1
+            added_round = 0
+            for sub in range(8):
+                front = _face_dilate(Xf.reshape(1, 1, Dp, Hp, Wp).float()).reshape(-1) > 0
+                cand = (allowed & ~Xf & front & (parity == sub)).nonzero(as_tuple=True)[0]
+                if cand.numel() == 0:
+                    continue
+                occ = Xf[cand.unsqueeze(1) + off_flat.unsqueeze(0)]
+                ok = is_simple(occ, T, comp_iters, pair=pair)
+                sel = cand[ok]
+                if sel.numel():
+                    Xf[sel] = True
+                    added_round += int(sel.numel())
+            added_total += added_round
+            if verbose and rounds % 20 == 0:
+                print('  round %3d: %8d voxels (+%d this round)'
+                      % (rounds, int(Xf.sum()), added_round))
+            if added_round == 0:
+                break
 
     out = Xf.reshape(Dp, Hp, Wp)[1:-1, 1:-1, 1:-1].cpu().numpy()
     info = dict(rounds=rounds, added=added_total, filled=int(out.sum()),

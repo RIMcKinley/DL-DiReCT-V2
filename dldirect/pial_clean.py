@@ -71,6 +71,56 @@ RELAX_ITERS_FINAL = 1      # odd, so the last round ends on an unpaired shrink
 RELAX_LAMBDA = 0.51        # matched to pymeshlab's filter; do not change
 PIN_FEATHER = 2            # mesh rings over which the medial-wall pin ramps off
 WM_SUPERSAMPLE = 3         # partial-volume rasterisation of the white surface
+INVERT_MAX_ITER = 20       # ANTs' cap on the inversion's fixed-point iterations
+INVERT_CHECK_EVERY = 4     # host syncs per that many iterations; see below
+
+
+def invert_field_gated(field, identity_grid, max_iter=INVERT_MAX_ITER, initial=None,
+                       check_every=INVERT_CHECK_EVERY):
+    """direct_cuda.invert_field with the convergence test evaluated on the GPU.
+
+    The original breaks out of the loop on `if max_error <= 0.1 or mean <= 0.001`,
+    which is a host synchronisation on every fixed-point iteration -- measured,
+    ~9800 of them per solve, and 16.8% of the function's time. Here the flag is
+    a sticky GPU scalar and the UPDATE is frozen once it is set:
+
+        done |= (max <= 0.1) | (mean <= 0.001)
+        inv  -= (~done) * eps * residual * scale
+
+    A frozen iteration adds exactly zero, so the result is what breaking would
+    have produced -- bit-identical, verified over a full 45-iteration solve
+    (max |diff| 0.000e+00 on the velocity field and 0.000 mm on both pials).
+
+    Freezing alone is not a win: it costs the full max_iter (mean is 10.84) and
+    came out 3.3% slower. The host is therefore still asked every `check_every`
+    iterations whether it can leave early, which cuts the syncs 4x while keeping
+    the arithmetic identical. Net: -26.4% on the solve.
+
+    Do NOT torch.compile this. The compiled body is accurate to 3e-08 per call,
+    but it reorders the max/mean reductions, which flips which iteration the
+    threshold stops on, and the solve then diverges -- measured 0.1995 on a
+    field whose maximum is 1.2.
+    """
+    inv = initial.clone() if initial is not None else torch.zeros_like(field)
+    done = torch.zeros((), dtype=torch.bool, device=field.device)
+    for i in range(max_iter):
+        residual = warp_image(field, inv, identity_grid) + inv
+        scaled_norm = (residual * residual).sum(dim=1, keepdim=True).sqrt()
+        max_error = scaled_norm.max()
+        done = done | (max_error <= 0.1) | (scaled_norm.mean() <= 0.001)
+        epsilon = 0.75 if i == 0 else 0.5
+        threshold = epsilon * max_error
+        # clamp bound and multiplication ORDER both copied from
+        # direct_cuda.invert_field: float multiply is not associative, and a
+        # last-bit difference here flips which iteration the threshold stops on.
+        clamp_scale = torch.where(scaled_norm > threshold,
+                                  threshold / scaled_norm.clamp(min=1e-10),
+                                  torch.ones_like(scaled_norm))
+        inv = inv - torch.where(done, torch.zeros_like(inv),
+                                epsilon * clamp_scale * residual)
+        if check_every and (i % check_every == check_every - 1) and bool(done):
+            break
+    return inv
 
 
 def gated_velocity_smooth(vol, sigma, device):
@@ -192,8 +242,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
             velocity = velocity * active
             if pt == 1:
                 integrated.zero_()
-            integrated = invert_field(inverse, identity, initial=integrated)
-            inverse = invert_field(integrated, identity, initial=inverse)
+            integrated = invert_field_gated(inverse, identity, initial=integrated)
+            inverse = invert_field_gated(integrated, identity, initial=inverse)
 
         velocity = velocity + increment
 

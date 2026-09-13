@@ -64,6 +64,7 @@ SMOOTH_SIGMA = 1.0         # voxels, gradient + hit/total accumulation
 VELOCITY_SIGMA = 1.0       # voxels, ANTs' -b. Below 1.0 the mesh tangles steeply
 GATE_TRUNCATE = 2.0        # kernel radius = 2 voxels
 FIELD_EPS = 1e-3           # a velocity below this has no usable direction
+GATE_BLEND_BETA = 0.5      # the nu/field direction blend; see gated_velocity_smooth
 ROUNDS = 20                # propagation rounds
 STEP_SCALE = INTEGRATION_POINTS / ROUNDS   # keeps the total deformation fixed
 RELAX_ITERS = 2            # Taubin iterations between rounds
@@ -91,7 +92,21 @@ INVERT_CHECK_EVERY = 4     # host syncs per that many iterations; see below
 # solve by alternating arms and taking medians; a single A-then-B is worthless
 # here.
 
-def gated_velocity_smooth(vol, sigma, device):
+def wm_normal_field(seg, device):
+    """nu: the unit gradient of the WM signed distance, one vector per voxel.
+
+    Points OUT of white matter. DiReCT's velocity runs GM->WM, so the outward
+    direction the blend wants is -nu.
+    """
+    from scipy.ndimage import distance_transform_edt
+    wmb = (seg == 3)
+    sdt = distance_transform_edt(~wmb) - distance_transform_edt(wmb)
+    grad = np.stack(np.gradient(sdt), axis=-1)
+    nu = grad / np.maximum(np.linalg.norm(grad, axis=-1), 1e-9)[..., None]
+    return torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
+
+
+def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
     """Gaussian smoothing of the velocity field that refuses to average across a
     direction reversal.
 
@@ -107,6 +122,24 @@ def gated_velocity_smooth(vol, sigma, device):
     vote. This leaves the WM contour (which gets no increment of its own, since
     the speed term is masked to GM) holding zero for the whole solve; the
     propagation's trilinear stencil still reads live corners around it.
+
+    BLEND. With `nu` supplied, the direction each voxel is compared against is
+    not its own velocity but an equal mix of the flow and the WM interface
+    geometry:
+
+        u = normalise( beta * (-nu) + (1 - beta) * vhat )
+
+    used for the centre AND the neighbours. Two consequences. A voxel whose
+    velocity is zero still has a direction (-nu), so the WM contour -- 31% of
+    the active region, and dead for the whole solve under the field reference --
+    is smoothed rather than skipped; the FIELD_EPS guard is therefore not
+    applied. And a neighbour on the far bank of a sulcus is rejected on
+    geometry even where the flow has not yet separated the two.
+
+    beta=0.5 is the validated value: 36/36 hemispheres better on fundus CSF
+    arrival (3.39 -> 7.79%), fundus travel (+0.437mm), slide and
+    self-intersections; 0/36 on crown arrival. beta=0 is the plain field
+    reference, beta=1 is the pure geometric one.
     """
     r = max(1, int(GATE_TRUNCATE * sigma + 0.5))
     coords = torch.arange(-r, r + 1, device=device, dtype=torch.float32)
@@ -120,7 +153,13 @@ def gated_velocity_smooth(vol, sigma, device):
 
     mag = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
     ok = mag > FIELD_EPS
-    ref = vol / mag.clamp(min=FIELD_EPS)
+    if nu is None:
+        ref = vol / mag.clamp(min=FIELD_EPS)
+    else:
+        fhat = vol / mag.clamp(min=max(FIELD_EPS, 1e-12))
+        ref = beta * (-nu) + (1.0 - beta) * torch.where(ok, fhat, torch.zeros_like(fhat))
+        ref = ref / ref.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        ok = torch.ones_like(ok)          # every voxel now has a direction
 
     D, H, W = vol.shape[2:]
     padded = F.pad(vol, (r,) * 6, mode='replicate')
@@ -153,7 +192,7 @@ def gated_velocity_smooth(vol, sigma, device):
 
 
 def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
-                           compute_thickness=True):
+                           compute_thickness=True, blend_beta=GATE_BLEND_BETA):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -183,6 +222,7 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
     wm_contour = extract_wm_contours(seg_t)
     active = (gm_mask + wm_contour).clamp(max=1.0)
     identity = _make_identity_grid((D, H, W), device)
+    nu_t = None if blend_beta is None else wm_normal_field(seg, device)
 
     velocity = torch.zeros(1, 3, D, H, W, device=device)
     integrated = torch.zeros(1, 3, D, H, W, device=device)
@@ -239,7 +279,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                 velocity = velocity * torch.where(over, frac * frac, torch.ones_like(frac))
             cortical_thickness = vals * gm_mask
 
-        velocity = gated_velocity_smooth(velocity, VELOCITY_SIGMA, device)
+        velocity = gated_velocity_smooth(velocity, VELOCITY_SIGMA, device,
+                                         nu=nu_t, beta=blend_beta)
         velocity = velocity * active          # MUST precede the save; see below
         if verbose and (iteration + 1) % 10 == 0:
             if compute_thickness:
@@ -259,7 +300,7 @@ def velocity_to_numpy(velocity):
 
 
 def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbose=True,
-                         compute_thickness=True):
+                         compute_thickness=True, blend_beta=GATE_BLEND_BETA):
     """DiReCT with the gated velocity smoothing. Returns (velocity, thickness).
 
     velocity is [D, H, W, 3] in voxels, components in voxel-index order (d,h,w),
@@ -269,7 +310,7 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
     """
     velocity, cortical_thickness, _ = solve_velocity_field_t(
         seg, gm_prob, wm_prob, ref_img, verbose=verbose,
-        compute_thickness=compute_thickness)
+        compute_thickness=compute_thickness, blend_beta=blend_beta)
     vel = velocity_to_numpy(velocity)
     if out_prefix:
         # AFTER the active-region mask. Saving before it exported a 12% smoothing

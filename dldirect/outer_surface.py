@@ -112,16 +112,11 @@ def build_hemisphere_outer(seg_labelled, df_labels, affine, region, excluded,
     hemisphere's cortex label, so the envelope covers the ribbon rather than
     the WM alone.
     """
-    side = 'Left' if region == 'lh' else 'Right'
     # The WM fill's labels are the 'Left-*' / 'Right-*' structures. A parcellated
     # aseg names the cortex per gyrus instead, as 'lh-*' / 'rh-*', and those
     # carry the ribbon -- without them the envelope wraps white matter, not
     # cortex. Take both families for this side, minus the same exclusions.
-    ids = list(wm_labels.hemisphere_labels(df_labels, side, excluded))
-    skip = {'%s-%s' % (side, x) for x in excluded}
-    for name, i in df_labels['ID'].items():
-        if name.startswith(region + '-') and name not in skip:
-            ids.append(i)
+    ids = list(wm_labels.ribbon_labels(df_labels, region, excluded))
     if cortex_label is not None:
         ids.append(cortex_label)
     ids = sorted(set(ids))

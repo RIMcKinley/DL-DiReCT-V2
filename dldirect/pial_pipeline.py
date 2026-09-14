@@ -269,10 +269,15 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
             print('building the white surfaces (%d Taubin steps, %s topology)...'
                   % (nsmooth, topology))
         # Both hemispheres regardless of `hemis`: the WM label is reconciled
-        # against their union.
+        # against their union. ref_img puts the vertices in the solve grid's
+        # tkrRAS, which is what prepare() expects -- the label grid's differs by
+        # half a voxel per odd axis (0.5mm on a 256^3 conform vs a cropped
+        # grid), under prepare's frame-check threshold -- and crops the label
+        # volume to the ribbon, which is 4.9x fewer voxels to correct and mesh.
+        _g, _w, _ref = pc.load_gm_wm_probability(prep_dir)
         surfaces = wm_surface.build_white_surfaces(prep_dir, regions=('lh', 'rh'),
                                                    nsmooth=nsmooth, verbose=verbose,
-                                                   topology=topology)
+                                                   topology=topology, ref_img=_ref)
         surf_dir = None
 
     d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces)

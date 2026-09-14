@@ -41,6 +41,22 @@ def hemisphere_labels(df_labels, side, excluded):
             if x.startswith(side) and x not in skip]
 
 
+def ribbon_labels(df_labels, region, excluded):
+    """Label IDs of one hemisphere's cortical RIBBON: the WM fill plus the
+    cortex parcels.
+
+    The fill's labels are named 'Left-*' / 'Right-*'; a parcellated aseg names
+    the cortex per gyrus as 'lh-*' / 'rh-*'. Both families are needed -- the
+    fill alone is white matter, not the ribbon.
+    """
+    side = 'Left' if region == 'lh' else 'Right'
+    skip = {'%s-%s' % (side, s) for s in excluded}
+    ids = list(hemisphere_labels(df_labels, side, excluded))
+    ids += [i for n, i in df_labels['ID'].items()
+            if n.startswith(region + '-') and n not in skip]
+    return sorted(set(ids))
+
+
 def write_record(mri_dir, excluded):
     """Record the exclusions beside the run, so the surface step inherits them."""
     with open(os.path.join(mri_dir, RECORD), 'w') as f:

@@ -16,6 +16,7 @@ import pymeshlab
 from . import wm_labels
 
 NSMOOTH_DEFAULT = 50          # Taubin steps; the shell pipelines pass -ns 50
+CROP_MARGIN = 8               # voxels of background kept around the ribbon when cropping
 
 
 def get_vox2ras_tkr(t1):
@@ -197,38 +198,109 @@ def _build_one(job):
                                     topology=topology, priority=priority)
 
 
-def load_inputs(prep_dir):
-    """(seg, df_labels, affine, excluded) from a prep directory.
+def ribbon_bbox(seg, df_labels, excluded, margin=CROP_MARGIN,
+                regions=('lh', 'rh')):
+    """Slices bounding both hemispheres' ribbon, grown by `margin` voxels.
+
+    `margin` is background the operations downstream need around the object:
+    the topology correction's pad (2), the signed distance transform, and the
+    6 mm ball closing in surface_seg.locality_guard. 8 covers all three. The
+    box is clamped to the array, so a mask that already reaches a face simply
+    gets less margin there -- the callers that care pad for themselves.
+    """
+    from . import wm_labels
+    m = np.isin(seg, sorted(set(sum((list(wm_labels.ribbon_labels(df_labels, r, excluded))
+                                     for r in regions), []))))
+    nz = np.array(np.nonzero(m))
+    if not nz.size:
+        raise ValueError('the ribbon is empty; nothing to crop to')
+    lo = np.maximum(nz.min(1) - margin, 0)
+    hi = np.minimum(nz.max(1) + 1 + margin, np.array(seg.shape[:3]))
+    return tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+
+
+def load_inputs(prep_dir, crop=False, margin=CROP_MARGIN):
+    """(seg, df_labels, affine, excluded, label_img) from a prep directory.
 
     Whatever grid preparedata.py wrote the segmentation on (256^3 conform by
     default, the cropped grid with --space cropped) is the grid the surfaces
-    are built on, and the tkrRAS returned is that grid's.
+    are built on, and the tkrRAS returned is that grid's. `label_img` is the
+    image that grid belongs to -- pass it to retarget_surface.tkr_to_tkr as
+    `src_ref` to map the resulting vertices anywhere else.
+
+    crop=True first cuts the label volume down to the ribbon's bounding box
+    plus `margin` (ribbon_bbox). The cut is a plain array slice with the
+    affine's origin moved by the same integer offset: nothing is resampled and
+    no anatomy is lost. On a 256^3 conform this is a 4.9x reduction in voxels
+    (16.78M -> ~3.46M), and the white-surface build is dominated by three costs
+    that are all proportional to volume -- measured on one hemisphere, topology
+    correction 8.05 -> 2.51 s, distance transform 3.46 -> 0.42 s, meshing
+    2.50 -> 0.77 s, i.e. 14.0 s -> 3.7 s.
+
+    It is NOT bit-identical, because the topology correction is not invariant
+    to how much background surrounds the object (already noted in rec_surf).
+    Measured against the uncropped build on lh: median surface distance
+    0.0001 mm, p95 0.0002 mm, max 4.47 mm -- the same shape everywhere except
+    at the handful of sites where the two corrections choose to cut a handle
+    differently, which is the same class and magnitude of difference as
+    nighres-vs-GPU.
     """
     import os
     import pandas as pd
     seg_img = nib.load(os.path.join(prep_dir, 'mri', 'aparc.atlas+aseg.nii.gz'))
-    affine = get_vox2ras_tkr(seg_img)
     seg = seg_img.get_fdata()
     df_labels = pd.read_csv(os.path.join(prep_dir, 'label_def.csv')) \
         .set_index('LABEL').to_dict()
     # The structures preparedata.py left out of the hemisphere fill for this
     # run. Read, not re-specified, so the two masks cannot disagree.
     excluded = wm_labels.read_record(os.path.join(prep_dir, 'mri'))
-    return seg, df_labels, affine, excluded
+    if crop:
+        sl = ribbon_bbox(seg, df_labels, excluded, margin)
+        off = np.array([s.start for s in sl], float)
+        seg = np.ascontiguousarray(seg[sl])
+        aff = seg_img.affine.copy()
+        aff[:3, 3] = nib.affines.apply_affine(seg_img.affine, off)
+        seg_img = nib.Nifti1Image(seg.astype(np.float32), aff, seg_img.header)
+        seg_img.header.set_data_shape(seg.shape)
+    affine = get_vox2ras_tkr(seg_img)
+    return seg, df_labels, affine, excluded, seg_img
 
 
 def build_white_surfaces(prep_dir, regions=('lh', 'rh'), nsmooth=NSMOOTH_DEFAULT,
-                         parallel=True, verbose=True, topology='nighres', priority=None):
+                         parallel=True, verbose=True, topology='nighres', priority=None,
+                         ref_img=None, crop=None):
     """{region: (vertices, faces)} built from a prep directory.
 
     The two hemispheres are independent, so they run in a process pool by
     default -- with topology='nighres' the correction is the expensive part and
     it is single-threaded. With topology='gpu' the pool is NOT used, because the
     hemispheres would then contend for one device; they run in sequence.
+
+    WHICH FRAME THE VERTICES COME BACK IN depends on `ref_img`:
+
+      ref_img=None   the label grid's tkrRAS, i.e. the grid
+                     mri/aparc.atlas+aseg.nii.gz is on. This is what the ?h.white
+                     writer wants, since it stamps that grid's volume_info.
+      ref_img=<img>  that image's tkrRAS. Pass the solve's reference (the one
+                     load_gm_wm_probability returns) when the surfaces are going
+                     into pial_clean.prepare, which documents its `surfaces=`
+                     as being in the cropped frame. The two frames are NOT the
+                     same: a 256^3 conform and a cropped grid with an odd extent
+                     differ by half a voxel per odd axis, measured 0.5 mm on the
+                     PoB preps, which is under prepare's 1.5 mm frame-check
+                     threshold and so passes silently.
+
+    `crop` cuts the label volume to the ribbon's bounding box first (see
+    load_inputs); it defaults to True whenever `ref_img` is given, since a
+    caller that is already mapping frames has no reason to pay for the conform.
     """
-    seg, df_labels, affine, excluded = load_inputs(prep_dir)
+    crop = (ref_img is not None) if crop is None else crop
+    seg, df_labels, affine, excluded, label_img = load_inputs(prep_dir, crop=crop)
     if verbose:
         print('WM fill excludes: %s' % ', '.join(excluded))
+        if crop:
+            print('label volume cropped to %s (%.2fM voxels)'
+                  % (tuple(seg.shape), seg.size / 1e6))
     jobs = [(seg, df_labels, affine, r, excluded, nsmooth, topology, priority) for r in regions]
     if parallel and len(jobs) > 1 and topology != 'gpu':
         from multiprocessing.pool import Pool
@@ -236,4 +308,10 @@ def build_white_surfaces(prep_dir, regions=('lh', 'rh'), nsmooth=NSMOOTH_DEFAULT
             res = pool.map(_build_one, jobs)
     else:
         res = [_build_one(j) for j in jobs]
-    return {r: vf for r, vf in res}
+    out = {r: vf for r, vf in res}
+    if ref_img is not None:
+        from .retarget_surface import tkr_to_tkr
+        M = tkr_to_tkr(prep_dir, ref_img, src_ref=label_img)
+        out = {r: ((M[:3, :3] @ np.asarray(v).T).T + M[:3, 3], f)
+               for r, (v, f) in out.items()}
+    return out

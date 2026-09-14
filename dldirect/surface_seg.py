@@ -146,12 +146,8 @@ def hemisphere_ribbon(seg_labelled, df_labels, region, excluded):
     cortex per gyrus as 'lh-*' / 'rh-*'. Both are needed -- without the parcels
     this is the WM mask, not the ribbon.
     """
-    side = 'Left' if region == 'lh' else 'Right'
-    ids = list(wm_labels.hemisphere_labels(df_labels, side, excluded))
-    skip = {'%s-%s' % (side, x) for x in excluded}
-    ids += [i for n, i in df_labels['ID'].items()
-            if n.startswith(region + '-') and n not in skip]
-    return np.isin(np.asarray(seg_labelled), sorted(set(ids)))
+    return np.isin(np.asarray(seg_labelled),
+                   wm_labels.ribbon_labels(df_labels, region, excluded))
 
 
 def tissue_priority(gm_prob, wm_prob, ref_img, label_img):
@@ -190,7 +186,7 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
                                n_bands=N_BANDS, supersample=SUPERSAMPLE,
                                correct_ribbon=True, gm_crisp=False,
                                protect_above=PROTECT_ABOVE, wm_surfaces=None,
-                               locality=True, verbose=True):
+                               locality=True, crop=True, verbose=True):
     """Surfaces -> (seg, gmT, wmT) on the solve's grid, plus the WM surfaces.
 
     Returns a dict with seg/gmT/wmT/ref_img/tovox/totkr, 'surfaces' (the WM
@@ -215,6 +211,11 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     36-hemisphere comparison -- it moves exactly the metrics a displaced
     starting mesh would move (self-intersections, slide, inward).
 
+    crop=True (the default) builds on the ribbon's bounding box rather than on
+    whatever grid the label volume was written on -- 4.9x fewer voxels than a
+    256^3 conform, for the same surfaces to a p95 of 0.0002mm. See
+    wm_surface.load_inputs.
+
     gm_crisp=True takes the GM occupancy as the voxel-centre-inside test rather
     than the partial-volume fraction. The PV fraction gives gmT a soft outer
     edge, so DiReCT's speed term is still non-zero half a voxel beyond the GM
@@ -226,11 +227,13 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     gm, wm, ref_img = load_gm_wm_probability(prep_dir)
     tovox, totkr = make_transforms(ref_img)
     shape = tuple(ref_img.shape[:3])
-    seg_lab, df, aff_lab, excluded = wm_surface.load_inputs(prep_dir)
-    label_img = nib.load(os.path.join(prep_dir, 'mri', 'aparc.atlas+aseg.nii.gz'))
+    seg_lab, df, aff_lab, excluded, label_img = wm_surface.load_inputs(prep_dir, crop=crop)
+    if verbose and crop:
+        print('label volume cropped to %s (%.2fM voxels)'
+              % (tuple(seg_lab.shape), seg_lab.size / 1e6))
     prio, hi = tissue_priority(gm, wm, ref_img, label_img)
     # the label grid's tkrRAS -> the solve's tkrRAS, applied once, to both surfaces
-    M = tkr_to_tkr(prep_dir, ref_img)
+    M = tkr_to_tkr(prep_dir, ref_img, src_ref=label_img)
     to_ref = lambda v: (M[:3, :3] @ np.asarray(v).T).T + M[:3, 3]
 
     pv_wm = np.zeros(shape, np.float32)

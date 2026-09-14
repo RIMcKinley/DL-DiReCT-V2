@@ -30,12 +30,25 @@ from .compare_surfaces import tkr_to_world
 from .surface_frames import volume_info_from_image
 
 
-def tkr_to_tkr(src_prep, dst_ref):
-    """Affine taking tkr coordinates of `src_prep`'s grid into `dst_ref`'s."""
+def tkr_to_tkr(src_prep, dst_ref, src_ref=None):
+    """Affine taking tkr coordinates of `src_prep`'s grid into `dst_ref`'s.
+
+    `src_ref` optionally gives the source grid explicitly, for the case where
+    the surfaces were built on a CROP of the label volume rather than on the
+    label volume itself (wm_surface.load_inputs(crop=True)). A crop has a
+    different shape, hence a different tkrRAS, and its origin has moved; both
+    are read back off the image -- the voxel offset comes from its affine
+    relative to the one on disk, and is composed onto the scanner vox2ras so
+    the mapping stays exact. Defaults to the label volume, i.e. no crop.
+    """
     A_src = np.loadtxt(os.path.join(src_prep, 'mri', 'conform_vox2ras.txt'))
-    ref_src = nib.load(os.path.join(src_prep, 'mri', 'aparc.atlas+aseg.nii.gz'))
+    disk = nib.load(os.path.join(src_prep, 'mri', 'aparc.atlas+aseg.nii.gz'))
+    if src_ref is None:
+        src_ref = disk
+    else:
+        A_src = A_src @ (np.linalg.inv(disk.affine) @ src_ref.affine)
     return (np.linalg.inv(tkr_to_world(dst_ref, dst_ref.affine))
-            @ tkr_to_world(ref_src, A_src))
+            @ tkr_to_world(src_ref, A_src))
 
 
 def retarget(src_prep, dst_ref, surf_path, out_path, dst_name=None):

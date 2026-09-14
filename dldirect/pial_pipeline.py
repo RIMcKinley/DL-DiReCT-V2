@@ -47,6 +47,7 @@ import torch
 import torch.nn.functional as F
 
 from . import pial_clean as pc
+from . import solve_grid
 from . import surface_seg
 from . import wm_surface
 from .field_pial_prototype import (_pin_weights, build_no_push_mask,
@@ -196,7 +197,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=False,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='gpu', segmentation='surface-pv',
+                topology='gpu', segmentation='surface-pv', crop=True,
+                solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
@@ -214,18 +216,29 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     when neither surf_dir nor surfaces is given, so the whole
                     chain segmentation -> white -> field -> pial runs in one
                     process with nothing going through disk.
-    topology        'nighres' (default) or 'gpu' for the topology correction
-                    when building the white surfaces. See wm_surface for what
-                    'gpu' is and is not validated for.
-    segmentation    'logits' (default) takes seg/gmT/wmT from the model output
-                    and reconciles the WM label against the white surface.
-                    'surface-pv' builds BOTH boundaries as surfaces and
+    topology        'gpu' (default) or 'nighres' for the topology correction
+                    when building the white surfaces.
+    solve_margin    solve and propagate on the cerebrum plus this many voxels of
+                    background instead of on the whole supplied grid. The
+                    supplied grid is the bounding box of the brain mask with NO
+                    margin, so the tissue touches the faces and the propagation
+                    has nothing to stop against there, while the cerebellum end
+                    carries 24-29 slices the solve has no use for. None keeps
+                    the supplied grid. Ignored when `velocity` is given, since
+                    the field defines its own grid. See solve_grid.
+    crop            build the surfaces on a crop of the label volume rather than
+                    on whatever grid it was written on (4.9x fewer voxels than a
+                    256^3 conform). See wm_surface.load_inputs; crop=False
+                    reproduces the pre-crop behaviour.
+    segmentation    'surface-pv' (default) builds BOTH boundaries as surfaces and
                     rasterises them as partial volume -- MEASURED WORSE on
                     containment at every smoothing level, see
                     surface_seg. The GM surface comes from the topology-
                     corrected ribbon, so sulci whose CSF fell below detection
                     are open. It supplies its own white surfaces, so surf_dir /
                     surfaces / build_white / topology are ignored.
+                    'logits' takes seg/gmT/wmT from the model output and
+                    reconciles the WM label against the white surface.
     propagate_on    'cuda' keeps the field in GPU memory from solve to surface;
                     'cpu' uses the numpy reference implementation
     velocity        reuse a field instead of solving (tensor or [D,H,W,3] array)
@@ -247,13 +260,15 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         if verbose:
             print('building the segmentation from surfaces...')
         sd = surface_seg.build_surface_segmentation(prep_dir, hemis=tuple(hemis),
-                                                    nsmooth=nsmooth, verbose=verbose)
+                                                    nsmooth=nsmooth, crop=crop,
+                                                    verbose=verbose)
         d = dict(seg=sd['seg'], gmT=sd['gmT'], wmT=sd['wmT'], ref_img=sd['ref_img'],
                  tovox=sd['tovox'], totkr=sd['totkr'], surfaces=sd['surfaces'],
                  prep_dir=prep_dir)
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
+                                    solve_margin=solve_margin,
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
                                                found_csf=sd['found_csf']))
     elif str(segmentation).lower() != 'logits':
@@ -277,25 +292,36 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         _g, _w, _ref = pc.load_gm_wm_probability(prep_dir)
         surfaces = wm_surface.build_white_surfaces(prep_dir, regions=('lh', 'rh'),
                                                    nsmooth=nsmooth, verbose=verbose,
-                                                   topology=topology, ref_img=_ref)
+                                                   topology=topology, ref_img=_ref,
+                                                   crop=crop)
         surf_dir = None
 
     d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces)
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
-                                velocity_sigma=velocity_sigma, blend_beta=blend_beta)
+                                velocity_sigma=velocity_sigma, blend_beta=blend_beta,
+                                solve_margin=solve_margin)
 
 
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
                          velocity_sigma=pc.VELOCITY_SIGMA,
-                         blend_beta=pc.GATE_BLEND_BETA, extra=None):
+                         blend_beta=pc.GATE_BLEND_BETA, solve_margin=solve_grid.MARGIN,
+                         extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
-    hemis = tuple(d['surfaces'])
-    seg, tovox, totkr, ref_img = d['seg'], d['tovox'], d['totkr'], d['ref_img']
+    outer = d
     report = verbose if report is None else report
     on_gpu = str(propagate_on).lower() == 'cuda'
+    # Solve on the cerebrum plus a margin rather than on the brain-mask box:
+    # smaller where the cerebellum was, LARGER where the tissue was against a
+    # face with no background to stop the propagation against. Skipped when a
+    # field is supplied, since that field defines its own grid.
+    sub = None
+    if solve_margin is not None and velocity is None:
+        d, sub = solve_grid.tighten(d, margin=solve_margin, verbose=verbose)
+    hemis = tuple(d['surfaces'])
+    seg, tovox, totkr, ref_img = d['seg'], d['tovox'], d['totkr'], d['ref_img']
 
     thickness = None
     if velocity is None:
@@ -310,7 +336,9 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
         velocity = vel_t if (on_gpu and not out_dir) else pc.velocity_to_numpy(vel_t)
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
-            img = nib.Nifti1Image(velocity, ref_img.affine)
+            # on the caller's grid, so the file matches the prep's other volumes
+            img = nib.Nifti1Image(velocity if sub is None else sub.restore(velocity),
+                                  outer['ref_img'].affine)
             img.header['xyzt_units'] = 10
             nib.save(img, os.path.join(out_dir, 'pial_Velocity.nii.gz'))
             if on_gpu:
@@ -322,6 +350,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
         ldef = os.path.join(prep_dir, 'label_def.csv')
         if os.path.exists(soft) and os.path.exists(ldef):
             soft_seg = np.asarray(nib.load(soft).dataobj)
+            if sub is not None:
+                soft_seg = sub.apply(soft_seg)
             id_map = {r.LABEL: int(r.ID) for _, r in pd.read_csv(ldef).iterrows()}
         else:
             print('WARNING: no softmax_seg.nii.gz / label_def.csv; the medial wall will '
@@ -340,23 +370,36 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                       % (hemi, no_push.sum(), len(no_push), pin_mask.sum()))
         pial = propagate(white, faces, velocity, seg, tovox, totkr, ref_img=ref_img,
                          pin_mask=pin_mask, on=propagate_on, device=device, dtype=dtype)
+        if sub is not None:
+            pial = sub.to_parent(pial)
         out[hemi] = (pial, faces)
         if out_dir:
-            vinfo = volume_info_from_image(ref_img, prep_dir)
+            vinfo = volume_info_from_image(outer['ref_img'], prep_dir)
             nib.freesurfer.io.write_geometry(os.path.join(out_dir, '%s.pial' % hemi),
                                              pial, faces, create_stamp=None,
                                              volume_info=vinfo)
         if report:
-            m = evaluate_surface(white, pial, faces, seg, tovox,
+            # against the caller's grid, so the numbers stay comparable
+            m = evaluate_surface(outer['surfaces'][hemi][0], pial, faces,
+                                 outer['seg'], outer['tovox'],
                                  no_push=pin_mask if (pin_mask is not None
                                                       and pin_mask.any()) else None)
             print('%s: displacement %.3f mm, crossed_csf %d, self-intersections %d, '
                   'flipped %.4f%%  [%s]'
                   % (hemi, m['mean_displacement_mm'], m['crossed_csf_count'],
                      m['self_intersections'], m['flipped_face_pct'], propagate_on))
-    res = dict(surfaces=out, white=d['surfaces'], velocity=velocity,
-               thickness=thickness, seg=seg, ref_img=ref_img,
-               tovox=tovox, totkr=totkr)
+    if sub is not None:
+        # Everything leaves on the grid it arrived on. The field is brought back
+        # to the host even when the propagation kept it resident: a sub-grid
+        # tensor handed to a later call would be used against a caller-grid
+        # segmentation, and nothing downstream would notice.
+        if not isinstance(velocity, np.ndarray):
+            velocity = pc.velocity_to_numpy(velocity)
+        velocity = sub.restore(velocity)
+        thickness = None if thickness is None else sub.restore(thickness)
+    res = dict(surfaces=out, white=outer['surfaces'], velocity=velocity,
+               thickness=thickness, seg=outer['seg'], ref_img=outer['ref_img'],
+               tovox=outer['tovox'], totkr=outer['totkr'])
     if extra:
         res.update(extra)
     return res
@@ -384,6 +427,11 @@ def main():
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT,
                    help='Taubin steps for the white surface (default %d)'
                         % wm_surface.NSMOOTH_DEFAULT)
+    p.add_argument('--solve-margin', type=int, default=solve_grid.MARGIN,
+                   help='voxels of background guaranteed around the cerebrum for the '
+                        'solve and the propagation (default %d). The supplied grid is '
+                        'the brain mask bounding box with none, so the tissue touches '
+                        'the faces; -1 keeps it as given' % solve_grid.MARGIN)
     p.add_argument('--out-dir')
     p.add_argument('--hemi', nargs='+', default=['lh', 'rh'], choices=['lh', 'rh'])
     p.add_argument('--propagate-on', default='cuda', choices=['cpu', 'cuda'])
@@ -408,7 +456,8 @@ def main():
                     topology=args.topology,
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
-                    blend_beta=args.blend_beta)
+                    blend_beta=args.blend_beta,
+                    solve_margin=None if args.solve_margin < 0 else args.solve_margin)
         return
 
     import time
@@ -420,7 +469,8 @@ def main():
                     topology=args.topology,
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
-                    blend_beta=args.blend_beta)
+                    blend_beta=args.blend_beta,
+                    solve_margin=None if args.solve_margin < 0 else args.solve_margin)
     for hemi in args.hemi:
         white, faces = r['white'][hemi]
         cpu = r['surfaces'][hemi][0]

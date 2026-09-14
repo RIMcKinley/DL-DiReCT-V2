@@ -1,4 +1,7 @@
 import argparse
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dldirect import wm_labels
 import numpy as np
 import nibabel as nib
 import pandas as pd
@@ -19,6 +22,12 @@ def get_vox2ras_tkr(t1):
 # Parser for the shell script
 parser = argparse.ArgumentParser()
 parser.add_argument('-inputpath', '--input')
+parser.add_argument('--exclude-amygdala', action='store_true',
+                    help='drop the amygdala from the hemisphere fill, as the hippocampus '
+                         'already is. Measured on bert, 99.1%% of the amygdala lies inside '
+                         'the white surface by default against 1.1%% of the hippocampus. '
+                         'Changes ?h.white, so surfaces built with and without it are not '
+                         'comparable vertex-wise.')
 parser.add_argument('--space', choices=('conformed', 'cropped'), default='conformed',
                     help="grid the mri/ volumes (and hence the surfaces) are built on. "
                          "'conformed' (default): resample to LIA 256^3 as FreeSurfer's "
@@ -116,6 +125,14 @@ nib.save(trans_seg_mgz,args.input+'/mri/aparc.atlas+aseg.mgz')
 # the grid mri/aparc.atlas+aseg.nii.gz is on", which is what it still is.
 np.savetxt(args.input+'/mri/conform_vox2ras.txt', seg_image.affine)
 
+# The structures left out of the hemisphere fill. Recorded for BOTH spaces:
+# filled.mgz below is written only on the conformed path, but
+# dl_wm_surface_parallel_dev.py builds the surface from the same set on either,
+# and it reads this record rather than holding a second copy of the list.
+_excluded = wm_labels.excluded_structures(('Amygdala',) if args.exclude_amygdala else ())
+wm_labels.write_record(args.input + '/mri', _excluded)
+print('WM fill excludes: %s' % ', '.join(_excluded))
+
 # Everything from here to the normalised MRI exists only to feed FreeSurfer's
 # mri_normalize / mri_edit_wm_with_aseg / mri_pretess / mris_make_surfaces
 # (see fast_surface_reconstruction.sh), which require the 256^3 conform. No
@@ -145,10 +162,10 @@ seg = np.array(np.where(mask_rh,42,temp),dtype=np.int32)
 seg_mgz = nib.freesurfer.mghformat.MGHImage(seg, affine, header=None, extra=None, file_map=None)
 nib.save(seg_mgz,args.input+'/mri/aseg.presurf.mgz')
 
-# create filled
-labels_wm_lh = [df_labels['ID'][x] for x in df_labels['ID'].keys() if (x.startswith('Left') and x != 'Left-Cerebellum' and x != 'Left-Hippocampus') ]
+# create filled (conformed path only; the exclusions were recorded above).
+labels_wm_lh = wm_labels.hemisphere_labels(df_labels, 'Left', _excluded)
 mask_wm_lh = np.isin(seg_img, labels_wm_lh)
-labels_wm_rh = [df_labels['ID'][x] for x in df_labels['ID'].keys() if (x.startswith('Right') and x != 'Right-Cerebellum' and x != 'Right-Hippocampus') ]
+labels_wm_rh = wm_labels.hemisphere_labels(df_labels, 'Right', _excluded)
 mask_wm_rh = np.isin(seg_img, labels_wm_rh)
 temp = np.array(np.where(mask_wm_lh, 255, 0),dtype=np.int32)
 wm_fill = np.array(np.where(mask_wm_rh,127,temp),dtype=np.int32)

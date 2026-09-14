@@ -95,7 +95,47 @@ from .topology_gpu import correct_topology
 SUPERSAMPLE = 3            # partial-volume rasterisation, as the white reconciliation uses
 N_BANDS = 8                # priority bands for the ribbon correction
 PROTECT_ABOVE = 0.6        # never sacrifice tissue the model is this sure about
+GUARD_WM_MM = 1.0          # protect tissue within this of the WM fill
+GUARD_ENV_MM = 2.0         # ... and this of the closing envelope's edge
 PAD = 2
+
+
+def locality_guard(seg_labelled, df_labels, region, excluded, ribbon,
+                   wm_mm=GUARD_WM_MM, env_mm=GUARD_ENV_MM):
+    """Tissue the topology correction may NOT sacrifice, by location.
+
+    The correction has no notion of CSF -- it finds where the ribbon's shape is
+    topologically wrong, and a handle can run anywhere. Two zones are therefore
+    put out of bounds:
+
+      * within `wm_mm` of the WM FILL. Note the fill, not the
+        Left/Right-Cerebral-White-Matter label: the fill also contains the
+        thalamus, caudate, putamen, pallidum and ventricles, whose interiors
+        are several mm from any cerebral-WM voxel. Guarding on the label alone
+        left 49 rh cuts inside the pallidum and putamen, up to 5.8mm from
+        cerebral WM -- and none in lh, which is why a one-hemisphere check
+        missed it.
+      * within `env_mm` of the closing envelope's edge, i.e. the outer brain
+        margin. The envelope bridges sulci, so sulcal depths are inside it
+        while the outer cortical surface is on it; plain distance to background
+        cannot separate those, because sulcal CSF connects outward. Measured,
+        this one earns little (it excludes ~5% more cuts, all of them already
+        CSF-adjacent) but it is cheap and principled.
+
+    Measured at floor 0.70: the WM-fill guard takes rh from 49 cuts inside the
+    fill to 0, deep cuts (>2mm from any CSF) 86 -> 41, and CSF-adjacency
+    85.9% -> 87.7%, for 49 of 2143 cuts.
+    """
+    from scipy.ndimage import distance_transform_edt, binary_fill_holes
+    from . import outer_surface as _osf
+    side = 'Left' if region == 'lh' else 'Right'
+    fill = np.isin(np.asarray(seg_labelled),
+                   wm_labels.hemisphere_labels(df_labels, side, excluded))
+    guard = distance_transform_edt(~fill) <= wm_mm
+    if env_mm:
+        env = binary_fill_holes(_osf.close_by_ball(ribbon, 6.0))
+        guard = guard | (distance_transform_edt(env) <= env_mm)
+    return guard
 
 
 def hemisphere_ribbon(seg_labelled, df_labels, region, excluded):
@@ -149,7 +189,7 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
                                n_bands=N_BANDS, supersample=SUPERSAMPLE,
                                correct_ribbon=True, gm_crisp=False,
                                protect_above=PROTECT_ABOVE, wm_surfaces=None,
-                               verbose=True):
+                               locality=True, verbose=True):
     """Surfaces -> (seg, gmT, wmT) on the solve's grid, plus the WM surfaces.
 
     Returns a dict with seg/gmT/wmT/ref_img/tovox/totkr, 'surfaces' (the WM
@@ -198,9 +238,13 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     for h in ('lh', 'rh'):
         ribbon = hemisphere_ribbon(seg_lab, df, h, excluded)
         if correct_ribbon:
-            corr, info = correct_topology(np.pad(ribbon, PAD), verbose=False, pair='26-6',
-                                          priority=np.pad(prio, PAD, constant_values=hi),
-                                          n_bands=n_bands, protect_above=protect_above)
+            pmask = (locality_guard(seg_lab, df, h, excluded, ribbon)
+                     if locality else None)
+            corr, info = correct_topology(
+                np.pad(ribbon, PAD), verbose=False, pair='26-6',
+                priority=np.pad(prio, PAD, constant_values=hi), n_bands=n_bands,
+                protect_above=protect_above,
+                protect_mask=(None if pmask is None else np.pad(pmask, PAD)))
             corr = corr[PAD:-PAD, PAD:-PAD, PAD:-PAD]
             found[h] = int((ribbon & ~corr).sum())
             if verbose:

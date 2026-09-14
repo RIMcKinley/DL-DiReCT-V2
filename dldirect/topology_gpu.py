@@ -141,7 +141,7 @@ def _face_dilate(x):
 
 def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
                      comp_iters=12, pair='26-6', priority=None, n_bands=8,
-                     protect_above=None):
+                     protect_above=None, protect_mask=None):
     """Genus-0 subset of `mask`, grown by adding simple points only.
 
     mask      [D,H,W] boolean/int array
@@ -168,6 +168,15 @@ def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
               for in confident tissue. Without it the growth's only currency is
               tissue, so a mask with many defects necessarily loses some.
               Needs `priority`; the floor is in that array's units.
+    protect_mask
+              a boolean volume of tissue that must never be sacrificed,
+              applied the same way as protect_above but by location rather than
+              confidence. Use it to say WHERE a cut is allowed to be: the
+              correction has no notion of CSF, it only finds where the shape is
+              topologically wrong, so without a locality constraint it will cut
+              at the white-matter interface and at the outer brain margin as
+              readily as in a sulcus. Must be the same shape as `mask`, i.e.
+              padded the same way `priority` is.
 
     Returns (corrected [D,H,W] bool, info dict).
     """
@@ -245,10 +254,19 @@ def correct_topology(mask, device=None, seed=None, max_rounds=400, verbose=True,
                 break
 
     protected = 0
-    if protect_above is not None:
-        if Pf is None:
-            raise ValueError('protect_above needs priority=')
-        keep = Mf & (Pf >= float(protect_above))
+    if protect_above is not None or protect_mask is not None:
+        # start with NOTHING protected and OR in each constraint; initialising
+        # to Mf protects the whole mask and silently disables the correction
+        keep = torch.zeros_like(Mf)
+        if protect_above is not None:
+            if Pf is None:
+                raise ValueError('protect_above needs priority=')
+            keep = keep | (Mf & (Pf >= float(protect_above)))
+        if protect_mask is not None:
+            pm = torch.zeros_like(M)
+            pm[1:-1, 1:-1, 1:-1] = torch.from_numpy(
+                np.asarray(protect_mask, bool)).to(device)
+            keep = keep | (Mf & pm.reshape(-1))
         for _ in range(max_rounds):
             front = _face_dilate(Xf.reshape(1, 1, Dp, Hp, Wp).float()).reshape(-1) > 0
             cand = keep & ~Xf & front

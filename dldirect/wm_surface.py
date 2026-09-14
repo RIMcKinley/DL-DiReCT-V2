@@ -74,6 +74,30 @@ def rec_surf(binary, affine, r):
     return vertices, faces
 
 
+def signed_distance(mask, workers=2):
+    """Exact signed Euclidean distance to the boundary of `mask`.
+
+    The two transforms are independent and scipy's distance_transform_edt
+    releases the GIL, so they run concurrently.
+
+    MEASURED AND REJECTED: a narrow chamfer band computed with GPU min-pools is
+    61x faster (5.9s -> 0.1s) but is NOT a substitute. Chamfer makes a diagonal
+    neighbour distance 1 where Euclidean makes it sqrt(2), which moves the
+    zero crossing by up to half a voxel and changes the mesh: on lh the
+    isosurface came back with the same vertex count but a different
+    triangulation and chi -42 instead of 2. Widening the band does not help --
+    the error is sub-voxel, not far-field. An exact GPU transform
+    (Felzenszwalb separable) would work; a chamfer one will not.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from scipy.ndimage import distance_transform_edt
+    m = np.asarray(mask) > 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        out = ex.submit(distance_transform_edt, ~m)
+        inn = ex.submit(distance_transform_edt, m)
+        return (out.result() - inn.result()).astype(np.float32)
+
+
 def rec_surf_gpu(binary, affine, r, pad=2, priority=None, n_bands=8):
     """rec_surf's contract, with the topology correction done on the GPU.
 
@@ -96,7 +120,6 @@ def rec_surf_gpu(binary, affine, r, pad=2, priority=None, n_bands=8):
     where the two choose to cut a handle.
     """
     import nighres
-    from scipy.ndimage import distance_transform_edt
     from .topology_gpu import correct_topology
 
     b = np.pad(np.asarray(binary) > 0, pad)
@@ -104,8 +127,7 @@ def rec_surf_gpu(binary, affine, r, pad=2, priority=None, n_bands=8):
                                               constant_values=1.0)
     corrected, info = correct_topology(b, verbose=False, pair='26-6',
                                        priority=pr, n_bands=n_bands)
-    levelset = (distance_transform_edt(~corrected)
-                - distance_transform_edt(corrected)).astype(np.float32)
+    levelset = signed_distance(corrected)
     l2m = nighres.surface.levelset_to_mesh(nib.Nifti1Image(levelset, affine),
                                            connectivity='6/18')
     return l2m['result']['points'] - pad, l2m['result']['faces']

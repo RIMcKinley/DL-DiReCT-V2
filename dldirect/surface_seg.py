@@ -30,9 +30,53 @@ The label volume (mri/aparc.atlas+aseg.nii.gz) is usually on the 256^3 conform
 while the solve runs on the cropped grid. That mapping is done here, in one
 place, rather than in each caller.
 
-STATUS: validated on one subject, two hemispheres, against the FSR pial --
-crossed_csf and median distance improve, self-intersections and end_in_wm get
-worse. Not a default.
+STATUS: NOT A DEFAULT, and measured worse than the logits route on every
+containment metric. Kept because the sub-threshold CSF idea is worth another
+attempt, not because this implementation of it works.
+
+What the measurements showed, in the order they were established:
+
+  1. The reported benefit was a SCORING ARTEFACT. crossed_csf was computed
+     against each arm's OWN segmentation. This arm's segmentation has the sulci
+     opened, so a vertex that stops inside a sulcus is in background and stays
+     there -- no crossing is recorded -- while the same vertex against the
+     baseline segmentation goes tissue/background/tissue and counts. Scored
+     against a COMMON segmentation the direction reverses: 712 -> 1965, not
+     703 -> 387. Any comparison of crossed_csf, transit_pct or end_in_wm
+     across arms with different seg is invalid.
+
+  2. The topology correction contributes almost none of the difference.
+     correct_ribbon=False changes c_crossed by a few percent (1965 vs 1826).
+
+  3. The partial volume contributes little either: gm_crisp=True reproduces
+     91% of the effect (1796 vs 1965).
+
+  4. It is the SMOOTHED GM SURFACE itself, and nsmooth -- inherited from the
+     white surface, never tested on a GM envelope -- is the live variable.
+     Sweeping it, scored against a common segmentation, 4 subjects:
+
+       nsmooth   euc_med  euc_p95  c_crossed  c_transit  c_endwm  selfint
+       logits     0.5399   1.3817      712.5     0.4358    898.0     10.0
+       0          0.5143   1.3672      919.9     0.4754   1331.6     18.9
+       10         0.5266   1.3434     1507.9     0.4942   1230.9     45.8
+       50         0.5427   1.3443     1964.5     0.5077    898.6     77.5
+
+     Smoothing trades containment (crossed, transit, self-intersections all
+     rise) against inward excursion (end_in_wm and inward_pct fall). No value
+     beats the logits baseline on containment.
+
+  5. The detector is not specific to CSF. It finds where the ribbon is
+     TOPOLOGICALLY wrong and declines to complete the loop; whether that place
+     is sulcal CSF is an assumption. 89% of the cut voxels are adjacent to
+     existing CSF (median distance 1.0mm vs 1.73mm for GM generally), but 12%
+     are within 1mm of white matter and 38 sit in the ribbon interior touching
+     neither. A handle can run anywhere.
+
+To make the idea work, the missing piece is a LOCALITY CONSTRAINT: only accept
+a cut adjacent to existing CSF, or within ~1mm of it. That discards exactly the
+population that cannot be sulcal CSF, at the cost of leaving some handles
+unfixed -- which does not matter, since the GM surface tolerates defects.
+Untested.
 """
 
 import os
@@ -104,7 +148,8 @@ def tissue_priority(gm_prob, wm_prob, ref_img, label_img):
 def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
                                n_bands=N_BANDS, supersample=SUPERSAMPLE,
                                correct_ribbon=True, gm_crisp=False,
-                               protect_above=PROTECT_ABOVE, verbose=True):
+                               protect_above=PROTECT_ABOVE, wm_surfaces=None,
+                               verbose=True):
     """Surfaces -> (seg, gmT, wmT) on the solve's grid, plus the WM surfaces.
 
     Returns a dict with seg/gmT/wmT/ref_img/tovox/totkr, 'surfaces' (the WM
@@ -120,6 +165,14 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     matter here, since the GM surface is allowed defects. In the ribbon's units
     (max of the WM and cortex logits) the ribbon median is ~0.87 and the voxels
     the unprotected correction removes have median ~0.65.
+
+    wm_surfaces optionally supplies {hemi: (verts, faces)} to use as the WM
+    boundary instead of building one. Pass the surface you intend to PROPAGATE
+    from: otherwise wmT is rasterised from a different mesh than the one the
+    propagation starts on, and the field is shaped around a boundary the
+    starting surface does not sit on. That mismatch invalidated a
+    36-hemisphere comparison -- it moves exactly the metrics a displaced
+    starting mesh would move (self-intersections, slide, inward).
 
     gm_crisp=True takes the GM occupancy as the voxel-centre-inside test rather
     than the partial-volume fraction. The PV fraction gives gmT a soft outer
@@ -141,7 +194,7 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
 
     pv_wm = np.zeros(shape, np.float32)
     pv_gm = np.zeros(shape, np.float32)
-    wm_surfaces, gm_surfaces, found = {}, {}, {}
+    wm_out, gm_surfaces, found = {}, {}, {}   # NOT wm_surfaces: that is the parameter
     for h in ('lh', 'rh'):
         ribbon = hemisphere_ribbon(seg_lab, df, h, excluded)
         if correct_ribbon:
@@ -156,12 +209,17 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
         else:
             corr, found[h] = ribbon, 0
         gv, gf = osf.mesh_envelope(corr, aff_lab, nsmooth=nsmooth)
-        wv, wf = wm_surface.build_hemisphere(seg_lab, df, aff_lab, h, excluded,
-                                             nsmooth=nsmooth, topology='gpu',
-                                             priority=prio)
-        gv, wv = to_ref(gv), to_ref(wv)
+        gv = to_ref(gv)
+        if wm_surfaces is not None:
+            wv, wf = wm_surfaces[h]           # already in the solve's frame
+            wv = np.asarray(wv)
+        else:
+            wv, wf = wm_surface.build_hemisphere(seg_lab, df, aff_lab, h, excluded,
+                                                 nsmooth=nsmooth, topology='gpu',
+                                                 priority=prio)
+            wv = to_ref(wv)
         gm_surfaces[h] = (gv, np.asarray(gf))
-        wm_surfaces[h] = (wv, np.asarray(wf))
+        wm_out[h] = (wv, np.asarray(wf))
         pv_gm += (rasterize_mesh(tovox(gv), np.asarray(gf), shape).astype(np.float32)
                   if gm_crisp else
                   rasterize_mesh_pv(tovox(gv), np.asarray(gf), shape, supersample))
@@ -177,6 +235,6 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
               % ('crisp' if gm_crisp else 'PV',
                  int((seg == 3).sum()), int((seg == 2).sum())))
     return dict(seg=seg, gmT=gmT, wmT=wmT, ref_img=ref_img, tovox=tovox, totkr=totkr,
-                surfaces={h: wm_surfaces[h] for h in hemis},
+                surfaces={h: wm_out[h] for h in hemis},
                 gm_surfaces={h: gm_surfaces[h] for h in hemis},
                 found_csf=found, pv_gm=pv_gm, pv_wm=pv_wm, prep_dir=prep_dir)

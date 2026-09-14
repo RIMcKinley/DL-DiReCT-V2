@@ -196,7 +196,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=True,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='nighres', segmentation='surface-pv',
+                topology='nighres', segmentation='logits',
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
@@ -217,10 +217,11 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     topology        'nighres' (default) or 'gpu' for the topology correction
                     when building the white surfaces. See wm_surface for what
                     'gpu' is and is not validated for.
-    segmentation    'surface-pv' (default) builds BOTH boundaries as surfaces
-                    and rasterises them as partial volume; 'logits' takes
-                    seg/gmT/wmT from the model output and reconciles the WM
-                    label against the white surface. See
+    segmentation    'logits' (default) takes seg/gmT/wmT from the model output
+                    and reconciles the WM label against the white surface.
+                    'surface-pv' builds BOTH boundaries as surfaces and
+                    rasterises them as partial volume -- MEASURED WORSE on
+                    containment at every smoothing level, see
                     surface_seg. The GM surface comes from the topology-
                     corrected ribbon, so sulci whose CSF fell below detection
                     are open. It supplies its own white surfaces, so surf_dir /
@@ -369,7 +370,7 @@ def main():
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f; 0 = plain field gate)'
                         % pc.GATE_BLEND_BETA)
-    p.add_argument('--segmentation', default='surface-pv',
+    p.add_argument('--segmentation', default='logits',
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')

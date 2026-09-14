@@ -94,7 +94,8 @@ from .topology_gpu import correct_topology
 
 SUPERSAMPLE = 3            # partial-volume rasterisation, as the white reconciliation uses
 N_BANDS = 8                # priority bands for the ribbon correction
-PROTECT_ABOVE = 0.6        # never sacrifice tissue the model is this sure about
+PROTECT_ABOVE = 0.7        # never sacrifice tissue the model is this sure about
+                           # (a probability: load_gm_wm_probability applies expit)
 GUARD_WM_MM = 1.0          # protect tissue within this of the WM fill
 GUARD_ENV_MM = 2.0         # ... and this of the closing envelope's edge
 PAD = 2

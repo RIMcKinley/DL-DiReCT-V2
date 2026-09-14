@@ -194,9 +194,9 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, ref_img=None,
 # ---------------------------------------------------------------------------
 def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
-                verbose=True, report=None, compute_thickness=True,
+                verbose=True, report=None, compute_thickness=False,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='nighres', segmentation='logits',
+                topology='gpu', segmentation='surface-pv',
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
@@ -370,11 +370,11 @@ def main():
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f; 0 = plain field gate)'
                         % pc.GATE_BLEND_BETA)
-    p.add_argument('--segmentation', default='logits',
+    p.add_argument('--segmentation', default='surface-pv',
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')
-    p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu'],
+    p.add_argument('--topology', default='gpu', choices=['nighres', 'gpu'],
                    help='topology correction when building white surfaces')
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT,
                    help='Taubin steps for the white surface (default %d)'
@@ -382,9 +382,12 @@ def main():
     p.add_argument('--out-dir')
     p.add_argument('--hemi', nargs='+', default=['lh', 'rh'], choices=['lh', 'rh'])
     p.add_argument('--propagate-on', default='cuda', choices=['cpu', 'cuda'])
-    p.add_argument('--no-thickness', action='store_true',
-                   help='skip the DiReCT thickness map; also drops the THICKNESS_PRIOR '
-                        'velocity cap, which does not bind on validated data')
+    p.add_argument('--thickness', action='store_true',
+                   help='also compute the DiReCT thickness map. Off by default: it costs '
+                        'two warp_image calls per integration point and two Gaussian '
+                        'smooths per iteration (22.6s -> 13.3s without it), and on '
+                        'validated data the velocity field is bit-identical either way '
+                        'because the THICKNESS_PRIOR cap never binds')
     p.add_argument('--float64', action='store_true',
                    help='run the cuda propagation in double precision')
     p.add_argument('--check', action='store_true',
@@ -395,7 +398,7 @@ def main():
     if not args.check:
         reconstruct(args.prep_dir, args.surf_dir, hemis=tuple(args.hemi),
                     propagate_on=args.propagate_on, out_dir=args.out_dir, dtype=dtype,
-                    compute_thickness=not args.no_thickness,
+                    compute_thickness=args.thickness,
                     build_white=args.build_white or None, nsmooth=args.nsmooth,
                     topology=args.topology,
                     segmentation=args.segmentation,

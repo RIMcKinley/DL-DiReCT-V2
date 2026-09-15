@@ -291,6 +291,24 @@ def load_gm_wm_probability(prep_dir, gm_labels=None, wm_labels=None):
     includes the amygdala and hippocampus and was found in this
     investigation to let flow leak into subcortical grey matter.
     """
+    # A prep built from a segmenter that emits POSTERIORS rather than logits
+    # (SAMSEG, SynthSeg -- see prep_from_seg.py) carries the two tissue
+    # probabilities directly. Take them as they are: they are already what this
+    # function otherwise computes, and round-tripping them through a logit would
+    # be lossy at the ends and outright wrong at p == 0.5, which inverts to
+    # logit 0 and is then read back as probability 0 by the expit branch below.
+    # Only honoured when BOTH files are present, so a half-written prep falls
+    # through to the logits rather than silently mixing the two sources.
+    p_gm = os.path.join(prep_dir, 'prob_gm.nii.gz')
+    p_wm = os.path.join(prep_dir, 'prob_wm.nii.gz')
+    if gm_labels is None and wm_labels is None \
+            and os.path.exists(p_gm) and os.path.exists(p_wm):
+        gm_img = nib.load(p_gm)
+        gm_prob = gm_img.get_fdata(dtype=np.float32)
+        wm_prob = nib.load(p_wm).get_fdata(dtype=np.float32)
+        return (np.clip(gm_prob, 0, 1).astype(np.float32),
+                np.clip(wm_prob, 0, 1).astype(np.float32), gm_img)
+
     if gm_labels is None:
         gm_labels = ['Left-Cerebral-Cortex', 'Right-Cerebral-Cortex']
     if wm_labels is None:

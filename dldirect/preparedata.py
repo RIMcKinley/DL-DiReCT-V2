@@ -80,30 +80,45 @@ df_labels = pd.read_csv(args.input+'/label_def.csv').set_index('LABEL').to_dict(
 
 # Transform DeepSCAN corpus callosum and WM-hypointensities label into L and R WM
 output_data = seg_image.get_fdata()
-cc_min = int(min(np.argwhere(output_data == df_labels['ID']['Corpus-Callosum']).T[0]))
-cc_max = int(max(np.argwhere(output_data == df_labels['ID']['Corpus-Callosum']).T[0]))
 
-side = np.zeros_like(output_data)
-side[0:cc_min+int((cc_max-cc_min)/2),:,:] = 10000
-# Upper bound was a hard-coded 255, i.e. the conformed grid's last index. On
-# the conformed grid slice 255 is zero padding so this is output-identical
-# there; on the cropped grid it would have left the last slice unassigned.
-side[cc_min+int((cc_max-cc_min)/2):output_data.shape[0],:,:] = 5000
-
-# not every segmentation model detects WM-hypointensities as a separate
-# class (e.g. v0); only fold it into the midline mask if present
-midline = (output_data == df_labels['ID']['Corpus-Callosum'])
-if 'WM-hypointensities' in df_labels['ID']:
-    midline = midline | (output_data == df_labels['ID']['WM-hypointensities'])
+# A foreign segmentation may carry no corpus callosum at all -- SynthSeg's stock
+# label set has none, and it already lateralises the white matter as 2/41, so
+# there is nothing here to split. Without this guard the KeyError (no row in
+# label_def.csv) or the min() of an empty argwhere ends the run. DeepSCAN preps
+# are unaffected: v0_f1 always emits Corpus-Callosum, so `_has_cc` is True and
+# every line below runs exactly as before.
+_cc_id = df_labels['ID'].get('Corpus-Callosum')
+_has_cc = _cc_id is not None and bool(np.any(output_data == _cc_id))
+if not _has_cc:
+    print('NOTE: no corpus-callosum label in the segmentation; skipping the '
+          'CC -> left/right white matter split (the source must already '
+          'lateralise the white matter, as SynthSeg and SAMSEG do)')
+    seg_img = output_data
 else:
-    print('WARNING: segmentation model used does not detect WM-hypointensities, '
-          'surface reconstruction may be unreliable')
-temp = np.where(midline & (side == 10000), df_labels['ID']['Right-Cerebral-White-Matter'], output_data)
+    cc_min = int(min(np.argwhere(output_data == _cc_id).T[0]))
+    cc_max = int(max(np.argwhere(output_data == _cc_id).T[0]))
 
-midline2 = (temp == df_labels['ID']['Corpus-Callosum'])
-if 'WM-hypointensities' in df_labels['ID']:
-    midline2 = midline2 | (temp == df_labels['ID']['WM-hypointensities'])
-seg_img = np.where(midline2 & (side == 5000), df_labels['ID']['Left-Cerebral-White-Matter'], temp)
+    side = np.zeros_like(output_data)
+    side[0:cc_min+int((cc_max-cc_min)/2),:,:] = 10000
+    # Upper bound was a hard-coded 255, i.e. the conformed grid's last index. On
+    # the conformed grid slice 255 is zero padding so this is output-identical
+    # there; on the cropped grid it would have left the last slice unassigned.
+    side[cc_min+int((cc_max-cc_min)/2):output_data.shape[0],:,:] = 5000
+
+    # not every segmentation model detects WM-hypointensities as a separate
+    # class (e.g. v0); only fold it into the midline mask if present
+    midline = (output_data == _cc_id)
+    if 'WM-hypointensities' in df_labels['ID']:
+        midline = midline | (output_data == df_labels['ID']['WM-hypointensities'])
+    else:
+        print('WARNING: segmentation model used does not detect WM-hypointensities, '
+              'surface reconstruction may be unreliable')
+    temp = np.where(midline & (side == 10000), df_labels['ID']['Right-Cerebral-White-Matter'], output_data)
+
+    midline2 = (temp == _cc_id)
+    if 'WM-hypointensities' in df_labels['ID']:
+        midline2 = midline2 | (temp == df_labels['ID']['WM-hypointensities'])
+    seg_img = np.where(midline2 & (side == 5000), df_labels['ID']['Left-Cerebral-White-Matter'], temp)
 
 # export the transformed segmentation
 trans_seg_mgz = nib.freesurfer.mghformat.MGHImage(np.array(seg_img,dtype=np.int32) , affine, header=None, extra=None, file_map=None)

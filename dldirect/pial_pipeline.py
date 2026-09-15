@@ -197,7 +197,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=False,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='gpu', segmentation='surface-pv', crop=True,
+                topology='nighres', segmentation='surface-pv', crop=True,
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 write_white=True, dtype=torch.float32, device=None):
@@ -216,8 +216,11 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     when neither surf_dir nor surfaces is given, so the whole
                     chain segmentation -> white -> field -> pial runs in one
                     process with nothing going through disk.
-    topology        'gpu' (default) or 'nighres' for the topology correction
-                    when building the white surfaces.
+    topology        'nighres' (default) or 'gpu' for the topology correction
+                    when building the white surfaces. It applies on BOTH
+                    routes: under `surface-pv` it is forwarded to
+                    surface_seg.build_surface_segmentation, which used to
+                    hardcode 'gpu' and so ignored this flag entirely.
     write_white     also write ?h.white beside ?h.pial when out_dir is given
                     (default). It is the mesh the propagation started from, in
                     the pial's frame; under `surface-pv` nothing else writes it.
@@ -239,7 +242,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     surface_seg. The GM surface comes from the topology-
                     corrected ribbon, so sulci whose CSF fell below detection
                     are open. It supplies its own white surfaces, so surf_dir /
-                    surfaces / build_white / topology are ignored.
+                    surfaces / build_white are ignored -- `topology` is not, it
+                    selects the correction used to build them.
                     'logits' takes seg/gmT/wmT from the model output and
                     reconciles the WM label against the white surface.
     propagate_on    'cuda' keeps the field in GPU memory from solve to surface;
@@ -264,6 +268,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
             print('building the segmentation from surfaces...')
         sd = surface_seg.build_surface_segmentation(prep_dir, hemis=tuple(hemis),
                                                     nsmooth=nsmooth, crop=crop,
+                                                    topology=topology,
                                                     verbose=verbose)
         d = dict(seg=sd['seg'], gmT=sd['gmT'], wmT=sd['wmT'], ref_img=sd['ref_img'],
                  tovox=sd['tovox'], totkr=sd['totkr'], surfaces=sd['surfaces'],
@@ -443,8 +448,9 @@ def main():
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')
-    p.add_argument('--topology', default='gpu', choices=['nighres', 'gpu'],
-                   help='topology correction when building white surfaces')
+    p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu'],
+                   help='topology correction when building white surfaces '
+                        '(default nighres)')
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT,
                    help='Taubin steps for the white surface (default %d)'
                         % wm_surface.NSMOOTH_DEFAULT)

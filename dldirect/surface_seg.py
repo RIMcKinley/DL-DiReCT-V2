@@ -90,6 +90,7 @@ from . import wm_surface
 from .field_pial_prototype import (get_vox2ras_tkr, load_gm_wm_probability,
                                    make_transforms, rasterize_mesh, rasterize_mesh_pv)
 from .retarget_surface import tkr_to_tkr
+from .surface_frames import check_surface_frame
 from .topology_gpu import correct_topology
 
 SUPERSAMPLE = 3            # partial-volume rasterisation, as the white reconciliation uses
@@ -182,11 +183,63 @@ def tissue_priority(gm_prob, wm_prob, ref_img, label_img):
     return np.where(inb.reshape(sh), out, hi).astype(np.float32), hi
 
 
+FRAME_MARGIN_PCT = 2.0     # see _assert_solve_frame; the real gap is ~20 points
+
+
+def _assert_solve_frame(hemi, verts, M, label_img):
+    """Reject wm_surfaces= handed over in the LABEL grid's tkrRAS frame.
+
+    The parameter takes surfaces "already in the solve's frame" on a comment
+    alone. Label-grid surfaces are accepted silently and shift the whole mesh
+    by whatever the crop moved the tkr origin -- 7.0mm on OAS30001 -- which
+    surfaced only as 18919 self-intersections against a correct 5905.
+
+    The test is this repo's established one: surface_frames.check_surface_frame
+    sampling tissue labels at the vertices, which its docstring argues is the
+    conclusive check where centroid, bounding-box and nearest-neighbour tests
+    are not. The shape check in pial_clean.prepare is not an option here --
+    it reads volume_info off the file, and in-memory surfaces carry none.
+
+    But check_surface_frame's ABSOLUTE threshold is not sufficient for this.
+    It is deliberately blind to small displacements, and measured on
+    OAS30001's white surfaces the wrong reading still samples 75.6% (lh) /
+    76.3% (rh) tissue -- above the 72% pass mark, so it would be waved
+    through -- against 95.7% / 95.8% for the right one. So the check is used
+    COMPARATIVELY instead: score the mesh read as solve-frame (M^-1 v) against
+    the same mesh read as label-frame (v), and reject when the label-frame
+    reading is the better one. That has no fixed floor, which matters because
+    the offset between the frames is set by the ribbon's bounding box and can
+    be smaller on another subject; and it cannot cry wolf when the two frames
+    coincide, since M == I makes the two readings identical.
+
+    Everything stays inside the label grid, so no scanner-RAS affine enters.
+    """
+    W = label_img.affine @ np.linalg.inv(get_vox2ras_tkr(label_img))
+    Minv = np.linalg.inv(M)
+    verts = np.asarray(verts, float)
+    as_solve = (Minv[:3, :3] @ verts.T).T + Minv[:3, 3]
+    _, st_solve = check_surface_frame(as_solve, W, label_img, kind='white')
+    _, st_label = check_surface_frame(verts, W, label_img, kind='white')
+    if st_label['tissue'] > st_solve['tissue'] + FRAME_MARGIN_PCT:
+        raise ValueError(
+            "wm_surfaces[%r] is not in the solve grid's tkrRAS frame: its "
+            "vertices sample %.1f%% tissue read as LABEL-grid coordinates "
+            "against %.1f%% read as solve-grid ones, so they are in the label "
+            "grid's frame. The likely cause is a surface from "
+            "wm_surface.build_hemisphere, which returns vertices in the (here "
+            "cropped) label grid's tkrRAS, passed on unmapped. Fix by applying "
+            "retarget_surface.tkr_to_tkr(prep_dir, ref_img, src_ref=label_img) "
+            "to the vertices first -- the same mapping this function applies "
+            "to the surfaces it builds itself."
+            % (hemi, st_label['tissue'], st_solve['tissue']))
+
+
 def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
                                n_bands=N_BANDS, supersample=SUPERSAMPLE,
                                correct_ribbon=True, gm_crisp=False,
                                protect_above=PROTECT_ABOVE, wm_surfaces=None,
-                               locality=True, crop=True, verbose=True):
+                               locality=True, crop=True, topology='nighres',
+                               verbose=True):
     """Surfaces -> (seg, gmT, wmT) on the solve's grid, plus the WM surfaces.
 
     Returns a dict with seg/gmT/wmT/ref_img/tovox/totkr, 'surfaces' (the WM
@@ -209,7 +262,21 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     propagation starts on, and the field is shaped around a boundary the
     starting surface does not sit on. That mismatch invalidated a
     36-hemisphere comparison -- it moves exactly the metrics a displaced
-    starting mesh would move (self-intersections, slide, inward).
+    starting mesh would move (self-intersections, slide, inward). Surfaces
+    passed here must be in the SOLVE's tkrRAS, not the label grid's; that is
+    checked, see _assert_solve_frame.
+
+    topology selects the correction for the WHITE surface built here, and is
+    what pial_pipeline's --topology now reaches: this function used to hardcode
+    'gpu' at the build_hemisphere call, so the flag was silently inert on the
+    default `surface-pv` path.
+
+    It deliberately does NOT govern the GM ribbon's correct_topology call
+    below. Removal-only is the right behaviour for the GM envelope -- the
+    sub-threshold CSF this module exists for is found by declining to ADD the
+    bridging voxels -- and the ribbon is the only caller that uses
+    protect_above/protect_mask, which the GPU implementation provides and
+    nighres does not.
 
     crop=True (the default) builds on the ribbon's bounding box rather than on
     whatever grid the label volume was written on -- 4.9x fewer voxels than a
@@ -259,11 +326,12 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
         gv, gf = osf.mesh_envelope(corr, aff_lab, nsmooth=nsmooth)
         gv = to_ref(gv)
         if wm_surfaces is not None:
-            wv, wf = wm_surfaces[h]           # already in the solve's frame
+            wv, wf = wm_surfaces[h]           # must already be in the solve's frame
             wv = np.asarray(wv)
+            _assert_solve_frame(h, wv, M, label_img)
         else:
             wv, wf = wm_surface.build_hemisphere(seg_lab, df, aff_lab, h, excluded,
-                                                 nsmooth=nsmooth, topology='gpu',
+                                                 nsmooth=nsmooth, topology=topology,
                                                  priority=prio)
             wv = to_ref(wv)
         gm_surfaces[h] = (gv, np.asarray(gf))

@@ -12,7 +12,7 @@ have nothing to do with the subject:
 
 Measured by running the SAME prep three times in one process, so the work is
 identical and the only variable is warmth (RTX 6000 Ada, padded OAS30001 prep,
-surface-pv segmentation, gpu topology):
+surface-pv segmentation, the pipeline's default topology):
 
     run 1   55.80 s
     run 2   48.67 s
@@ -234,7 +234,12 @@ def main():
                    help='nu/field direction blend (default %.2f)' % pc.GATE_BLEND_BETA)
     p.add_argument('--segmentation', default='surface-pv',
                    choices=['logits', 'surface-pv'])
-    p.add_argument('--topology', default='gpu', choices=['nighres', 'gpu'])
+    # No default here ON PURPOSE. A default set in this file SHADOWS
+    # reconstruct's, because it is passed explicitly -- which is exactly how
+    # pial_pipeline's --topology came to be inert, and how a 60-subject
+    # rebuild meant to test the nighres default silently ran on gpu instead.
+    # None means 'do not pass it', so the pipeline's own default governs.
+    p.add_argument('--topology', default=None, choices=['nighres', 'gpu'])
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT)
     p.add_argument('--solve-margin', type=int, default=solve_grid.MARGIN,
                    help='voxels of background guaranteed around the cerebrum for the '
@@ -260,7 +265,8 @@ def main():
         propagate_on=args.propagate_on,
         dtype=torch.float64 if args.float64 else torch.float32,
         compute_thickness=args.thickness, nsmooth=args.nsmooth,
-        topology=args.topology, segmentation=args.segmentation,
+        segmentation=args.segmentation,
+        **({} if args.topology is None else {'topology': args.topology}),
         velocity_sigma=args.velocity_sigma, blend_beta=args.blend_beta,
         solve_margin=None if args.solve_margin < 0 else args.solve_margin)
 

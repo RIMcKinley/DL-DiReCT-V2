@@ -868,6 +868,31 @@ def _try_compile():
         os.makedirs(cache_dir, exist_ok=True)
         os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
 
+        # A DYNAMO FAILURE MUST NOT END THE RUN. Compilation here is an
+        # optimisation -- measured at 7.2s of warm-up bought back over a batch --
+        # so falling back to eager costs speed, not correctness. Without this, a
+        # failure inside a compiled function propagates and kills the caller:
+        # three 60-subject batches died on their FIRST subject with
+        #
+        #   InternalTorchDynamoError: RuntimeError: unknown parameter type
+        #
+        # raised from warp_image inside invert_field, after 33-46s of work.
+        #
+        # It is INTERMITTENT and the cause is not known. Ruled out by
+        # measurement: shape variety (warp_image took 40 distinct shapes, and a
+        # full cycle of every compiled function took 60, compiling just 5 frames
+        # -- dynamic=True collapses them, so cache_size_limit=8 never binds);
+        # accumulation across subjects (both failures were on the first subject
+        # processed); and batch size itself (a 60-prep glob re-run afterwards
+        # completed subjects cleanly). The only circumstance common to the
+        # diagnosable failures is another process compiling into the shared
+        # TORCHINDUCTOR_CACHE_DIR at the same time, which is a pattern in two
+        # samples, not a finding.
+        #
+        # suppress_errors turns that fatal error into a warning and an eager
+        # fallback, which is the right trade for an optimisation.
+        torch._dynamo.config.suppress_errors = True
+
         gaussian_gradient_3d = torch.compile(gaussian_gradient_3d, dynamic=True)
         gaussian_smooth_3d = torch.compile(gaussian_smooth_3d, dynamic=True)
         warp_image = torch.compile(warp_image, dynamic=True)

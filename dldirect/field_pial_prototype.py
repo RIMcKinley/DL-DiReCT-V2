@@ -677,29 +677,6 @@ class NormalGate:
         # transit 1.496 against 0.482, and the sulci visibly bulge outward.
         # Removed. The dead zone is real but is NOT what drives 'field'
         # self-intersections: removing it did not fix the surface.
-        #   'warped-normal'  nu recomputed each outer iteration from the WARPED
-        #            WM boundary, i.e. the interface as the current cumulative
-        #            deformation places it, rather than where it started.
-        #            'normal' uses a nu computed ONCE from the original boundary
-        #            and never updated, so deep in a sulcus it keeps asserting
-        #            "these are opposing banks" even after the front has
-        #            advanced -- which is a candidate explanation for why
-        #            'normal' holds sulci open (1.3% of vertices with an
-        #            opposing-bank gap <= 0.5mm, against FSR pial.raw's 8.3%).
-        #            Costs one signed-distance transform per outer iteration.
-        #   'warped-split'  the CENTRE and the NEIGHBOURS use different things,
-        #            and the centre switches on the WARPED WM boundary:
-        #              centre, exterior (outside warped WM): the warped WM
-        #                normal, negated so it points GM->WM like the velocity
-        #              centre, interior (the wake the front has already swept):
-        #                the field's own direction
-        #              neighbours: always the field's direction
-        #            Rationale: ahead of the front the warped boundary's geometry
-        #            is the meaningful statement about which way flow should go;
-        #            behind it that boundary describes a surface the front has
-        #            already passed, so the local field is the better reference.
-        #            Asymmetric (the weight from j to i differs from i to j),
-        #            which is fine for a filter.
         #   'hybrid' nu inside the WM label, the unit velocity everywhere else.
         #            nu is a boundary quantity -- it is the normal of the WM
         #            signed-distance transform, so it is meaningful in the WM
@@ -978,8 +955,6 @@ class NormalGate:
         self._bipolar_cache = {}
         self._nu_t = None
         self._wm_t = None
-        self._warped_nu_t = None
-        self._warped_iter = None
 
     def __enter__(self):
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1075,23 +1050,6 @@ class NormalGate:
                         padded_ok = F.pad(ok.to(vol.dtype), (r,)*6, mode='replicate')
             elif self.combine is not None:
                 pass                                 # endpoint already resolved
-            elif self.reference == 'warped-split':
-                fmag = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
-                fhat = vol / fmag.clamp(min=max(self.field_eps, 1e-12))
-                has_v = fmag > self.field_eps
-                wn = self._warped_nu_t if self._warped_nu_t is not None else self._nu_t
-                w = _direct_cuda_module.GATE_STATE.get('warped_wm')
-                interior = ((w > 0.5) if w is not None else self._wm_t.expand_as(has_v))
-                # nu points AWAY from WM; the velocity points GM->WM. Negate so
-                # both the exterior-centre and the neighbours speak the same
-                # convention and one cosine compares them.
-                ctr_t = torch.where(interior, fhat, -wn)
-                nbr_t = fhat
-                # a centre needs a direction: the exterior always has one (nu is
-                # unit), the interior only where the field is non-negligible
-                ok = (~interior) | has_v
-                ref_t = ctr_t
-                padded_ok = F.pad(has_v.to(vol.dtype), (r, r, r, r, r, r), mode='replicate')
             elif self.reference == 'field-noguard':
                 # DIAGNOSTIC: reference='field' with the guard simply DELETED --
                 # no centre clause, no neighbour clause, nothing substituted.
@@ -1158,17 +1116,13 @@ class NormalGate:
                     # 'hybrid' compares a WM centre's nu against neighbours
                     # carrying vhat in the OPPOSITE convention, and under relu
                     # such a centre scores ~0 weight on nearly every neighbour.
-                    # 'warped-split' negates for exactly this reason (see -wn
-                    # there). 'hybrid-neg' is 'hybrid' with the negation, so the
+                    # 'hybrid-neg' is 'hybrid' with the negation, so the
                     # two can be run paired to find out whether the unnegated
                     # form is a bug or merely a different filter.
                     _nu = self._nu_t if self.reference == 'hybrid' else -self._nu_t
                     ref_t = torch.where(self._wm_t, _nu, ref_t)
                     ok = ok | self._wm_t
                 padded_ok = F.pad(ok.to(vol.dtype), (r, r, r, r, r, r), mode='replicate')
-            elif self.reference == 'warped-normal' and self._warped_nu_t is not None:
-                ref_t, ok, padded_ok = self._warped_nu_t, None, None
-                nbr_t = ref_t
             else:
                 ref_t, ok, padded_ok = self._nu_t, None, None
                 nbr_t = ref_t
@@ -1177,8 +1131,8 @@ class NormalGate:
             g1d = g1d / g1d.sum()
             D, H, W = vol.shape[2:]
             padded = F.pad(vol, (r, r, r, r, r, r), mode='replicate')
-            # neighbours are read from nbr_t, the centre from ref_t: for most
-            # references these are the same volume, for 'warped-split' they are not
+            # neighbours are read from nbr_t, the centre from ref_t; for every
+            # surviving reference these are the same volume
             padded_nu = F.pad(nbr_t, (r, r, r, r, r, r), mode='replicate')
             padded_nu2 = (F.pad(nbr2_t, (r, r, r, r, r, r), mode='replicate')
                            if (_cb in ('both', 'both-nu')) else None)
@@ -1307,8 +1261,6 @@ class NormalGate:
 
         def selective_normal(vol, sigma, dev, truncate=2.0, mode='hard',
                               coherence_threshold=0.5, gate='coherence', return_stats=False):
-            if self.reference in ('warped-normal', 'warped-split'):
-                self._refresh_warped_nu(dev)
             plain = gaussian_smooth_3d(vol, sigma, dev, zero_boundary=False, truncate=truncate)
             key = round(float(sigma), 4)
             if key not in self._bipolar_cache:
@@ -1370,32 +1322,6 @@ class NormalGate:
         self._orig = _direct_cuda_module.selective_masked_smooth_3d
         _direct_cuda_module.selective_masked_smooth_3d = selective_normal
         return self
-
-    def _refresh_warped_nu(self, device):
-        """Recompute nu from the warped WM boundary, once per outer iteration.
-
-        The warped WM PROBABILITY alone is no good as a reference: its gradient
-        is ~0 away from the boundary, which is the dead zone that sank
-        reference='field' (see the comment above). Thresholding it at 0.5 and
-        taking the signed distance transform gives a unit normal everywhere, the
-        same construction as the static nu -- just of the deformed boundary.
-        """
-        st = getattr(_direct_cuda_module, 'GATE_STATE', {})
-        w = st.get('warped_wm')
-        it = st.get('iteration')
-        if w is None:
-            return                                  # first call: static nu stands in
-        if it is not None and it == self._warped_iter:
-            return                                  # already done for this iteration
-        wmb = (w[0, 0].detach().cpu().numpy() > 0.5)
-        if not wmb.any():
-            return
-        sdt = distance_transform_edt(~wmb) - distance_transform_edt(wmb)
-        grad = np.stack(np.gradient(sdt), axis=-1)
-        nu = grad / np.maximum(np.linalg.norm(grad, axis=-1), 1e-9)[..., None]
-        self._warped_nu_t = torch.from_numpy(
-            nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
-        self._warped_iter = it
 
     def __exit__(self, *exc):
         _direct_cuda_module.selective_masked_smooth_3d = self._orig
@@ -3328,8 +3254,7 @@ def main():
     p.add_argument('--gate-reference',
                     choices=('normal', 'field', 'field-nu', 'field-nu-pos', 'field-fill',
                              'field-noguard',
-                             'hybrid', 'hybrid-neg',
-                             'warped-normal', 'warped-split'),
+                             'hybrid', 'hybrid-neg'),
                     default=None,   # None -> PipelineConfig.gate_reference
                     help="what the gate's cosine is taken against; the default is whatever "
                          "PipelineConfig.gate_reference says. 'normal' is the WM "
@@ -3338,12 +3263,7 @@ def main():
                          "direct_cuda's own criterion; an ablation of the reference alone, with "
                          'the weighting mode, denominator and everywhere/threshold branch '
                          "unchanged. 'hybrid' takes the normal inside the WM label and the "
-                         "field everywhere else. 'warped-normal' recomputes the interface normal "
-                         'each outer iteration from the WARPED WM boundary instead of using the '
-                         'original one for the whole solve; costs one distance transform per '
-                         "iteration. 'warped-split' compares the CENTRE -- the warped WM normal "
-                         'outside the warped WM, the field inside it -- against the FIELD at the '
-                         'neighbours.')
+                         "field everywhere else.")
     p.add_argument('--gate-field-eps', type=float, default=1e-3,
                     help='--gate-reference field/hybrid/hybrid-neg only: velocity magnitude '
                          '(voxels) below '

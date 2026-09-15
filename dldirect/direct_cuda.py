@@ -814,12 +814,32 @@ def kelly_kapowski_cuda(
                 blended = _w * _wm_frozen + (1.0 - _w) * (velocity_field * _wm_sel)
                 velocity_field = velocity_field * (1.0 - _wm_sel) + blended
 
+        # Constrain to active region. This MUST come before the save below.
+        # The increment is generated at GM voxels only (speed * gm_mask) and the
+        # field is re-masked at every integration point, so before the smoothing
+        # step the field is exactly zero outside active_mask -- measured, 0 of
+        # 3.15M voxels. The smoothing is what carries velocity into the CSF:
+        # afterwards 440252 voxels outside the mask are nonzero and hold 12.2%
+        # of the total magnitude, reaching a max of 0.54 in seg==0.
+        #
+        # The save used to sit above this line, so that halo was zeroed for the
+        # next iteration but survived into Velocity.nii.gz and into
+        # velocity_out -- i.e. into the only copy anything downstream ever sees,
+        # contradicting the "velocity is zero elsewhere" invariant asserted
+        # where active_mask is defined. Saving after the mask is not cosmetic:
+        # on sub-POBHC0001 it moves the pial 0.06mm less far, crossed_csf
+        # 802/798 -> 588/556 and self-intersections 82/181 -> 77/168, while
+        # end_in_wm rises 930/964 -> 1000/1031 and normal_reversal_pct
+        # 0.0011/0.0026 -> 0.0081/0.0074.
+        velocity_field = velocity_field * active_mask
+
         if velocity_field_prefix and iteration == max_iterations - 1:
-            # AFTER the increment, the thickness-prior scaling and the smoothing:
-            # this is the field the propagation actually rides. It used to be
-            # written before those three steps, so the saved field was one
-            # iteration stale -- it omitted the final increment entirely, and
-            # with max_iterations=1 it wrote the initial zeros.
+            # AFTER the increment, the thickness-prior scaling, the smoothing
+            # and the active-region mask: this is the field the propagation
+            # actually rides. It used to be written before the first three, so
+            # the saved field was one iteration stale -- it omitted the final
+            # increment entirely, and with max_iterations=1 it wrote the initial
+            # zeros.
             if cumulative_fields:
                 _save_velocity_fields(velocity_field_prefix, ref_img,
                                       inverse_field_snapshots, forward_field_snapshots)
@@ -830,9 +850,6 @@ def kelly_kapowski_cuda(
             vimg = nib.Nifti1Image(vel, ref_img.affine)
             vimg.header['xyzt_units'] = 10
             nib.save(vimg, '{}Velocity.nii.gz'.format(velocity_field_prefix))
-
-        # Constrain to active region
-        velocity_field = velocity_field * active_mask
 
         iter_time = time.time() - iter_start
         if verbose:

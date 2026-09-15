@@ -200,7 +200,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 topology='gpu', segmentation='surface-pv', crop=True,
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
-                dtype=torch.float32, device=None):
+                write_white=True, dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -218,6 +218,9 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     process with nothing going through disk.
     topology        'gpu' (default) or 'nighres' for the topology correction
                     when building the white surfaces.
+    write_white     also write ?h.white beside ?h.pial when out_dir is given
+                    (default). It is the mesh the propagation started from, in
+                    the pial's frame; under `surface-pv` nothing else writes it.
     solve_margin    solve and propagate on the cerebrum plus this many voxels of
                     background instead of on the whole supplied grid. The
                     supplied grid is the bounding box of the brain mask with NO
@@ -268,7 +271,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
-                                    solve_margin=solve_margin,
+                                    solve_margin=solve_margin, write_white=write_white,
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
                                                found_csf=sd['found_csf']))
     elif str(segmentation).lower() != 'logits':
@@ -300,14 +303,14 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
-                                solve_margin=solve_margin)
+                                solve_margin=solve_margin, write_white=write_white)
 
 
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
                          velocity_sigma=pc.VELOCITY_SIGMA,
                          blend_beta=pc.GATE_BLEND_BETA, solve_margin=solve_grid.MARGIN,
-                         extra=None):
+                         write_white=True, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
     outer = d
@@ -378,6 +381,24 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             nib.freesurfer.io.write_geometry(os.path.join(out_dir, '%s.pial' % hemi),
                                              pial, faces, create_stamp=None,
                                              volume_info=vinfo)
+            if write_white:
+                # The surface the propagation STARTED from, in the same frame as
+                # the pial beside it (outer, i.e. before solve_grid.tighten).
+                # Under `surface-pv` it is built in memory and was previously
+                # never written, so anything wanting white-vs-pial afterwards --
+                # regional_stats, a distance comparison, freeview -- had to
+                # rebuild it: binary mask, topology correction, signed distance,
+                # levelset_to_mesh and 50 Taubin steps, ~35 s a subject, for a
+                # mesh the solve already had. Writing it here costs one file.
+                #
+                # Note the file is float32 (FreeSurfer geometry always is) while
+                # the in-memory mesh is float64. The quantisation is ~1e-5 mm at
+                # these coordinates; a caller that needs the exact float64 mesh
+                # should still rebuild rather than read.
+                nib.freesurfer.io.write_geometry(
+                    os.path.join(out_dir, '%s.white' % hemi),
+                    np.asarray(outer['surfaces'][hemi][0], np.float64), faces,
+                    create_stamp=None, volume_info=vinfo)
         if report:
             # against the caller's grid, so the numbers stay comparable
             m = evaluate_surface(outer['surfaces'][hemi][0], pial, faces,
@@ -433,6 +454,8 @@ def main():
                         'the brain mask bounding box with none, so the tissue touches '
                         'the faces; -1 keeps it as given' % solve_grid.MARGIN)
     p.add_argument('--out-dir')
+    p.add_argument('--no-white', action='store_true',
+                   help='do not write ?h.white beside ?h.pial')
     p.add_argument('--hemi', nargs='+', default=['lh', 'rh'], choices=['lh', 'rh'])
     p.add_argument('--propagate-on', default='cuda', choices=['cpu', 'cuda'])
     p.add_argument('--thickness', action='store_true',
@@ -457,7 +480,8 @@ def main():
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
                     blend_beta=args.blend_beta,
-                    solve_margin=None if args.solve_margin < 0 else args.solve_margin)
+                    solve_margin=None if args.solve_margin < 0 else args.solve_margin,
+                    write_white=not args.no_white)
         return
 
     import time

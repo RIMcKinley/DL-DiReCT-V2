@@ -58,6 +58,47 @@ part of the ribbon beyond its starting point, not the whole thickness. Adding
 that column means reading a thickness map, which is what this module exists to
 avoid.
 
+A KNOWN DIFFERENCE WE DO NOT CORRECT: THE LIMEN INSULAE
+
+About 8.6% of insula vertices (510 of 5949 on OAS30001; 212 lh, 298 rh) are
+counted here and called unknown by FreeSurfer. They are not noise and not a
+defect on our side -- they form a compact bilateral band immediately ANTERIOR TO
+THE AMYGDALA, at the limen insulae, where insular cortex becomes continuous with
+the temporal pole. Our white surface runs forward through that junction;
+FreeSurfer's turns and follows the amygdala boundary, leaving the strip outside
+its surface. Everywhere else in those slices the two contours are superimposed.
+
+Every structural explanation was tested and ruled out:
+
+  pinning              they survive the no_push/pin exclusion above
+  off-tissue labelling they survive the cortex-or-WM rule above
+  the sqrt(3) rule     sweeping max_dist 1.0 -> 5.0mm moves the labelled
+                       fraction by 0.3 points and the travel mean by 0.010mm
+  topology correction  gpu 510 flagged vs nighres 513, and lh identical at 212
+                       -- swapping the whole correction changes nothing
+  hippocampus          well posterior and separate; it is the amygdala that abuts
+
+TWO FIXES WERE MEASURED AND REJECTED:
+
+  --exclude-amygdala, which drops it from the WM fill, degrades the surface:
+  flipped faces 0.1047% -> 0.1317% (lh) and 0.1232% -> 0.1426% (rh) for no gain
+  elsewhere. The repo's note records 99.1% of the amygdala lying inside the
+  white surface by default, so the fill does swallow it -- but removing it costs
+  more than it buys.
+
+  An amygdala-adjacency exclusion separates well on distance (flagged median
+  3.00mm from the amygdala against 47.78mm for agreeing vertices) but trades
+  badly, because the amygdala sits deep to genuine insular and temporal-pole
+  cortex and a ball around it sweeps up real cortex at the same rate:
+
+      within 2mm   248 flagged (13.9%)  for   109 legitimate  ratio 2.3
+      within 3mm   349        (19.6%)   for   358             ratio 1.0
+      within 5mm   500        (28.1%)   for   755             ratio 0.7
+
+  against 14-25:1 for the two rules that ARE applied above. Adding hippocampus
+  makes it worse still. So this is left in, as a documented difference in where
+  the two pipelines put the cortical boundary, not as a filter.
+
 PARCEL ASSIGNMENT follows extract_stats.py exactly: nearest parcellation voxel
 by cKDTree, and anything further than sqrt(3) from one is dropped (that is what
 stops a hippocampal boundary voxel from being credited to a cortical parcel).
@@ -266,6 +307,7 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
     vals = {m: [] for m in ('travel', 'nn', 'sym_nn')}
     ids_all = []
     n_drop_named = 0
+    n_off_tissue = 0
     for h in hemis:
         wp = os.path.join(surf_dir, '%s.white' % h)
         pp = os.path.join(surf_dir, '%s.pial' % h)
@@ -310,6 +352,38 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
         pin = build_pin_mask(no_push, w, f, seg, soft_seg, id_map, tovox,
                              scope='medial-wall', rings=0)
         drop = no_push | pin
+
+        # A VERTEX SITTING IN NOTHING IS NOT CORTEX EITHER. nearest_parcel names
+        # a vertex from the nearest parcel voxel within sqrt(3); it never asks
+        # what the vertex itself sits in. A vertex over background, ventricle,
+        # hippocampus or amygdala is exactly as close to a cortical voxel as a
+        # legitimate one, so distance cannot separate them -- sweeping max_dist
+        # from 1.0 to 5.0mm moves the labelled fraction by 0.3 points and the
+        # travel mean by 0.010mm. The label it sits in does separate them.
+        #
+        # Cortex OR white matter, not cortex alone: this is the WHITE surface,
+        # so its vertices legitimately sit on the WM side of the boundary.
+        # Requiring a cortical parcel would discard 53% of all counted vertices.
+        # Measured on OAS30001, against the vertices FreeSurfer calls unknown:
+        #
+        #   rule                        flagged dropped   legitimate dropped
+        #   own voxel > 1000 (cortex)     1364 (60.2%)     114315 (53.28%)  <- no
+        #   own voxel != 0                 380 (16.8%)         15 ( 0.01%)
+        #   own voxel in cortex or WM      483 (21.3%)         33 ( 0.02%)  <- this
+        #   travel > 1.0mm                 886 (39.1%)        267 ( 0.12%)
+        #
+        # Travel thresholds score well but are circular -- they exclude vertices
+        # for being thin, which is the quantity being measured, and would bias
+        # every parcel mean upward by construction. Not used.
+        own = parc[vox[:, 0], vox[:, 1], vox[:, 2]]
+        wm_ids = [i for n, i in ((r.LABEL, int(r.ID)) for _, r in
+                                 pd.read_csv(ldef_p).iterrows())
+                  if n in ('Left-Cerebral-White-Matter', 'Right-Cerebral-White-Matter',
+                           'Corpus-Callosum', 'WM-hypointensities')]
+        off_tissue = ~((own > 1000) | np.isin(own, wm_ids))
+        n_off_tissue += int((off_tissue & ~drop & (ids > 0)).sum())
+        drop = drop | off_tissue
+
         ids = np.where(drop, 0, ids)
         n_drop_named += int((drop & (nearest_parcel(vox, parc) > 0)).sum())
         ids_all.append(ids)
@@ -320,8 +394,10 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
         keep = ids > 0
         if verbose:
             print('surfaces: %d vertices, %d labelled (%.1f%%); %d pinned vertices '
-                  'dropped that nearest_parcel would have named'
-                  % (len(ids), keep.sum(), 100 * keep.mean(), n_drop_named))
+                  'dropped that nearest_parcel would have named (%d of them for '
+                  'sitting outside cortex and white matter)'
+                  % (len(ids), keep.sum(), 100 * keep.mean(), n_drop_named,
+                     n_off_tissue))
         for m in ('travel', 'nn', 'sym_nn'):
             v = np.concatenate(vals[m])
             results[m] = aggregate(v[keep], ids[keep], offset)

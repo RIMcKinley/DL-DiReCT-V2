@@ -214,7 +214,8 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
             velocity_name='pial_Velocity.nii.gz', write_white=False, verbose=True):
     """All four metrics, aggregated per parcel. Returns {metric: (mean, std, names)}."""
     from . import surface_seg
-    from .field_pial_prototype import load_gm_wm_probability
+    from .field_pial_prototype import (build_no_push_mask, build_pin_mask,
+                                       load_gm_wm_probability)
 
     out_dir = out_dir or surf_dir
     os.makedirs(out_dir, exist_ok=True)
@@ -251,8 +252,20 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
         print('no %s in %s; skipping the field metric' % (velocity_name, surf_dir))
 
     # --- surfaces ---
+    # the pin mask needs the same two files pial_pipeline's pin does
+    import pandas as pd
+    soft_p = os.path.join(prep_dir, 'softmax_seg.nii.gz')
+    ldef_p = os.path.join(prep_dir, 'label_def.csv')
+    soft_seg = np.asarray(nib.load(soft_p).dataobj) if os.path.exists(soft_p) else None
+    id_map = ({r.LABEL: int(r.ID) for _, r in pd.read_csv(ldef_p).iterrows()}
+              if os.path.exists(ldef_p) else None)
+    if soft_seg is None or id_map is None:
+        raise FileNotFoundError('softmax_seg.nii.gz and label_def.csv are needed to '
+                                'exclude the pinned vertices; %s has neither' % prep_dir)
+
     vals = {m: [] for m in ('travel', 'nn', 'sym_nn')}
     ids_all = []
+    n_drop_named = 0
     for h in hemis:
         wp = os.path.join(surf_dir, '%s.white' % h)
         pp = os.path.join(surf_dir, '%s.pial' % h)
@@ -262,8 +275,9 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
                       % (h, surf_dir))
             vals = None
             break
+        wfaces = None
         if os.path.exists(wp):
-            w = nib.freesurfer.io.read_geometry(wp)[0]
+            w, wfaces = nib.freesurfer.io.read_geometry(wp)
         else:
             # `surface-pv` keeps the white surface in memory and writes only the
             # pial, so a batch run has no ?h.white on disk. sd['surfaces'] IS the
@@ -281,15 +295,33 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
         vox = np.rint(tovox(np.asarray(w, float))).astype(int)
         for k in range(3):
             vox[:, k] = np.clip(vox[:, k], 0, parc.shape[k] - 1)
-        ids_all.append(nearest_parcel(vox, parc))
+        ids = nearest_parcel(vox, parc)
+
+        # A PINNED VERTEX HAS NO CORTICAL THICKNESS. The medial wall, the
+        # subcortical structures the hemisphere fill swallows, anything with no
+        # cortex to move into -- the propagation holds those in place, so their
+        # travel is the feather blend's residue rather than a ribbon. They are
+        # near enough to a parcel for nearest_parcel to name them, which is the
+        # trap: they are not zero, so `aggregate`'s nonzero filter does not drop
+        # them, and they drag the parcel mean down. `evaluate_surface` excludes
+        # them via no_push=pin_mask; this now does the same.
+        f = np.asarray(sd['surfaces'][h][1]) if wfaces is None else wfaces
+        no_push = build_no_push_mask(w, f, seg, soft_seg, id_map, tovox, rings=0)
+        pin = build_pin_mask(no_push, w, f, seg, soft_seg, id_map, tovox,
+                             scope='medial-wall', rings=0)
+        drop = no_push | pin
+        ids = np.where(drop, 0, ids)
+        n_drop_named += int((drop & (nearest_parcel(vox, parc) > 0)).sum())
+        ids_all.append(ids)
         vals['travel'].append(tr); vals['nn'].append(nn); vals['sym_nn'].append(sym)
 
     if vals is not None and ids_all:
         ids = np.concatenate(ids_all)
         keep = ids > 0
         if verbose:
-            print('surfaces: %d vertices, %d labelled (%.1f%%)'
-                  % (len(ids), keep.sum(), 100 * keep.mean()))
+            print('surfaces: %d vertices, %d labelled (%.1f%%); %d pinned vertices '
+                  'dropped that nearest_parcel would have named'
+                  % (len(ids), keep.sum(), 100 * keep.mean(), n_drop_named))
         for m in ('travel', 'nn', 'sym_nn'):
             v = np.concatenate(vals[m])
             results[m] = aggregate(v[keep], ids[keep], offset)

@@ -200,7 +200,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 topology='nighres', segmentation='surface-pv', crop=True,
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
-                write_white=True, dtype=torch.float32, device=None):
+                write_white=True, stats=False, subject_id=None,
+                dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -224,6 +225,15 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     write_white     also write ?h.white beside ?h.pial when out_dir is given
                     (default). It is the mesh the propagation started from, in
                     the pial's frame; under `surface-pv` nothing else writes it.
+    stats           also write regional_stats' result-thick-<metric>.csv /
+                    result-thickstd-<metric>.csv into out_dir (field, field_raw,
+                    travel, nn, sym_nn). Needs out_dir and the prep's
+                    aparc.atlas+aseg.nii.gz. It reuses the segmentation, the
+                    white meshes, the pials and the field this call already
+                    holds, so it costs the aggregation alone (~2 s) rather than
+                    the ~35 s rebuild a standalone regional_stats run pays.
+    subject_id      the SUBJECT cell of those CSVs; defaults to prep_dir's
+                    directory name.
     solve_margin    solve and propagate on the cerebrum plus this many voxels of
                     background instead of on the whole supplied grid. The
                     supplied grid is the bounding box of the brain mask with NO
@@ -277,6 +287,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                     solve_margin=solve_margin, write_white=write_white,
+                                    stats=stats, subject_id=subject_id,
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
                                                found_csf=sd['found_csf']))
     elif str(segmentation).lower() != 'logits':
@@ -308,14 +319,15 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
-                                solve_margin=solve_margin, write_white=write_white)
+                                solve_margin=solve_margin, write_white=write_white,
+                                stats=stats, subject_id=subject_id)
 
 
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
                          velocity_sigma=pc.VELOCITY_SIGMA,
                          blend_beta=pc.GATE_BLEND_BETA, solve_margin=solve_grid.MARGIN,
-                         write_white=True, extra=None):
+                         write_white=True, stats=False, subject_id=None, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
     outer = d
@@ -423,6 +435,23 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             velocity = pc.velocity_to_numpy(velocity)
         velocity = sub.restore(velocity)
         thickness = None if thickness is None else sub.restore(thickness)
+    if stats:
+        if not out_dir:
+            raise ValueError('stats=True needs out_dir to write the CSVs into')
+        from . import regional_stats
+        # Everything handed over is on the CALLER's grid: `outer` predates
+        # solve_grid.tighten, the pials were brought back by sub.to_parent, and
+        # the field by sub.restore just above. Passing the tightened `d` or a
+        # sub-grid field instead would mislabel every vertex, silently.
+        vel_np = (velocity if isinstance(velocity, np.ndarray)
+                  else pc.velocity_to_numpy(velocity))
+        sid = subject_id or os.path.basename(os.path.normpath(prep_dir))
+        if verbose:
+            print('aggregating regional statistics...')
+        regional_stats.compute(prep_dir, out_dir=out_dir, subject_id=sid,
+                               hemis=tuple(out), sd=outer,
+                               pials={h: out[h][0] for h in out},
+                               velocity=vel_np, verbose=verbose)
     res = dict(surfaces=out, white=outer['surfaces'], velocity=velocity,
                thickness=thickness, seg=outer['seg'], ref_img=outer['ref_img'],
                tovox=outer['tovox'], totkr=outer['totkr'])
@@ -470,6 +499,13 @@ def main():
                         'smooths per iteration (22.6s -> 13.3s without it), and on '
                         'validated data the velocity field is bit-identical either way '
                         'because the THICKNESS_PRIOR cap never binds')
+    p.add_argument('--stats', action='store_true',
+                   help='also write regional_stats\' result-thick-<metric>.csv into '
+                        '--out-dir (field, field_raw, travel, nn, sym_nn). Reuses the '
+                        'solve\'s segmentation, surfaces and field, so it costs the '
+                        'aggregation alone rather than a 35s rebuild')
+    p.add_argument('--subject', help='SUBJECT cell of the --stats CSVs '
+                                     '(default: the prep directory name)')
     p.add_argument('--float64', action='store_true',
                    help='run the cuda propagation in double precision')
     p.add_argument('--check', action='store_true',
@@ -487,7 +523,8 @@ def main():
                     velocity_sigma=args.velocity_sigma,
                     blend_beta=args.blend_beta,
                     solve_margin=None if args.solve_margin < 0 else args.solve_margin,
-                    write_white=not args.no_white)
+                    write_white=not args.no_white,
+                    stats=args.stats, subject_id=args.subject)
         return
 
     import time

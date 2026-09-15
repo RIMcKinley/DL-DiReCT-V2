@@ -34,6 +34,17 @@ module does exactly the same from voxel centres. What it does NOT do is the mesh
 relaxation and the medial-wall pin: those are operations on a surface and have
 no meaning for an unconnected voxel.
 
+TWO WAYS IN
+
+pial_pipeline --stats (and pial_batch --stats) calls compute() at the end of a
+solve with the segmentation, the white meshes, the pials and the field it
+already holds, so the CSVs land beside the surfaces for ~5 s. Run standalone
+against a --surf-dir, everything comes off disk and the solve segmentation is
+rebuilt from the prep, which is ~35 s of the ~46 s. The two agree: on
+OAS30091 the field columns are bit-identical and the surface columns differ by
+at most 1.4e-7 mm, which is the float32 quantisation of the written ?h.white /
+?h.pial against the float64 meshes in memory.
+
 `voxel_field_raw_mm` is reported alongside for reference -- |v| at the voxel
 times INTEGRATION_POINTS -- because it is the quantity "the field value at this
 voxel" most directly names, and seeing both makes the difference explicit.
@@ -251,21 +262,35 @@ def surface_thickness(white, pial):
 
 
 # ---------------------------------------------------------------------------
-def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
-            velocity_name='pial_Velocity.nii.gz', write_white=False, verbose=True):
-    """All four metrics, aggregated per parcel. Returns {metric: (mean, std, names)}."""
+def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
+            hemis=('lh', 'rh'), velocity_name='pial_Velocity.nii.gz',
+            write_white=False, verbose=True, sd=None, pials=None, velocity=None):
+    """All four metrics, aggregated per parcel. Returns {metric: (mean, std, names)}.
+
+    Run standalone, everything comes off disk: the solve segmentation is rebuilt
+    from the prep (~35 s) and the surfaces and field are read from `surf_dir`.
+
+    `sd`, `pials` and `velocity` let a caller that has just solved hand over what
+    it already holds instead -- `sd` a dict with seg/tovox/ref_img/surfaces (the
+    white meshes) on the SAME grid as `pials` and `velocity`, i.e. the caller's
+    grid, not a tightened solve sub-grid. See pial_pipeline._solve_and_propagate,
+    which passes `outer`. That skips the rebuild entirely.
+    """
     from . import surface_seg
     from .field_pial_prototype import (build_no_push_mask, build_pin_mask,
                                        load_gm_wm_probability)
 
     out_dir = out_dir or surf_dir
+    if out_dir is None:
+        raise ValueError('one of out_dir or surf_dir is required')
     os.makedirs(out_dir, exist_ok=True)
 
-    # the segmentation the solve used, rebuilt deterministically from the prep
-    if verbose:
-        print('rebuilding the solve segmentation...')
-    sd = surface_seg.build_surface_segmentation(prep_dir, hemis=tuple(hemis),
-                                                verbose=False)
+    if sd is None:
+        # the segmentation the solve used, rebuilt deterministically from the prep
+        if verbose:
+            print('rebuilding the solve segmentation...')
+        sd = surface_seg.build_surface_segmentation(prep_dir, hemis=tuple(hemis),
+                                                    verbose=False)
     seg, tovox, ref_img = sd['seg'], sd['tovox'], sd['ref_img']
     zooms = ref_img.header.get_zooms()[:3]
 
@@ -276,9 +301,10 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
     results = {}
 
     # --- field ---
-    vel_path = os.path.join(surf_dir, velocity_name)
-    if os.path.exists(vel_path):
-        vel = np.asarray(nib.load(vel_path).dataobj, dtype=np.float32)
+    vel_path = None if surf_dir is None else os.path.join(surf_dir, velocity_name)
+    if velocity is not None or (vel_path and os.path.exists(vel_path)):
+        vel = (np.asarray(velocity, dtype=np.float32) if velocity is not None
+               else np.asarray(nib.load(vel_path).dataobj, dtype=np.float32))
         thick, coords, raw = field_thickness(seg, vel, zooms)
         ids = nearest_parcel(coords, parc)
         keep = ids > 0
@@ -309,16 +335,19 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
     n_drop_named = 0
     n_off_tissue = 0
     for h in hemis:
-        wp = os.path.join(surf_dir, '%s.white' % h)
-        pp = os.path.join(surf_dir, '%s.pial' % h)
-        if not os.path.exists(pp):
+        wp = None if surf_dir is None else os.path.join(surf_dir, '%s.white' % h)
+        pp = None if surf_dir is None else os.path.join(surf_dir, '%s.pial' % h)
+        have_pial = (pials is not None and h in pials) or (pp and os.path.exists(pp))
+        if not have_pial:
             if verbose:
                 print('missing %s.pial in %s; skipping the surface metrics'
                       % (h, surf_dir))
             vals = None
             break
         wfaces = None
-        if os.path.exists(wp):
+        if pials is not None and h in pials:
+            w = np.asarray(sd['surfaces'][h][0], float)
+        elif wp and os.path.exists(wp):
             w, wfaces = nib.freesurfer.io.read_geometry(wp)
         else:
             # `surface-pv` keeps the white surface in memory and writes only the
@@ -331,7 +360,8 @@ def compute(prep_dir, surf_dir, subject_id, out_dir=None, hemis=('lh', 'rh'),
                 nib.freesurfer.io.write_geometry(
                     wp, w, sd['surfaces'][h][1], create_stamp=None,
                     volume_info=volume_info_from_image(ref_img, prep_dir))
-        p = nib.freesurfer.io.read_geometry(pp)[0]
+        p = (np.asarray(pials[h], float) if (pials is not None and h in pials)
+             else nib.freesurfer.io.read_geometry(pp)[0])
         tr, nn, sym = surface_thickness(w, p)
         # label at the WHITE vertex, by the same nearest-parcel rule
         vox = np.rint(tovox(np.asarray(w, float))).astype(int)

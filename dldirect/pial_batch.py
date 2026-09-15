@@ -108,7 +108,12 @@ def run_batch(prep_dirs, out_name='field_pial', out_root=None, skip_existing=Fal
 
     for i, prep in enumerate(prep_dirs, 1):
         out_dir = _out_dir_for(prep, out_name, out_root)
-        done = all(os.path.exists(os.path.join(out_dir, '%s.pial' % h)) for h in hemis)
+        want = ['%s.pial' % h for h in hemis]
+        if reconstruct_kwargs.get('stats'):
+            # otherwise --skip-existing on a batch rerun that ADDS --stats skips
+            # every subject and writes no CSV at all
+            want.append('result-thick-field.csv')
+        done = all(os.path.exists(os.path.join(out_dir, f)) for f in want)
         if skip_existing and done:
             if verbose:
                 print('[%d/%d] %s: skipped (surfaces present)'
@@ -248,6 +253,11 @@ def main():
     p.add_argument('--propagate-on', default='cuda', choices=['cpu', 'cuda'])
     p.add_argument('--thickness', action='store_true',
                    help='also compute the DiReCT thickness map')
+    # default=None so this cannot SHADOW reconstruct's own default when passed
+    # explicitly -- the mistake --topology made, two lines up.
+    p.add_argument('--stats', action='store_true', default=None,
+                   help='also write regional_stats\' result-thick-<metric>.csv beside '
+                        'each subject\'s surfaces, off the solve already in memory')
     p.add_argument('--float64', action='store_true')
     args = p.parse_args()
 
@@ -267,6 +277,7 @@ def main():
         compute_thickness=args.thickness, nsmooth=args.nsmooth,
         segmentation=args.segmentation,
         **({} if args.topology is None else {'topology': args.topology}),
+        **({} if args.stats is None else {'stats': args.stats}),
         velocity_sigma=args.velocity_sigma, blend_beta=args.blend_beta,
         solve_margin=None if args.solve_margin < 0 else args.solve_margin)
 

@@ -283,11 +283,15 @@ def wm_deviation(white_vox, ids, wm_mask, zooms, offset=0, lut_path=None):
     the worst parcel landed in the damaged territory every time. Hence per
     parcel, and hence no hemisphere-level verdict here.
 
-    CAVEAT ON THOSE NUMBERS: they were measured on a prototype that scored every
-    white vertex. compute() feeds this the KEPT vertices only -- pinned and
-    off-tissue dropped -- so the flag describes exactly the measurement beside
-    it. That shifts the scale (hemisphere means land near 0 rather than +0.11)
-    and has not been re-validated at cohort scale; see scratchpad/wm_qc*.
+    THE SHIPPED STATISTIC SCORES LOWER THAN THAT PROTOTYPE. The prototype used
+    every white vertex; compute() feeds this the KEPT vertices only -- pinned
+    and off-tissue dropped -- so the flag describes exactly the measurement
+    beside it, and hemisphere means land near 0 rather than +0.11. Re-measured
+    that way on 120 subjects: AUC 0.836 against the confirmed cases (hemisphere
+    mean 0.769), catching 3 of 4 at the 95th percentile for 9 false alarms.
+    Two things differ from the 420-subject prototype run at once -- the vertex
+    set and the size of the cohort the robust z is referenced against -- so the
+    gap between 0.939 and 0.836 is not attributable to either alone.
 
     The miss is the instructive part either way: a subject whose whole anterior
     frontal lobe is noise scored at the 76th percentile, because the surface

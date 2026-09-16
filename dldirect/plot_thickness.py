@@ -45,6 +45,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from .freesurfer_stats import load_comparison
 
 INK, SEC, MUTED, GRID, SURF, BLUE = '#0b0b0b', '#52514e', '#898781', '#e1e0d9', '#fcfcfb', '#2a78d6'
+RED = '#c0504d'          # reference lines only (bias, limits of agreement)
 NA = '#dedcd4'
 METRICS = ('field', 'travel', 'nn', 'sym_nn')
 
@@ -105,6 +106,112 @@ def scatter(subjects, fs_csv, prep_root, out, out_name, metrics=METRICS):
              color=INK, fontsize=15, ha='left', va='top')
     fig.subplots_adjust(top=0.93, hspace=0.30, wspace=0.28, left=0.055, right=0.985, bottom=0.06)
     fig.savefig(out, dpi=140, facecolor=SURF)
+    return out
+
+
+def _ba_panel(ax, a, b, title=None):
+    """One Bland-Altman panel: difference against mean, with the agreement band.
+
+    Returns (bias, sd, lo, hi, trend) where `trend` is the slope of the
+    difference on the mean. A non-zero trend is proportional bias -- the two
+    methods disagree by an amount that depends on the thickness itself -- and it
+    is the thing a plain bias number hides.
+    """
+    ok = np.isfinite(a) & np.isfinite(b)
+    a, b = a[ok], b[ok]
+    d, m = a - b, (a + b) / 2.0
+    bias, sd = d.mean(), d.std(ddof=1)
+    lo, hi = bias - 1.96 * sd, bias + 1.96 * sd
+    trend = np.polyfit(m, d, 1)[0]
+    ax.set_facecolor(SURF)
+    # Zero only when it is actually in view: with a +0.69mm bias, forcing it in
+    # squashes the whole cloud into the top fifth of the panel.
+    span = max(hi, d.max()) - min(lo, d.min())
+    if min(lo, d.min()) - .15 * span <= 0 <= max(hi, d.max()) + .15 * span:
+        ax.axhline(0, color=MUTED, lw=1.1, ls='--', zorder=1)
+    ax.axhspan(lo, hi, color=BLUE, alpha=.07, zorder=0)
+    ax.scatter(m, d, s=20, color=BLUE, alpha=.6, edgecolors=SURF, linewidths=.4, zorder=3)
+    xs = np.array([m.min(), m.max()])
+    ax.plot(xs, np.polyval(np.polyfit(m, d, 1), xs), color=BLUE, lw=1.3, alpha=.55, zorder=4)
+    for y, lab, st in ((bias, 'bias %+.3f' % bias, '-'),
+                       (lo, '-1.96 SD  %+.3f' % lo, ':'),
+                       (hi, '+1.96 SD  %+.3f' % hi, ':')):
+        ax.axhline(y, color=RED, lw=1.15, ls=st, zorder=5)
+        ax.text(.012, y, lab, transform=ax.get_yaxis_transform(), ha='left',
+                va='bottom', color=RED, fontsize=8.2)
+    ax.text(.985, .035, 'trend %+.2f mm/mm' % trend, transform=ax.transAxes,
+            ha='right', color=SEC, fontsize=9)
+    if title:
+        ax.set_title(title, color=INK, fontsize=12.5, loc='left', pad=8)
+    ax.grid(color=GRID, lw=.7); ax.set_axisbelow(True)
+    for sp in ('top', 'right'):
+        ax.spines[sp].set_visible(False)
+    for sp in ('left', 'bottom'):
+        ax.spines[sp].set_color('#c3c2b7')
+    ax.tick_params(colors=MUTED, labelsize=8.5)
+    return bias, sd, lo, hi, trend
+
+
+def bland(subjects, fs_csv, prep_root, out, out_name, metrics=METRICS, names=None,
+          sources=None):
+    """Bland-Altman against FreeSurfer: hemisphere means, or one row per region.
+
+    Preferred over the scatter when the question is agreement rather than
+    association. The scatter's least-squares slope is attenuated by exactly the
+    correlation (slope = r * sd_ours / sd_fs), so in a weakly-correlated parcel
+    it reports compression that is really noise; Bland-Altman has no such term.
+    """
+    # `sources` puts columns from DIFFERENT roots side by side -- e.g. the
+    # shipped DL+DiReCT result-thick.csv against one of ours -- so the two are
+    # read by the same code, against the same FreeSurfer table, on the same
+    # subjects, and drawn on panels built by the same function. Each entry is
+    # (label, prep_root, out_name, metric).
+    if sources:
+        cells = [(lab, load_comparison(subjects, met, fs_csv, root, on))
+                 for lab, root, on, met in sources]
+    else:
+        cells = [(m, load_comparison(subjects, m, fs_csv, prep_root, out_name))
+                 for m in metrics]
+    tabs = dict(cells)
+    metrics = [lab for lab, _ in cells]
+    cols = cells[0][1][0]
+    rows = [(n, cols.index(n)) for n in (names or [])] or [('hemisphere mean', None)]
+    # a single-metric figure still has to fit the title, so floor the width
+    fig, axes = plt.subplots(len(rows), len(metrics),
+                             figsize=(max(4.15 * len(metrics), 8.0),
+                                      (3.9 if len(metrics) > 1 else 3.1) * len(rows)),
+                             squeeze=False, facecolor=SURF,
+                             # columns from `sources` measure the SAME quantity
+                             # with different pipelines, so they have to share a
+                             # y-scale or the panel with the tighter agreement
+                             # just looks noisier
+                             sharey='row' if sources else False)
+    for i, (label, j) in enumerate(rows):
+        for k, m in enumerate(metrics):
+            _, A, FS = tabs[m]
+            a = np.nanmean(A[:, -2:], axis=1) if j is None else A[:, j]
+            b = np.nanmean(FS[:, -2:], axis=1) if j is None else FS[:, j]
+            _ba_panel(axes[i, k], a, b, m if i == 0 else None)
+            if k == 0:
+                # the region name alone: a two-line label gets clipped out of
+                # the canvas in the narrow single-metric layout
+                axes[i, k].set_ylabel('%s\n(mm)' % label, color=SEC,
+                                      fontsize=10.5, linespacing=1.3)
+            if i == len(rows) - 1:
+                axes[i, k].set_xlabel('mean of the two (mm)', color=MUTED, fontsize=9.5)
+    # in figure fractions, so a short figure would stack these on top of each
+    # other; place them a fixed number of inches from the top instead
+    H = fig.get_size_inches()[1]
+    fig.text(0.006, 1 - 0.30 / H, 'Bland-Altman against FreeSurfer, one point per '
+             'subject (n = %d)' % len(subjects), color=INK, fontsize=15,
+             ha='left', va='top')
+    fig.text(0.006, 1 - 0.60 / H, 'y = this pipeline - FreeSurfer;  solid red = bias, '
+             'dotted = 95% limits of agreement, blue = trend of the difference',
+             color=MUTED, fontsize=9.6, ha='left', va='top')
+    fig.subplots_adjust(top=1 - 1.05 / fig.get_size_inches()[1], hspace=0.30,
+                        wspace=0.13 if sources else 0.26,
+                        left=0.105 if len(metrics) > 1 else 0.13, right=0.985, bottom=0.145 if len(rows) == 1 else 0.075)
+    fig.savefig(out, dpi=135, facecolor=SURF)
     return out
 
 
@@ -241,7 +348,7 @@ def brain(subjects, fs_csv, prep_root, out, out_name, metric='sym_nn',
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('kind', choices=('scatter', 'regions', 'brain'))
+    p.add_argument('kind', choices=('scatter', 'regions', 'brain', 'bland'))
     p.add_argument('--subjects', required=True, help='one subject directory name per line')
     p.add_argument('--fs-csv', required=True, help='table from freesurfer_stats.py')
     p.add_argument('--prep-root', required=True, help='directory holding the subject preps')
@@ -250,7 +357,14 @@ def main():
                    help='subdirectory inside each prep holding the result-thick CSVs')
     p.add_argument('--metric', default='sym_nn', help='brain: which metric to map')
     p.add_argument('--metrics', nargs='+', default=list(METRICS))
-    p.add_argument('--regions', nargs='+', help='regions: name them instead of ranking')
+    p.add_argument('--source', action='append', dest='sources',
+                   help='bland: a column from its own tree, as '
+                        'LABEL,PREP_ROOT,OUT_NAME,METRIC. Repeatable; overrides '
+                        '--metrics. Use OUT_NAME=. for CSVs directly in the '
+                        'subject directory')
+    p.add_argument('--regions', nargs='+',
+                   help='regions/bland: name them instead of ranking '
+                        '(bland: omit for the hemisphere mean)')
     p.add_argument('--slope-lo', type=float, default=0.75)
     p.add_argument('--slope-hi', type=float, default=1.25)
     p.add_argument('--r-cmap', default='plasma')
@@ -262,6 +376,12 @@ def main():
     if args.kind == 'scatter':
         out = scatter(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
                       tuple(args.metrics))
+    elif args.kind == 'bland':
+        src = [tuple(x.split(',')) for x in args.sources] if args.sources else None
+        if src and any(len(x) != 4 for x in src):
+            p.error('--source must be LABEL,PREP_ROOT,OUT_NAME,METRIC')
+        out = bland(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
+                    tuple(args.metrics), args.regions, sources=src)
     elif args.kind == 'regions':
         out = regions(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
                       args.regions, metrics=tuple(args.metrics))

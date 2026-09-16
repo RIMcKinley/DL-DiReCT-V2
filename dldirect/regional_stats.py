@@ -137,6 +137,9 @@ METRICS = ('field', 'travel', 'nn', 'sym_nn')
 # ---------------------------------------------------------------------------
 # labels, in DL+DiReCT's order and naming
 # ---------------------------------------------------------------------------
+WM_ID = {'lh': 2, 'rh': 41}   # cerebral white matter in aparc.atlas+aseg
+
+
 def get_labels(offset=0, lut_path=None):
     """(lut, parcel names, all column names). extract_stats.get_labels, but with
     the lookup table located relative to this file rather than sys.argv[0] --
@@ -262,13 +265,78 @@ def surface_thickness(white, pial):
 
 
 # ---------------------------------------------------------------------------
+def wm_deviation(white_vox, ids, wm_mask, zooms, offset=0, lut_path=None):
+    """Per-parcel mean signed distance from the white vertices to the WM boundary.
+
+    Positive is OUTSIDE the segmented white matter. The white surface is meshed
+    from the (topology-corrected) WM mask and then Taubin smoothed, so a small
+    positive offset is normal and is not the signal -- the signal is a parcel
+    whose vertices sit much further out than the same parcel does in the rest of
+    a cohort.
+
+    WHAT THIS MEASURES, AND WHAT IT DOES NOT
+
+    It is surface-versus-segmentation CONSISTENCY, not segmentation
+    correctness. On 420 OASIS subjects against 4 visually confirmed bad scans,
+    scoring the WORST PARCEL gave AUC 0.939 where the hemisphere mean gave 0.835
+    -- a one-lobe failure averages away against 60-odd healthy parcels -- and
+    the worst parcel landed in the damaged territory every time. Hence per
+    parcel, and hence no hemisphere-level verdict here.
+
+    CAVEAT ON THOSE NUMBERS: they were measured on a prototype that scored every
+    white vertex. compute() feeds this the KEPT vertices only -- pinned and
+    off-tissue dropped -- so the flag describes exactly the measurement beside
+    it. That shifts the scale (hemisphere means land near 0 rather than +0.11)
+    and has not been re-validated at cohort scale; see scratchpad/wm_qc*.
+
+    The miss is the instructive part either way: a subject whose whole anterior
+    frontal lobe is noise scored at the 76th percentile, because the surface
+    follows the wrong segmentation faithfully. Any measure built from only these
+    two objects shares that blind spot, so do not sell this as detecting bad
+    segmentations.
+
+    Distances are sampled trilinearly. Nearest-voxel sampling quantises the
+    distance transform onto the voxel centres, which puts a lot of vertices on
+    exactly 1.000mm and costs the measure its discrimination.
+    """
+    from scipy.ndimage import distance_transform_edt, map_coordinates
+    sd = (distance_transform_edt(~wm_mask, sampling=zooms)
+          - distance_transform_edt(wm_mask, sampling=zooms))
+    d = map_coordinates(sd, np.asarray(white_vox, float).T, order=1, mode='nearest')
+    return d
+
+
+def aggregate_signed(values, parcel_ids, offset=0, lut_path=None):
+    """`aggregate` for a SIGNED quantity: same grouping, no non-zero filter.
+
+    aggregate() drops zeros because a zero thickness means "no measurement
+    there". A signed distance of zero means the vertex is exactly on the
+    boundary, which is the best case, not a missing one.
+    """
+    lut, names, all_names = get_labels(offset, lut_path)
+    values = np.asarray(values, float)
+    parcel_ids = np.asarray(parcel_ids)
+    groups = [values[parcel_ids == lut[n]] for n in names]
+    groups += [values[(parcel_ids >= 1000 + offset) & (parcel_ids < 2000 + offset)],
+               values[(parcel_ids >= 2000 + offset) & (parcel_ids < 3000 + offset)]]
+    return (np.array([g.mean() if g.size else np.nan for g in groups]),
+            np.array([g.std() if g.size else np.nan for g in groups]), all_names)
+
+
 def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
             hemis=('lh', 'rh'), velocity_name='pial_Velocity.nii.gz',
-            write_white=False, verbose=True, sd=None, pials=None, velocity=None):
+            write_white=False, verbose=True, sd=None, pials=None, velocity=None,
+            qc=True):
     """All four metrics, aggregated per parcel. Returns {metric: (mean, std, names)}.
 
     Run standalone, everything comes off disk: the solve segmentation is rebuilt
     from the prep (~35 s) and the surfaces and field are read from `surf_dir`.
+
+    `qc` also writes result-qc-wm_deviation.csv: the mean signed distance from
+    each parcel's white vertices to the white-matter segmentation boundary, in
+    the same 71 columns. See wm_deviation for what it does and does not detect.
+    It costs ~2.5s a hemisphere (two distance transforms), so pass qc=False in a
+    sweep that does not want it.
 
     `sd`, `pials` and `velocity` let a caller that has just solved hand over what
     it already holds instead -- `sd` a dict with seg/tovox/ref_img/surfaces (the
@@ -332,6 +400,7 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
 
     vals = {m: [] for m in ('travel', 'nn', 'sym_nn')}
     ids_all = []
+    dev_all = []
     n_drop_named = 0
     n_off_tissue = 0
     for h in hemis:
@@ -417,6 +486,15 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
         ids = np.where(drop, 0, ids)
         n_drop_named += int((drop & (nearest_parcel(vox, parc) > 0)).sum())
         ids_all.append(ids)
+        if qc:
+            # The same vertices the thickness came from, so the flag describes
+            # exactly the measurement it sits beside. Per hemisphere, not the
+            # union of both WM masks: a left-hemisphere vertex that has drifted
+            # to the right hemisphere's white matter is an error, and scoring
+            # against the union would hide it.
+            wm_id = WM_ID[h]
+            dev_all.append(wm_deviation(tovox(np.asarray(w, float)), ids,
+                                        parc == wm_id, zooms))
         vals['travel'].append(tr); vals['nn'].append(nn); vals['sym_nn'].append(sym)
 
     if vals is not None and ids_all:
@@ -431,6 +509,20 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
         for m in ('travel', 'nn', 'sym_nn'):
             v = np.concatenate(vals[m])
             results[m] = aggregate(v[keep], ids[keep], offset)
+
+    if qc and dev_all and vals is not None:
+        dev = np.concatenate(dev_all)
+        ids = np.concatenate(ids_all)
+        k = ids > 0
+        qmean, qstd, qnames = aggregate_signed(dev[k], ids[k], offset)
+        write_stats(qmean, subject_id,
+                    os.path.join(out_dir, 'result-qc-wm_deviation.csv'), qnames)
+        write_stats(qstd, subject_id,
+                    os.path.join(out_dir, 'result-qc-wm_deviation-std.csv'), qnames)
+        if verbose:
+            worst = int(np.nanargmax(qmean[:-2]))
+            print('wm_deviation lh %+.3f  rh %+.3f mm  (worst parcel %s %+.3f)'
+                  % (qmean[-2], qmean[-1], qnames[worst], qmean[worst]))
 
     for m, (mean, std, names) in results.items():
         write_stats(mean, subject_id, os.path.join(out_dir, 'result-thick-%s.csv' % m), names)
@@ -450,6 +542,8 @@ def main():
     p.add_argument('--subject')
     p.add_argument('--out-dir', help='default: --surf-dir')
     p.add_argument('--hemi', nargs='+', default=['lh', 'rh'], choices=['lh', 'rh'])
+    p.add_argument('--no-qc', dest='qc', action='store_false',
+                   help='skip result-qc-wm_deviation.csv (saves ~5s a subject)')
     p.add_argument('--write-white', action='store_true',
                    help='also write the rebuilt ?h.white next to the pial')
     p.add_argument('--preps', nargs='+',
@@ -462,7 +556,7 @@ def main():
 
     if not args.preps:
         compute(args.prep_dir, args.surf_dir, args.subject, args.out_dir,
-                hemis=tuple(args.hemi), write_white=args.write_white)
+                hemis=tuple(args.hemi), write_white=args.write_white, qc=args.qc)
         return 0
 
     import glob as _glob
@@ -482,7 +576,7 @@ def main():
         t = _time.time()
         try:
             compute(d, sdir, name, args.out_dir, hemis=tuple(args.hemi),
-                    write_white=args.write_white, verbose=False)
+                    write_white=args.write_white, verbose=False, qc=args.qc)
         except Exception as exc:
             print('[%d/%d] %s: FAILED %s: %s'
                   % (i, len(preps), name, type(exc).__name__, exc), file=sys.stderr)

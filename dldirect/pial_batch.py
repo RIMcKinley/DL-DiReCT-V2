@@ -244,7 +244,7 @@ def main():
     # pial_pipeline's --topology came to be inert, and how a 60-subject
     # rebuild meant to test the nighres default silently ran on gpu instead.
     # None means 'do not pass it', so the pipeline's own default governs.
-    p.add_argument('--topology', default=None, choices=['nighres', 'gpu'])
+    p.add_argument('--topology', default=None, choices=['nighres', 'gpu', 'none'])
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT)
     p.add_argument('--solve-margin', type=int, default=solve_grid.MARGIN,
                    help='voxels of background guaranteed around the cerebrum for the '
@@ -255,6 +255,14 @@ def main():
                    help='also compute the DiReCT thickness map')
     # default=None so this cannot SHADOW reconstruct's own default when passed
     # explicitly -- the mistake --topology made, two lines up.
+    p.add_argument('--smoothing', default=None, choices=['gated', 'plain'])
+    # default None so it cannot shadow reconstruct's, per the --topology lesson
+    p.add_argument('--no-ribbon-correction', dest='correct_ribbon',
+                   action='store_false', default=None)
+    p.add_argument('--reuse-white', default=None,
+                   help="directory name inside each prep holding ?h.white from an "
+                        "earlier run to start from (e.g. field_pial_sigma0.65), "
+                        "instead of rebuilding the white surfaces")
     p.add_argument('--stats', action='store_true', default=None,
                    help='also write regional_stats\' result-thick-<metric>.csv beside '
                         'each subject\'s surfaces, off the solve already in memory')
@@ -278,6 +286,9 @@ def main():
         segmentation=args.segmentation,
         **({} if args.topology is None else {'topology': args.topology}),
         **({} if args.stats is None else {'stats': args.stats}),
+        **({} if args.reuse_white is None else {'reuse_white': args.reuse_white}),
+        **({} if args.smoothing is None else {'smoothing': args.smoothing}),
+        **({} if args.correct_ribbon is None else {'correct_ribbon': args.correct_ribbon}),
         velocity_sigma=args.velocity_sigma, blend_beta=args.blend_beta,
         solve_margin=None if args.solve_margin < 0 else args.solve_margin)
 

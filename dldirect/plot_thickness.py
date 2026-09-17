@@ -153,8 +153,13 @@ def _ba_panel(ax, a, b, title=None):
 
 
 def bland(subjects, fs_csv, prep_root, out, out_name, metrics=METRICS, names=None,
-          sources=None):
+          sources=None, ref_label='FreeSurfer'):
     """Bland-Altman against FreeSurfer: hemisphere means, or one row per region.
+
+    `ref_label` names whatever `fs_csv` holds. It is not always FreeSurfer:
+    with --source the same machinery compares against any reference table in
+    result-thick's 71 columns -- the shipped DL+DiReCT, for instance -- and a
+    figure captioned FreeSurfer in that case is simply wrong.
 
     Preferred over the scatter when the question is agreement rather than
     association. The scatter's least-squares slope is attenuated by exactly the
@@ -202,11 +207,13 @@ def bland(subjects, fs_csv, prep_root, out, out_name, metrics=METRICS, names=Non
     # in figure fractions, so a short figure would stack these on top of each
     # other; place them a fixed number of inches from the top instead
     H = fig.get_size_inches()[1]
-    fig.text(0.006, 1 - 0.30 / H, 'Bland-Altman against FreeSurfer, one point per '
-             'subject (n = %d)' % len(subjects), color=INK, fontsize=15,
+    fig.text(0.006, 1 - 0.30 / H,
+             'Bland-Altman against %s, one point per subject (n = %d)'
+             % (ref_label, len(subjects)), color=INK, fontsize=15,
              ha='left', va='top')
-    fig.text(0.006, 1 - 0.60 / H, 'y = this pipeline - FreeSurfer;  solid red = bias, '
-             'dotted = 95% limits of agreement, blue = trend of the difference',
+    fig.text(0.006, 1 - 0.60 / H,
+             'y = this pipeline - %s;  solid red = bias, dotted = 95%% limits '
+             'of agreement, blue = trend of the difference' % ref_label,
              color=MUTED, fontsize=9.6, ha='left', va='top')
     fig.subplots_adjust(top=1 - 1.05 / fig.get_size_inches()[1], hspace=0.30,
                         wspace=0.13 if sources else 0.26,
@@ -357,6 +364,8 @@ def main():
                    help='subdirectory inside each prep holding the result-thick CSVs')
     p.add_argument('--metric', default='sym_nn', help='brain: which metric to map')
     p.add_argument('--metrics', nargs='+', default=list(METRICS))
+    p.add_argument('--ref-label', default='FreeSurfer',
+                   help='what --fs-csv actually holds, for the figure caption')
     p.add_argument('--source', action='append', dest='sources',
                    help='bland: a column from its own tree, as '
                         'LABEL,PREP_ROOT,OUT_NAME,METRIC. Repeatable; overrides '
@@ -381,7 +390,8 @@ def main():
         if src and any(len(x) != 4 for x in src):
             p.error('--source must be LABEL,PREP_ROOT,OUT_NAME,METRIC')
         out = bland(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
-                    tuple(args.metrics), args.regions, sources=src)
+                    tuple(args.metrics), args.regions, sources=src,
+                    ref_label=args.ref_label)
     elif args.kind == 'regions':
         out = regions(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
                       args.regions, metrics=tuple(args.metrics))

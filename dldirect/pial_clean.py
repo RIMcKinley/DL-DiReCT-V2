@@ -193,7 +193,7 @@ def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
 
 def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
                            compute_thickness=True, blend_beta=GATE_BLEND_BETA,
-                           velocity_sigma=VELOCITY_SIGMA):
+                           velocity_sigma=VELOCITY_SIGMA, smoothing='gated'):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -280,7 +280,15 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                 velocity = velocity * torch.where(over, frac * frac, torch.ones_like(frac))
             cortical_thickness = vals * gm_mask
 
-        velocity = gated_velocity_smooth(velocity, velocity_sigma, device,
+        if smoothing == 'plain':
+            # The ungated Gaussian the original DiReCT applies: no relu(cos)
+            # rejection of opposing neighbours, no nu blend. For a baseline arm;
+            # the gate is the default for the reasons gated_velocity_smooth
+            # documents.
+            velocity = gaussian_smooth_3d(velocity, velocity_sigma, device,
+                                          zero_boundary=False)
+        else:
+            velocity = gated_velocity_smooth(velocity, velocity_sigma, device,
                                          nu=nu_t, beta=blend_beta)
         velocity = velocity * active          # MUST precede the save; see below
         if verbose and (iteration + 1) % 10 == 0:

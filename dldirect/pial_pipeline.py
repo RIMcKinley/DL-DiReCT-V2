@@ -193,6 +193,58 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, ref_img=None,
 # ---------------------------------------------------------------------------
 # solve + propagate
 # ---------------------------------------------------------------------------
+WHITE_BUILD = 'white_build.json'
+
+
+def _white_build_record(nsmooth, topology, crop, segmentation='surface-pv'):
+    return dict(nsmooth=int(nsmooth), topology=str(topology), crop=bool(crop),
+                segmentation=str(segmentation))
+
+
+def _load_white_for_reuse(where, prep_dir, hemis, nsmooth, topology, crop, verbose):
+    """{hemi: (verts, faces)} from `where`, ready for wm_surfaces=.
+
+    `where` may be an absolute path or a directory name inside prep_dir.
+
+    NO FRAME CONVERSION HAPPENS HERE, and none is needed: _solve_and_propagate
+    writes ?h.white from `outer`, i.e. already in the solve's tkrRAS, and the
+    solve grid is load_gm_wm_probability's ref_img, which is the prep's own
+    on-disk grid. tkr_to_tkr(prep, ref_img) is the identity between them.
+    Converting with the CROPPED label grid's matrix instead -- which is the one
+    build_surface_segmentation uses internally for the surfaces it builds --
+    shifts the mesh by the ribbon crop, 5.5mm in z on OAS30458, and moves every
+    pial vertex by a median 5.4mm. Measured, not hypothetical: that is what the
+    first version of this did.
+    """
+    import json
+    d = where if os.path.isdir(where) else os.path.join(prep_dir, where)
+    if not os.path.isdir(d):
+        raise FileNotFoundError('reuse_white: no such directory %s' % d)
+    rec_path = os.path.join(d, WHITE_BUILD)
+    want = _white_build_record(nsmooth, topology, crop)
+    if os.path.exists(rec_path):
+        have = json.load(open(rec_path))
+        bad = {k: (have.get(k), want[k]) for k in want if have.get(k) != want[k]}
+        if bad:
+            raise ValueError(
+                'reuse_white: %s was built with %s, this call wants %s. Reusing it '
+                'would label the output with this call\'s parameters while starting '
+                'from the other surface.'
+                % (d, {k: v[0] for k, v in bad.items()}, {k: v[1] for k, v in bad.items()}))
+    elif verbose:
+        print('WARNING: %s has no %s, so the surfaces there cannot be checked against '
+              'nsmooth=%s topology=%s crop=%s. Reusing on the caller\'s word.'
+              % (d, WHITE_BUILD, nsmooth, topology, crop), file=sys.stderr)
+    out = {}
+    for h in hemis:
+        p = os.path.join(d, '%s.white' % h)
+        if not os.path.exists(p):
+            raise FileNotFoundError('reuse_white: %s missing' % p)
+        v, f = nib.freesurfer.io.read_geometry(p)
+        out[h] = (np.asarray(v, np.float64), np.asarray(f))
+    return out
+
+
 def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=False,
@@ -201,6 +253,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 write_white=True, stats=False, subject_id=None,
+                reuse_white=None, smoothing='gated', correct_ribbon=True,
                 dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
@@ -225,6 +278,36 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     write_white     also write ?h.white beside ?h.pial when out_dir is given
                     (default). It is the mesh the propagation started from, in
                     the pial's frame; under `surface-pv` nothing else writes it.
+    correct_ribbon  `surface-pv` only. True (default) runs the sub-threshold CSF
+                    detection on the GM ribbon before meshing it, opening sulci
+                    the model scored below detection. False meshes the raw
+                    ribbon -- surface_seg documents it as "the control for it".
+                    Note the `surface-pv` route turns on three things at once
+                    (PV rasterisation of the WM boundary, a meshed GM envelope,
+                    and this correction), so an arm that differs only in this
+                    flag is what separates the third from the first two.
+    smoothing       'gated' (default) or 'plain'. 'plain' is the ungated
+                    Gaussian of the original DiReCT -- see
+                    pial_clean.gated_velocity_smooth for what the gate does and
+                    why it is on. Pair it with topology='none' and
+                    segmentation='logits' for an original-DiReCT baseline.
+    reuse_white     directory holding ?h.white from an EARLIER run of this same
+                    pipeline on this same prep. Under `surface-pv` the white
+                    surfaces are rebuilt from the segmentation on every call --
+                    topology correction, marching cubes and `nsmooth` Taubin
+                    steps, 34 of the 61s the segmentation build costs. Reusing
+                    them makes a second solve at a different --velocity-sigma
+                    cost the solve, not the surfaces. Measured: 60.9s -> 27.0s
+                    for the segmentation build, with seg bit-identical and the
+                    recovered mesh 4.3e-06 mm from the rebuilt one (float32
+                    storage).
+
+                    ONLY valid when those surfaces were built with the same
+                    nsmooth/topology/crop. The pipeline writes white_build.json
+                    beside ?h.white recording them, and this REFUSES a mismatch;
+                    surfaces from before that file existed are accepted with a
+                    warning, since the alternative is refusing every surface
+                    already on disk.
     stats           also write regional_stats' result-thick-<metric>.csv /
                     result-thickstd-<metric>.csv into out_dir (field, field_raw,
                     travel, nn, sym_nn). Needs out_dir and the prep's
@@ -274,11 +357,19 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     import pandas as pd
 
     if str(segmentation).lower() == 'surface-pv':
+        reused = None
+        if reuse_white:
+            reused = _load_white_for_reuse(reuse_white, prep_dir, hemis=('lh', 'rh'),
+                                           nsmooth=nsmooth, topology=topology,
+                                           crop=crop, verbose=verbose)
         if verbose:
-            print('building the segmentation from surfaces...')
+            print('building the segmentation from surfaces%s...'
+                  % (' (reusing ?h.white)' if reused else ''))
         sd = surface_seg.build_surface_segmentation(prep_dir, hemis=tuple(hemis),
                                                     nsmooth=nsmooth, crop=crop,
                                                     topology=topology,
+                                                    wm_surfaces=reused,
+                                                    correct_ribbon=correct_ribbon,
                                                     verbose=verbose)
         d = dict(seg=sd['seg'], gmT=sd['gmT'], wmT=sd['wmT'], ref_img=sd['ref_img'],
                  tovox=sd['tovox'], totkr=sd['totkr'], surfaces=sd['surfaces'],
@@ -286,8 +377,10 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
+                                    smoothing=smoothing,
                                     solve_margin=solve_margin, write_white=write_white,
                                     stats=stats, subject_id=subject_id,
+                                    white_build=_white_build_record(nsmooth, topology, crop),
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
                                                found_csf=sd['found_csf']))
     elif str(segmentation).lower() != 'logits':
@@ -319,6 +412,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
+                                smoothing=smoothing,
                                 solve_margin=solve_margin, write_white=write_white,
                                 stats=stats, subject_id=subject_id)
 
@@ -326,8 +420,10 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
                          velocity_sigma=pc.VELOCITY_SIGMA,
-                         blend_beta=pc.GATE_BLEND_BETA, solve_margin=solve_grid.MARGIN,
-                         write_white=True, stats=False, subject_id=None, extra=None):
+                         blend_beta=pc.GATE_BLEND_BETA, smoothing='gated',
+                         solve_margin=solve_grid.MARGIN,
+                         write_white=True, stats=False, subject_id=None,
+                         white_build=None, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
     outer = d
@@ -350,7 +446,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
         vel_t, thick_t, _dev = pc.solve_velocity_field_t(
             seg, d['gmT'], d['wmT'], ref_img, verbose=verbose, device=device,
             compute_thickness=compute_thickness, velocity_sigma=velocity_sigma,
-            blend_beta=blend_beta)
+            blend_beta=blend_beta, smoothing=smoothing)
         thickness = thick_t.squeeze().cpu().numpy() if thick_t is not None else None
         # Only leave the GPU if something actually needs the host copy.
         velocity = vel_t if (on_gpu and not out_dir) else pc.velocity_to_numpy(vel_t)
@@ -416,6 +512,12 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                     os.path.join(out_dir, '%s.white' % hemi),
                     np.asarray(outer['surfaces'][hemi][0], np.float64), faces,
                     create_stamp=None, volume_info=vinfo)
+                if white_build:
+                    # so a later --reuse-white can REFUSE a parameter mismatch
+                    # rather than silently start from the wrong surface
+                    import json as _json
+                    with open(os.path.join(out_dir, WHITE_BUILD), 'w') as fh:
+                        _json.dump(white_build, fh)
         if report:
             # against the caller's grid, so the numbers stay comparable
             m = evaluate_surface(outer['surfaces'][hemi][0], pial, faces,
@@ -477,7 +579,7 @@ def main():
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')
-    p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu'],
+    p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu', 'none'],
                    help='topology correction when building white surfaces '
                         '(default nighres)')
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT,
@@ -499,6 +601,18 @@ def main():
                         'smooths per iteration (22.6s -> 13.3s without it), and on '
                         'validated data the velocity field is bit-identical either way '
                         'because the THICKNESS_PRIOR cap never binds')
+    p.add_argument('--no-ribbon-correction', dest='correct_ribbon',
+                   action='store_false',
+                   help='surface-pv only: mesh the raw GM ribbon instead of running '
+                        'the sub-threshold CSF detection on it')
+    p.add_argument('--smoothing', default='gated', choices=['gated', 'plain'],
+                   help="'plain' is the original DiReCT's ungated Gaussian velocity "
+                        "smoothing; 'gated' (default) refuses to average across a "
+                        "direction reversal")
+    p.add_argument('--reuse-white',
+                   help='directory (absolute, or a name inside --prep-dir) holding '
+                        '?h.white from an earlier run to start from instead of '
+                        'rebuilding the white surfaces')
     p.add_argument('--stats', action='store_true',
                    help='also write regional_stats\' result-thick-<metric>.csv into '
                         '--out-dir (field, field_raw, travel, nn, sym_nn). Reuses the '
@@ -524,7 +638,9 @@ def main():
                     blend_beta=args.blend_beta,
                     solve_margin=None if args.solve_margin < 0 else args.solve_margin,
                     write_white=not args.no_white,
-                    stats=args.stats, subject_id=args.subject)
+                    stats=args.stats, subject_id=args.subject,
+                    reuse_white=args.reuse_white, smoothing=args.smoothing,
+                    correct_ribbon=args.correct_ribbon)
         return
 
     import time

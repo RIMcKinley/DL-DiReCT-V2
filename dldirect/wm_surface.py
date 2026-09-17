@@ -134,6 +134,24 @@ def rec_surf_gpu(binary, affine, r, pad=2, priority=None, n_bands=8):
     return l2m['result']['points'] - pad, l2m['result']['faces']
 
 
+def rec_surf_raw(binary, affine, r, pad=2):
+    """rec_surf's contract with NO topology correction: mesh the mask as it is.
+
+    For a baseline that wants the original DiReCT's inputs rather than this
+    pipeline's. The result is not genus 0 and may have several bodies -- that is
+    the point of the arm, not a defect -- so nothing downstream may assume a
+    sphere. It still goes through nighres' levelset_to_mesh rather than
+    skimage's marching cubes, for the reason rec_surf_gpu gives: that mesher is
+    connectivity-consistent and skimage's is not.
+    """
+    import nighres
+    b = np.pad(np.asarray(binary) > 0, pad)
+    levelset = signed_distance(b)
+    l2m = nighres.surface.levelset_to_mesh(nib.Nifti1Image(levelset, affine),
+                                           connectivity='6/18')
+    return l2m['result']['points'] - pad, l2m['result']['faces']
+
+
 def hemisphere_binary(seg, df_labels, region, excluded):
     """The filled WM mask for one hemisphere.
 
@@ -164,6 +182,9 @@ def build_hemisphere(seg, df_labels, affine, region, excluded, nsmooth=NSMOOTH_D
     the grid `affine` describes.
 
     topology='nighres'  the shipped sequential correction
+    topology='none'     no correction at all: the mask is meshed as it stands.
+                        For the original-DiReCT baseline. NOT genus 0, possibly
+                        several bodies.
     topology='gpu'      rec_surf_gpu. Validated at 36 hemispheres for TOPOLOGY
                         (36/36 genus 0, single body) and for geometry away from
                         the handle cuts (p95 0.012mm). NOT the default: the cut
@@ -177,8 +198,11 @@ def build_hemisphere(seg, df_labels, affine, region, excluded, nsmooth=NSMOOTH_D
         vertices, faces = rec_surf_gpu(binary, affine, region, priority=priority)
     elif topology == 'nighres':
         vertices, faces = rec_surf(binary, affine, region)
+    elif topology in ('none', None, False):
+        vertices, faces = rec_surf_raw(binary, affine, region)
     else:
-        raise ValueError('topology must be "nighres" or "gpu", got %r' % (topology,))
+        raise ValueError('topology must be "nighres", "gpu" or "none", got %r'
+                         % (topology,))
 
     # apply affine for FS visualization and matching with the MRI
     transf_vertx = nib.affines.apply_affine(affine, vertices)

@@ -310,6 +310,100 @@ def wm_deviation(white_vox, ids, wm_mask, zooms, offset=0, lut_path=None):
     return d
 
 
+def fragmentation(seg_labels, ids):
+    """Per-side connected-component fragmentation of the cerebrum labels.
+
+    Returns {side: (frac_outside_largest, n_stray_components_ge_10vox,
+    n_components)} for WM+cortex of each side, 26-connected.
+
+    WHY THIS EXISTS ALONGSIDE wm_deviation. That flag compares the white surface
+    with the segmentation it was meshed from, so a segmentation that is wrong but
+    self-consistent passes: on 2363 OASIS scans the single genuinely fragmented
+    case (3.6% of one side detached as ONE coherent 5829-voxel blob) sat at only
+    the 72.7th percentile of the WM flag. This measures the segmentation alone
+    and catches exactly that failure.
+
+    Scale, from those 2363 scans: 90% of scans have some detached voxel, but the
+    median stray mass is 17 ppm -- boundary dust, not fragmentation. Judge on the
+    component COUNT at >=10 voxels, where 90.5% of scans score zero.
+    """
+    from scipy import ndimage
+    st = np.ones((3, 3, 3), bool)
+    out = {}
+    for side in ('Left', 'Right'):
+        wm = ids.get('%s-Cerebral-White-Matter' % side)
+        ct = ids.get('%s-Cerebral-Cortex' % side)
+        want = [x for x in (wm, ct) if x is not None]
+        if not want:
+            continue
+        m = np.isin(seg_labels, want)
+        n = int(m.sum())
+        if not n:
+            out[side] = (np.nan, np.nan, 0)
+            continue
+        lab, k = ndimage.label(m, structure=st)
+        sz = np.bincount(lab.ravel())[1:]
+        out[side] = (float((n - sz.max()) / n), int((sz >= 10).sum() - 1), int(k))
+    return out
+
+
+def parcel_adjacency(parc, min_faces=20, lo=1000, hi=3000):
+    """Cortical label pairs meeting across a voxel face, as {(a, b): n_faces}.
+
+    Face counts rather than a boolean: a one-voxel touch and a real border are
+    different events, and `min_faces` drops the former. 20 was chosen because
+    below it the reference picks up pairs that appear in a handful of scans only.
+    """
+    pairs = {}
+    a = np.asarray(parc)
+    for ax in range(3):
+        x = np.moveaxis(a, ax, 0)
+        u, v = x[:-1], x[1:]
+        m = (u != v) & (u > lo) & (v > lo) & (u < hi) & (v < hi)
+        if not m.any():
+            continue
+        uu, vv = u[m].ravel(), v[m].ravel()
+        keys = np.stack([np.minimum(uu, vv), np.maximum(uu, vv)], 1)
+        uniq, cnt = np.unique(keys, axis=0, return_counts=True)
+        for (p, q), c in zip(uniq, cnt):
+            k = (int(p), int(q))
+            pairs[k] = pairs.get(k, 0) + int(c)
+    return {k: v for k, v in pairs.items() if v >= min_faces}
+
+
+def adjacency_check(parc, ref_path=None, min_faces=20):
+    """Compare a parcellation's adjacency graph with the shipped DK reference.
+
+    Returns (novel_pairs, novel_faces, missing_pairs, n_pairs). `novel` are
+    contacts absent from every reference scan; `missing` are borders present in
+    >=95% of reference scans but absent here.
+
+    The reference (dk_adjacency.csv) is the adjacency FREQUENCY over 150
+    FreeSurfer aparc+aseg volumes from OASIS-3 -- an independent segmentation of
+    the same scans -- so it encodes which DK borders actually exist rather than
+    which ones an atlas drawing implies.
+
+    Measured on 2405 of our parcellations: 94.3% have no novel adjacency at all.
+    The novel ones that recur are anatomically impossible rather than marginal --
+    precentral touching superiorparietal (postcentral pinched out locally), and
+    CROSS-HEMISPHERE contacts such as lh-paracentral--rh-superiorfrontal.
+
+    Read `missing` with care: it counts the three rh-unknown borders in every
+    scan, because this parcellation has no `unknown` label, and
+    lh-parstriangularis--lh-insula in half of them, which is the documented
+    limen insulae difference rather than a defect.
+    """
+    import pandas as pd
+    ref_path = ref_path or os.path.join(_HERE, 'dk_adjacency.csv')
+    ref = pd.read_csv(ref_path)
+    seen = {(int(r.a), int(r.b)) for _, r in ref.iterrows()}
+    universal = {(int(r.a), int(r.b)) for _, r in ref.iterrows() if r.freq >= 0.95}
+    got = parcel_adjacency(parc, min_faces=min_faces)
+    novel = {k: v for k, v in got.items() if k not in seen}
+    missing = universal - set(got)
+    return sorted(novel), int(sum(novel.values())), sorted(missing), len(got)
+
+
 def aggregate_signed(values, parcel_ids, offset=0, lut_path=None):
     """`aggregate` for a SIGNED quantity: same grouping, no non-zero filter.
 
@@ -339,6 +433,12 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
     `qc` also writes result-qc-wm_deviation.csv: the mean signed distance from
     each parcel's white vertices to the white-matter segmentation boundary, in
     the same 71 columns. See wm_deviation for what it does and does not detect.
+
+    It also writes result-qc-segmentation.csv, two channels that read the
+    segmentation and parcellation ONLY: connected-component fragmentation per
+    side, and parcel adjacencies that no reference scan shows. Those catch the
+    case wm_deviation structurally cannot -- a wrong segmentation the surface
+    follows faithfully. See fragmentation() and adjacency_check().
     It costs ~2.5s a hemisphere (two distance transforms), so pass qc=False in a
     sweep that does not want it.
 
@@ -527,6 +627,38 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
             worst = int(np.nanargmax(qmean[:-2]))
             print('wm_deviation lh %+.3f  rh %+.3f mm  (worst parcel %s %+.3f)'
                   % (qmean[-2], qmean[-1], qnames[worst], qmean[worst]))
+
+    if qc:
+        # segmentation-only channels: these see failures wm_deviation cannot,
+        # because they never consult the surface. Cheap enough to run always.
+        import csv as _csv
+        try:
+            frag = fragmentation(np.asarray(nib.load(os.path.join(
+                prep_dir, 'T1w_norm_seg.nii.gz')).dataobj), id_map)
+            nov, nov_faces, miss, npairs = adjacency_check(parc)
+            row = {'SUBJECT': subject_id}
+            for side in ('Left', 'Right'):
+                f = frag.get(side, (np.nan, np.nan, 0))
+                row['%s-frag' % side] = '%.6g' % f[0]
+                row['%s-stray' % side] = f[1]
+                row['%s-ncomp' % side] = f[2]
+            row['adjacency-novel'] = len(nov)
+            row['adjacency-novel-faces'] = nov_faces
+            row['adjacency-missing'] = len(miss)
+            row['adjacency-pairs'] = npairs
+            row['adjacency-novel-list'] = ';'.join('%d-%d' % k for k in nov)
+            path = os.path.join(out_dir, 'result-qc-segmentation.csv')
+            with open(path, 'w', newline='') as fh:
+                w = _csv.DictWriter(fh, fieldnames=list(row))
+                w.writeheader(); w.writerow(row)
+            if verbose:
+                print('segmentation qc: stray comps L%s/R%s, %d novel adjacencies '
+                      '(%d faces), %d missing borders -> result-qc-segmentation.csv'
+                      % (row['Left-stray'], row['Right-stray'], len(nov), nov_faces,
+                         len(miss)))
+        except Exception as e:                       # never fail a run over QC
+            if verbose:
+                print('segmentation qc skipped: %s' % e)
 
     for m, (mean, std, names) in results.items():
         write_stats(mean, subject_id, os.path.join(out_dir, 'result-thick-%s.csv' % m), names)

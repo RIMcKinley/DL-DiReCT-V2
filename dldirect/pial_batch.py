@@ -232,9 +232,8 @@ def main():
     p.add_argument('--csv', help='write per-subject status and timing here')
     # --- the reconstruct knobs, same names and defaults as pial_pipeline ---
     p.add_argument('--hemi', nargs='+', default=['lh', 'rh'], choices=['lh', 'rh'])
-    p.add_argument('--velocity-sigma', type=float, default=pc.VELOCITY_SIGMA,
-                   help='ANTs -b, the velocity smoothing sigma (default %.2f)'
-                        % pc.VELOCITY_SIGMA)
+    p.add_argument('--velocity-sigma', type=float, default=None,
+                   help="ANTs -b, the velocity smoothing sigma (default: the preset's)")
     p.add_argument('--segmentation', default='logits',
                    choices=['logits', 'surface-pv'])
     # No default here ON PURPOSE. A default set in this file SHADOWS
@@ -242,9 +241,17 @@ def main():
     # pial_pipeline's --topology came to be inert, and how a 60-subject
     # rebuild meant to test the nighres default silently ran on gpu instead.
     # None means 'do not pass it', so the pipeline's own default governs.
-    p.add_argument('--wm-from-surface', action='store_true',
+    p.add_argument('--preset', default=None, choices=sorted(pp.PRESETS),
+                   help="'direct' (default) is the stock DL+DiReCT solve; "
+                        "'anisotropic' is the benchmarked configuration")
+    p.add_argument('--smoothing', default=None, choices=['gated', 'plain'],
+                   help="velocity-field smoothing (default: the preset's)")
+    p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
+                   help='nu/field direction blend (default %.2f)' % pc.GATE_BLEND_BETA)
+    p.add_argument('--wm-from-surface', action=argparse.BooleanOptionalAction,
+                   default=None,
                    help="'logits' only: reconcile the WM label against the "
-                        'white surface before solving (off by default)')
+                        "white surface before solving (default: the preset's)")
     p.add_argument('--topology', default=None, choices=['nighres', 'gpu', 'none'])
     p.add_argument('--nsmooth', type=int, default=wm_surface.NSMOOTH_DEFAULT)
     p.add_argument('--solve-margin', type=int, default=solve_grid.MARGIN,
@@ -287,8 +294,13 @@ def main():
         **({} if args.stats is None else {'stats': args.stats}),
         **({} if args.reuse_white is None else {'reuse_white': args.reuse_white}),
         **({} if args.correct_ribbon is None else {'correct_ribbon': args.correct_ribbon}),
-        velocity_sigma=args.velocity_sigma,
-        wm_from_surface=args.wm_from_surface,
+        blend_beta=args.blend_beta,
+        **({} if args.preset is None else {'preset': args.preset}),
+        **({} if args.smoothing is None else {'smoothing': args.smoothing}),
+        **({} if args.velocity_sigma is None else
+           {'velocity_sigma': args.velocity_sigma}),
+        **({} if args.wm_from_surface is None else
+           {'wm_from_surface': args.wm_from_surface}),
         solve_margin=None if args.solve_margin < 0 else args.solve_margin)
 
     if args.csv:

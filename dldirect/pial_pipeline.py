@@ -245,17 +245,65 @@ def _load_white_for_reuse(where, prep_dir, hemis, nsmooth, topology, crop, verbo
     return out
 
 
+ANISOTROPIC_SIGMA = 0.6    # velocity smoothing for the 'anisotropic' preset
+
+PRESETS = {
+    # Stock DL+DiReCT: the solve DiReCT.py would have run. Only the
+    # propagation is new. This is the default, so merging the gate changes
+    # nothing unless it is asked for.
+    'direct': dict(smoothing='plain',
+                   velocity_sigma=pc.VELOCITY_SIGMA,
+                   wm_from_surface=False),
+    # The configuration the OASIS-3 numbers in this module's PR describe:
+    # the gated kernel, a narrower velocity sigma, and the WM label taken
+    # from the white surface so the field's inner boundary coincides with
+    # the surface that rides it. The three were validated together and have
+    # not been separated, so they are offered together.
+    'anisotropic': dict(smoothing='gated',
+                        velocity_sigma=ANISOTROPIC_SIGMA,
+                        wm_from_surface=True),
+}
+
+
+def resolve_preset(preset, smoothing=None, velocity_sigma=None,
+                   wm_from_surface=None):
+    """Preset values, with any explicitly-passed argument winning.
+
+    None means "not specified", which is why the three arguments it governs
+    default to None rather than to their values: otherwise a caller could not
+    be distinguished from a caller who happened to pass the default.
+    """
+    if preset not in PRESETS:
+        raise ValueError('unknown preset %r; expected one of %s'
+                         % (preset, sorted(PRESETS)))
+    cfg = dict(PRESETS[preset])
+    if smoothing is not None:
+        cfg['smoothing'] = smoothing
+    if velocity_sigma is not None:
+        cfg['velocity_sigma'] = velocity_sigma
+    if wm_from_surface is not None:
+        cfg['wm_from_surface'] = wm_from_surface
+    return cfg
+
+
 def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=False,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
                 topology='nighres', segmentation='logits', crop=True,
                 solve_margin=solve_grid.MARGIN,
-                velocity_sigma=pc.VELOCITY_SIGMA,
+                preset='direct', velocity_sigma=None,
+                blend_beta=pc.GATE_BLEND_BETA,
                 write_white=True, stats=False, subject_id=None,
-                reuse_white=None, correct_ribbon=True, wm_from_surface=False,
+                reuse_white=None, correct_ribbon=True, wm_from_surface=None,
+                smoothing=None,
                 dtype=torch.float32, device=None):
     """Solve the field and propagate, returning the propagated surfaces.
+
+    `preset` selects one of two configurations; see PRESETS. 'direct' (the
+    DEFAULT) is the stock DL+DiReCT solve. 'anisotropic' is the benchmarked
+    one. `smoothing`, `velocity_sigma` and `wm_from_surface` default to None,
+    meaning "take the preset's value"; pass any of them to override it.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
                     label_def.csv)
@@ -337,6 +385,11 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     are open. It supplies its own white surfaces, so surf_dir /
                     surfaces / build_white are ignored -- `topology` is not, it
                     selects the correction used to build them.
+    smoothing       'gated' (DEFAULT) refuses to average the velocity field
+                    across a direction reversal; 'plain' is the isotropic
+                    Gaussian of the original DiReCT. See
+                    pial_clean.gated_velocity_smooth.
+    blend_beta      the nu/field direction blend used by the gate.
     wm_from_surface 'logits' only. False (default) solves on the segmentation
                     DiReCT would have used. True replaces the WM label with the
                     white surface's interior first, so the field's inner
@@ -359,6 +412,11 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     """
     import pandas as pd
 
+    _cfg = resolve_preset(preset, smoothing, velocity_sigma, wm_from_surface)
+    smoothing = _cfg['smoothing']
+    velocity_sigma = _cfg['velocity_sigma']
+    wm_from_surface = _cfg['wm_from_surface']
+
     if str(segmentation).lower() == 'surface-pv':
         reused = None
         if reuse_white:
@@ -379,7 +437,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                  prep_dir=prep_dir)
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
-                                    velocity_sigma=velocity_sigma,
+                                    velocity_sigma=velocity_sigma, blend_beta=blend_beta,
+                                    smoothing=smoothing,
                                     solve_margin=solve_margin, write_white=write_white,
                                     stats=stats, subject_id=subject_id,
                                     white_build=_white_build_record(nsmooth, topology, crop),
@@ -414,14 +473,17 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                    wm_from_surface=wm_from_surface)
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
-                                velocity_sigma=velocity_sigma,
+                                velocity_sigma=velocity_sigma, blend_beta=blend_beta,
+                                smoothing=smoothing,
                                 solve_margin=solve_margin, write_white=write_white,
                                 stats=stats, subject_id=subject_id)
 
 
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
-                         velocity_sigma=pc.VELOCITY_SIGMA,
+                         preset='direct', velocity_sigma=None,
+                blend_beta=pc.GATE_BLEND_BETA,
+                         smoothing='gated',
                          solve_margin=solve_grid.MARGIN,
                          write_white=True, stats=False, subject_id=None,
                          white_build=None, extra=None):
@@ -446,7 +508,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             print('solving the velocity field (%d iterations)...' % pc.MAX_ITERATIONS)
         vel_t, thick_t, _dev = pc.solve_velocity_field_t(
             seg, d['gmT'], d['wmT'], ref_img, verbose=verbose, device=device,
-            compute_thickness=compute_thickness, velocity_sigma=velocity_sigma)
+            compute_thickness=compute_thickness, velocity_sigma=velocity_sigma,
+            blend_beta=blend_beta, smoothing=smoothing)
         thickness = thick_t.squeeze().cpu().numpy() if thick_t is not None else None
         # Only leave the GPU if something actually needs the host copy.
         velocity = vel_t if (on_gpu and not out_dir) else pc.velocity_to_numpy(vel_t)
@@ -569,17 +632,34 @@ def main():
     p.add_argument('--surf-dir', help='directory holding ?h.white; omit to build them')
     p.add_argument('--build-white', action='store_true',
                    help='build the white surfaces from the segmentation in-process')
-    p.add_argument('--velocity-sigma', type=float, default=pc.VELOCITY_SIGMA,
-                   help='ANTs -b, the velocity smoothing sigma (default %.2f)'
-                        % pc.VELOCITY_SIGMA)
+    p.add_argument('--velocity-sigma', type=float, default=None,
+                   help="ANTs -b, the velocity smoothing sigma. Default: the "
+                        "preset's (%.4f for 'direct', %.2f for 'anisotropic')"
+                        % (pc.VELOCITY_SIGMA, ANISOTROPIC_SIGMA))
     p.add_argument('--segmentation', default='logits',
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')
-    p.add_argument('--wm-from-surface', action='store_true',
+    p.add_argument('--preset', default='direct', choices=sorted(PRESETS),
+                   help="'direct' (default) is the stock DL+DiReCT solve; "
+                        "'anisotropic' is the benchmarked configuration -- the "
+                        'gated kernel, velocity sigma %.2f and the WM label '
+                        'taken from the white surface. The individual flags '
+                        'below override whichever preset is chosen.'
+                        % ANISOTROPIC_SIGMA)
+    p.add_argument('--smoothing', default=None, choices=['gated', 'plain'],
+                   help="velocity-field smoothing: 'gated' refuses to "
+                        "average across a direction reversal; 'plain' is the "
+                        'isotropic Gaussian of the original DiReCT. Default: '
+                        "the preset's.")
+    p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
+                   help='nu/field direction blend for the gate (default %.2f)'
+                        % pc.GATE_BLEND_BETA)
+    p.add_argument('--wm-from-surface', action=argparse.BooleanOptionalAction,
+                   default=None,
                    help="'logits' only: replace the WM label with the white "
-                        "surface's interior before solving. Off by default, so "
-                        "the solve is the stock DL+DiReCT one.")
+                        "surface's interior before solving. Default: the "
+                        "preset's (off for 'direct', on for 'anisotropic').")
     p.add_argument('--topology', default='nighres', choices=['nighres', 'gpu', 'none'],
                    help='topology correction when building white surfaces '
                         '(default nighres)')

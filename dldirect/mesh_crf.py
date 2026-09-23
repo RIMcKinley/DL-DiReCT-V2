@@ -378,19 +378,18 @@ def icm(unary, edges, w, beta=1.0, n_iter=30, init=None, verbose=True):
 # 3. evaluation against an independent parcellation
 # ---------------------------------------------------------------------------
 
-def freesurfer_labels_on_our_mesh(case, fs_dir, hemi, our_verts, labels, names):
-    """FreeSurfer's ?h.aparc.annot resampled onto our vertices.
+def fs_vertex_map(case, fs_dir, hemi, our_verts):
+    """For each of our white vertices, the nearest FreeSurfer white vertex.
 
     Routed through scanner RAS exactly as compare_surfaces documents; the same
     conversion was checked by our white matching FreeSurfer's to a median
-    0.42 mm on this subject.
+    0.42 mm on this subject. Anything of FreeSurfer's that lives per-vertex --
+    the annotation, ?h.sulc, ?h.curv -- rides this one correspondence, so they
+    cannot disagree about which vertex is which.
     """
     from scipy import spatial
     from dldirect.compare_surfaces import tkr_to_world
     fsio = nib.freesurfer.io
-    lab, _ctab, fsnames = fsio.read_annot(
-        os.path.join(fs_dir, 'label', '%s.aparc.annot' % hemi))
-    fsnames = [n.decode() if isinstance(n, bytes) else n for n in fsnames]
     fsv, _ = fsio.read_geometry(os.path.join(fs_dir, 'surf', '%s.white' % hemi))
     ref = nib.load(os.path.join(case, 'mri', 'aparc.atlas+aseg.nii.gz'))
     fsref = nib.load(os.path.join(fs_dir, 'mri', 'orig.mgz'))
@@ -398,7 +397,33 @@ def freesurfer_labels_on_our_mesh(case, fs_dir, hemi, our_verts, labels, names):
         ref, np.loadtxt(os.path.join(case, 'mri', 'conform_vox2ras.txt')))) \
         @ tkr_to_world(fsref)
     fsv = nib.affines.apply_affine(M, np.asarray(fsv, float))
-    j = spatial.cKDTree(fsv).query(np.asarray(our_verts, float))[1]
+    return spatial.cKDTree(fsv).query(np.asarray(our_verts, float))[1]
+
+
+def fs_morph_on_our_mesh(case, fs_dir, hemi, our_verts, what='sulc', j=None):
+    """FreeSurfer's own ?h.sulc (or ?h.curv) sampled on our vertices.
+
+    This is the INDEPENDENT fundus signal. hull_depth's z-score is what the
+    CRF's edge weights are built from, so a CRF driven hard enough will raise
+    the boundary/interior gap measured in z by construction; the same gap
+    measured in FreeSurfer's sulc is not something the energy can pay for.
+    """
+    fsio = nib.freesurfer.io
+    v = fsio.read_morph_data(os.path.join(fs_dir, 'surf', '%s.%s' % (hemi, what)))
+    if j is None:
+        j = fs_vertex_map(case, fs_dir, hemi, our_verts)
+    return np.asarray(v, float)[j]
+
+
+def freesurfer_labels_on_our_mesh(case, fs_dir, hemi, our_verts, labels, names,
+                                  j=None):
+    """FreeSurfer's ?h.aparc.annot resampled onto our vertices."""
+    fsio = nib.freesurfer.io
+    lab, _ctab, fsnames = fsio.read_annot(
+        os.path.join(fs_dir, 'label', '%s.aparc.annot' % hemi))
+    fsnames = [n.decode() if isinstance(n, bytes) else n for n in fsnames]
+    if j is None:
+        j = fs_vertex_map(case, fs_dir, hemi, our_verts)
     # FreeSurfer annot index -> our integer parcel id, matched by NAME
     short = {n.replace('%s-' % hemi, ''): int(l) for n, l in zip(names, labels)}
     lut = np.full(len(fsnames), -1, np.int64)

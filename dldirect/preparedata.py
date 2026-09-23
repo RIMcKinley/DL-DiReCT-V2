@@ -95,15 +95,34 @@ if not _has_cc:
           'lateralise the white matter, as SynthSeg and SAMSEG do)')
     seg_img = output_data
 else:
-    cc_min = int(min(np.argwhere(output_data == _cc_id).T[0]))
-    cc_max = int(max(np.argwhere(output_data == _cc_id).T[0]))
+    # WHICH AXIS, AND WHICH WAY ROUND. The split plane runs through the middle
+    # of the corpus callosum's extent along the left-right axis, and each half
+    # joins the hemisphere it lies on. Both facts have to come from the affine.
+    # This used to index axis 0 and hard-code low index = Right, which is true
+    # of the LIA conform and false of a cropped grid in any other orientation:
+    # on an RAS input (axis 0 increasing toward Right) the two halves came out
+    # SWAPPED, so each hemisphere's WM fill took the far half of the callosum
+    # and the two white surfaces crossed each other in the CC's slab. On LIA
+    # this is output-identical to what it replaced.
+    _axcodes = nib.aff2axcodes(seg_image.affine)
+    _lr = [i for i, c in enumerate(_axcodes) if c in 'LR']
+    if not _lr:
+        raise ValueError('no left-right axis in the segmentation affine (axcodes %s); '
+                         'cannot split the corpus callosum' % (_axcodes,))
+    lr_axis = _lr[0]
+    low_is_right = _axcodes[lr_axis] == 'L'   # axis increases toward Left
 
-    side = np.zeros_like(output_data)
-    side[0:cc_min+int((cc_max-cc_min)/2),:,:] = 10000
+    cc_idx = np.argwhere(output_data == _cc_id).T[lr_axis]
+    cc_min, cc_max = int(cc_idx.min()), int(cc_idx.max())
+    plane = cc_min + int((cc_max - cc_min) / 2)
+
     # Upper bound was a hard-coded 255, i.e. the conformed grid's last index. On
     # the conformed grid slice 255 is zero padding so this is output-identical
     # there; on the cropped grid it would have left the last slice unassigned.
-    side[cc_min+int((cc_max-cc_min)/2):output_data.shape[0],:,:] = 5000
+    coord = np.arange(output_data.shape[lr_axis]).reshape(
+        [-1 if a == lr_axis else 1 for a in range(3)])
+    # 10000 tags the half that is on the RIGHT, 5000 the half on the LEFT
+    side = np.where((coord < plane) == low_is_right, 10000, 5000)
 
     # not every segmentation model detects WM-hypointensities as a separate
     # class (e.g. v0); only fold it into the midline mask if present

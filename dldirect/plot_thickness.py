@@ -133,12 +133,17 @@ def _ba_panel(ax, a, b, title=None):
     ax.scatter(m, d, s=20, color=BLUE, alpha=.6, edgecolors=SURF, linewidths=.4, zorder=3)
     xs = np.array([m.min(), m.max()])
     ax.plot(xs, np.polyval(np.polyfit(m, d, 1), xs), color=BLUE, lw=1.3, alpha=.55, zorder=4)
-    for y, lab, st in ((bias, 'bias %+.3f' % bias, '-'),
-                       (lo, '-1.96 SD  %+.3f' % lo, ':'),
-                       (hi, '+1.96 SD  %+.3f' % hi, ':')):
+    for y, st in ((bias, '-'), (lo, ':'), (hi, ':')):
         ax.axhline(y, color=RED, lw=1.15, ls=st, zorder=5)
-        ax.text(.012, y, lab, transform=ax.get_yaxis_transform(), ha='left',
-                va='bottom', color=RED, fontsize=8.2)
+    # The numbers go in one corner block rather than on their own lines.
+    # Labelling each line in place collides whenever the agreement band is
+    # narrow relative to the y-range -- which is most panels once --source
+    # shares a y-scale across pipelines, since the scale is then set by the
+    # WORST-agreeing column and the good ones are squeezed into a few pixels.
+    ax.text(.012, .972, 'bias %+.3f\n95%% LoA  %+.3f to %+.3f' % (bias, lo, hi),
+            transform=ax.transAxes, ha='left', va='top', color=RED,
+            fontsize=8.6, linespacing=1.45, zorder=6,
+            bbox=dict(facecolor=SURF, alpha=.78, edgecolor='none', pad=1.6))
     ax.text(.985, .035, 'trend %+.2f mm/mm' % trend, transform=ax.transAxes,
             ha='right', color=SEC, fontsize=9)
     if title:
@@ -153,7 +158,7 @@ def _ba_panel(ax, a, b, title=None):
 
 
 def bland(subjects, fs_csv, prep_root, out, out_name, metrics=METRICS, names=None,
-          sources=None, ref_label='FreeSurfer'):
+          sources=None, ref_label='FreeSurfer', note=None):
     """Bland-Altman against FreeSurfer: hemisphere means, or one row per region.
 
     `ref_label` names whatever `fs_csv` holds. It is not always FreeSurfer:
@@ -207,10 +212,13 @@ def bland(subjects, fs_csv, prep_root, out, out_name, metrics=METRICS, names=Non
     # in figure fractions, so a short figure would stack these on top of each
     # other; place them a fixed number of inches from the top instead
     H = fig.get_size_inches()[1]
+    # `note` names the arm these columns came from. Without it two figures
+    # built from different --source roots are indistinguishable once saved,
+    # which is how the wrong one gets into a slide.
     fig.text(0.006, 1 - 0.30 / H,
-             'Bland-Altman against %s, one point per subject (n = %d)'
-             % (ref_label, len(subjects)), color=INK, fontsize=15,
-             ha='left', va='top')
+             'Bland-Altman against %s, one point per subject (n = %d)%s'
+             % (ref_label, len(subjects), '' if not note else '   |   %s' % note),
+             color=INK, fontsize=15, ha='left', va='top')
     fig.text(0.006, 1 - 0.60 / H,
              'y = this pipeline - %s;  solid red = bias, dotted = 95%% limits '
              'of agreement, blue = trend of the difference' % ref_label,
@@ -265,7 +273,8 @@ def regions(subjects, fs_csv, prep_root, out, out_name, names=None,
 
 def brain(subjects, fs_csv, prep_root, out, out_name, metric='sym_nn',
           fsavg='/data/disk2/freesurfer/subjects/fsaverage6',
-          r_cmap='plasma', slope_cmap='viridis', slope_lo=0.75, slope_hi=1.25):
+          r_cmap='plasma', slope_cmap='viridis', slope_lo=0.75, slope_hi=1.25,
+          note=None):
     """r and slope per parcel on an inflated surface, four views."""
     cols, A, FS = load_comparison(subjects, metric, fs_csv, prep_root, out_name)
     stat = {}
@@ -309,13 +318,23 @@ def brain(subjects, fs_csv, prep_root, out, out_name, metric='sym_nn',
                 v[f], facecolors=facecolors(h, which, norm, cmap), linewidths=0,
                 antialiased=False, shade=True,
                 lightsource=matplotlib.colors.LightSource(azdeg=azim + 45, altdeg=35)))
-            lim = np.abs(v).max() * 0.60
-            ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-lim, lim)
+            # Per-axis limits, not a cube scaled by 0.60 of max|v|. The
+            # inflated surface needs 0.96 of that along anterior-posterior,
+            # so the cube clipped the occipital and frontal poles off every
+            # medial view. box_aspect matches the extents, so fitting the
+            # whole brain costs no distortion and fills the panel better.
+            half = np.ptp(v, axis=0) / 2.0 * 1.02
+            ax.set_xlim(-half[0], half[0])
+            ax.set_ylim(-half[1], half[1])
+            ax.set_zlim(-half[2], half[2])
             ax.view_init(elev=elev, azim=azim); ax.set_axis_off()
             try:
-                ax.set_box_aspect((1, 1, 1))
+                ax.set_box_aspect(tuple(half))
             except Exception:
                 pass
+            # Transparent, so a negative wspace overlaps neighbours without
+            # the later axis painting its background over the earlier brain.
+            ax.patch.set_alpha(0.0)
             ax.text2D(.5, .04, vlabel, transform=ax.transAxes, ha='center', va='bottom',
                       color=MUTED, fontsize=10.5)
         cax = fig.add_axes([0.950, 0.55 - ri * 0.45, 0.011, 0.28])
@@ -338,8 +357,12 @@ def brain(subjects, fs_csv, prep_root, out, out_name, metric='sym_nn',
                        color=MUTED, fontsize=8.5)
         fig.text(0.017, 0.695 - ri * 0.455, rlabel, color=INK, fontsize=12.5,
                  ha='center', va='center', rotation=90)
-    fig.text(0.012, 0.985, 'Regional agreement with FreeSurfer, per Desikan-Killiany parcel  (%s)'
-             % metric, color=INK, fontsize=15, ha='left', va='top')
+    # see bland(): without the arm name two figures from different --out-name
+    # roots are indistinguishable once saved
+    fig.text(0.012, 0.985,
+             'Regional agreement with FreeSurfer, per Desikan-Killiany parcel  (%s)%s'
+             % (metric, '' if not note else '   |   %s' % note),
+             color=INK, fontsize=15, ha='left', va='top')
     fig.text(0.012, 0.955, 'n = %d subjects - %s inflated; grey = unknown / corpus callosum '
              '(no value). r on a fixed 0-1 scale, so the metric figures are comparable'
              % (len(subjects), os.path.basename(fsavg)),
@@ -374,6 +397,9 @@ def main():
     p.add_argument('--regions', nargs='+',
                    help='regions/bland: name them instead of ranking '
                         '(bland: omit for the hemisphere mean)')
+    p.add_argument('--note', default=None,
+                   help='bland: appended to the figure title, to name which '
+                        'arm the columns came from')
     p.add_argument('--slope-lo', type=float, default=0.75)
     p.add_argument('--slope-hi', type=float, default=1.25)
     p.add_argument('--r-cmap', default='plasma')
@@ -391,14 +417,15 @@ def main():
             p.error('--source must be LABEL,PREP_ROOT,OUT_NAME,METRIC')
         out = bland(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
                     tuple(args.metrics), args.regions, sources=src,
-                    ref_label=args.ref_label)
+                    ref_label=args.ref_label,
+                    note=args.note)
     elif args.kind == 'regions':
         out = regions(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
                       args.regions, metrics=tuple(args.metrics))
     else:
         out = brain(subs, args.fs_csv, args.prep_root, args.out, args.out_name,
                     args.metric, args.fsaverage, args.r_cmap, args.slope_cmap,
-                    args.slope_lo, args.slope_hi)
+                    args.slope_lo, args.slope_hi, note=args.note)
     print('wrote', out)
     return 0
 

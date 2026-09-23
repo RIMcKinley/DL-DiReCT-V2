@@ -98,12 +98,41 @@ FreeSurfer puts on a crown, and that pulls the overall bias from +0.015 to
 19/45 and 18/45 hemispheres respectively. Coin flip. Keep it or drop it; the
 evidence does not decide.
 
-The larger signal in that table belongs to neither arm. Our per-pair border
-depths are COMPRESSED toward the mean relative to FreeSurfer's: too shallow
-where FreeSurfer's border is deep (-0.034), too deep where it is shallow
-(+0.040). The parcellation under-differentiates which borders are sulcal, by
-more than any setting here moves. `--g-scale` (0.6) is the knob that controls
-how far G may separate the two classes, and it has never been swept.
+Both arms are too shallow where FreeSurfer's border is deep (-0.034) and too
+deep where it is shallow (+0.040). An earlier version of this document read
+that sign pattern as our per-pair depths being COMPRESSED toward the mean.
+That was an inference, and the direct measurement contradicts it: the ratio
+of our per-pair SD to FreeSurfer's is 1.063 median and above 1.0 in 79% of
+hemispheres, i.e. slightly MORE dispersed, not less. What is real is the
+bias split, not a compression.
+
+## The g-scale sweep
+
+`g = clip(median_z / scale, 0, 1)`, so a small scale saturates every pair at
+g = 1 (all borders loosened at fundi, i.e. plain Potts) and a large one
+spreads them down, making more borders pay full price as a gyral border
+should. Swept at theta 2 / beta 8 over all 60 hemispheres, off the cached
+unaries -- no GPU. Medians, ~75 parcel pairs per hemisphere:
+
+| g-scale | r | MAE | bias | on FS-sulcal | on FS-crown | Dice | strays |
+|---|---|---|---|---|---|---|---|
+| 0.0 (no prior) | 0.766 | 0.1438 | +0.0146 | -0.028 | +0.054 | 0.8988 | 3 |
+| 0.6 (current)  | 0.766 | 0.1448 | +0.0042 | -0.035 | +0.042 | 0.8987 | 3 |
+| 1.5            | 0.767 | 0.1416 | -0.0009 | -0.041 | +0.042 | 0.8988 | 3 |
+| **2.0**        | 0.769 | **0.1404** | -0.0023 | -0.043 | +0.041 | 0.8987 | 3.5 |
+| 3.0            | 0.761 | 0.1426 | -0.0030 | -0.046 | +0.039 | 0.8988 | 3.5 |
+
+Paired against 0.6, g = 2.0 cuts MAE in 45/60 hemispheres and the crown bias
+in 47/60; g = 3.0 in 49/60 on both, with the correlation starting to fall.
+Correlation is flat across the whole range (31-35/60 -- noise). Dice and
+stray counts do not move at all.
+
+**Use 1.5 to 2.0** if unbiased per-pair border depth is the goal: the bias
+crosses zero there and MAE is at its minimum. But this is a 3% change in MAE,
+and the sulcal/crown trade never separates -- pushing crown borders shallower
+drags the sulcal ones shallower too. The prior RE-CENTRES the error; it does
+not sharpen the distinction between the two kinds of border. Whatever limits
+agreement with FreeSurfer at r = 0.77 is not reachable from this knob.
 
 ## The gated vote holds up
 

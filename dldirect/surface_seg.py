@@ -269,7 +269,7 @@ def build_surface_segmentation(prep_dir, hemis=('lh', 'rh'), nsmooth=None,
     topology selects the correction for the WHITE surface built here, and is
     what pial_pipeline's --topology now reaches: this function used to hardcode
     'gpu' at the build_hemisphere call, so the flag was silently inert on the
-    default `surface-pv` path.
+    `surface-pv` path (no longer the pipeline default -- see pial_pipeline).
 
     It deliberately does NOT govern the GM ribbon's correct_topology call
     below. Removal-only is the right behaviour for the GM envelope -- the

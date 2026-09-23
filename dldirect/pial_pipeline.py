@@ -249,7 +249,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 propagate_on='cuda', velocity=None, pin=True, out_dir=None,
                 verbose=True, report=None, compute_thickness=False,
                 build_white=None, nsmooth=wm_surface.NSMOOTH_DEFAULT,
-                topology='nighres', segmentation='surface-pv', crop=True,
+                topology='nighres', segmentation='logits', crop=True,
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 write_white=True, stats=False, subject_id=None,
@@ -329,16 +329,22 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     on whatever grid it was written on (4.9x fewer voxels than a
                     256^3 conform). See wm_surface.load_inputs; crop=False
                     reproduces the pre-crop behaviour.
-    segmentation    'surface-pv' (default) builds BOTH boundaries as surfaces and
+    segmentation    'logits' (DEFAULT) takes seg/gmT/wmT from the model output
+                    and reconciles the WM label against the white surface, so
+                    the GM boundary is the model's sigmoid and the WM boundary
+                    is the surface. With velocity_sigma 0.6 this is the arm
+                    benchmarked on 2653 OASIS-3 sessions; it was previously
+                    non-default and known there as `isowhite`.
+                    'surface-pv' builds BOTH boundaries as surfaces and
                     rasterises them as partial volume -- MEASURED WORSE on
                     containment at every smoothing level, see
                     surface_seg. The GM surface comes from the topology-
                     corrected ribbon, so sulci whose CSF fell below detection
                     are open. It supplies its own white surfaces, so surf_dir /
                     surfaces / build_white are ignored -- `topology` is not, it
-                    selects the correction used to build them.
-                    'logits' takes seg/gmT/wmT from the model output and
-                    reconciles the WM label against the white surface.
+                    selects the correction used to build them. NOTE reuse_white
+                    is a surface-pv-only parameter; on 'logits' the white comes
+                    from surf_dir.
     propagate_on    'cuda' keeps the field in GPU memory from solve to surface;
                     'cpu' uses the numpy reference implementation
     velocity        reuse a field instead of solving (tensor or [D,H,W,3] array)
@@ -575,7 +581,7 @@ def main():
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f; 0 = plain field gate)'
                         % pc.GATE_BLEND_BETA)
-    p.add_argument('--segmentation', default='surface-pv',
+    p.add_argument('--segmentation', default='logits',
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
                         'them; the GM surface comes from the topology-corrected ribbon')

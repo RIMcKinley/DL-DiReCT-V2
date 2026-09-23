@@ -61,7 +61,15 @@ GRADIENT_STEP = 0.025      # mm, the Euler step of the descent
 GRADIENT_GATE = 1e-3       # gradient magnitudes at or below this do not propagate
 THICKNESS_PRIOR = 10.0     # mm; ANTs' cap. Never binds here (max observed 6.1mm)
 SMOOTH_SIGMA = 1.0         # voxels, gradient + hit/total accumulation
-VELOCITY_SIGMA = 1.0       # voxels, ANTs' -b. Below 1.0 the mesh tangles steeply
+VELOCITY_SIGMA = 0.6       # voxels, ANTs' -b. See the note below.
+# 0.6, not ANTs' 1.0: this is the shipped operating point, validated on
+# 2653 OASIS-3 sessions alongside segmentation='logits' (reproducibility
+# 0.398%% global / 0.960%% ROI-average on same-session re-scans, against
+# 0.489/1.274 for the released DL+DiReCT; CDR separation d = -1.33).
+# The older comment here warned that below 1.0 "the mesh tangles steeply",
+# which still holds as a statement about mesh self-intersection -- the
+# trade was accepted on the reproducibility and atrophy benchmarks, not
+# refuted. Raise it back to 1.0 if mesh quality is what you are after.
 GATE_TRUNCATE = 2.0        # kernel radius = 2 voxels
 FIELD_EPS = 1e-3           # a velocity below this has no usable direction
 GATE_BLEND_BETA = 0.5      # the nu/field direction blend; see gated_velocity_smooth

@@ -12,7 +12,9 @@ have nothing to do with the subject:
 
 Measured by running the SAME prep three times in one process, so the work is
 identical and the only variable is warmth (RTX 6000 Ada, padded OAS30001 prep,
-surface-pv segmentation, the pipeline's default topology):
+surface-pv segmentation, the pipeline's default topology -- NOTE these
+timings predate the switch of the default to `logits`, which does not build a
+GM surface and so does not pay the 39.0 s segmentation build quoted below):
 
     run 1   55.80 s
     run 2   48.67 s
@@ -237,7 +239,7 @@ def main():
                         % pc.VELOCITY_SIGMA)
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f)' % pc.GATE_BLEND_BETA)
-    p.add_argument('--segmentation', default='surface-pv',
+    p.add_argument('--segmentation', default='logits',
                    choices=['logits', 'surface-pv'])
     # No default here ON PURPOSE. A default set in this file SHADOWS
     # reconstruct's, because it is passed explicitly -- which is exactly how

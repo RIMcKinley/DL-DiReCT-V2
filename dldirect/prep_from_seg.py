@@ -43,7 +43,8 @@ Both segmenters can emit posteriors directly (`run_samseg --save-posteriors`,
 `prob_wm.nii.gz` and the logit step is bypassed entirely. Without posteriors
 (--binary) the probabilities are the hard mask itself, 1.0 inside and 0.0
 outside -- usable, but the surface then lands on a voxel staircase rather than
-at partial volume, since under the default `segmentation='surface-pv'` these
+at partial volume, since under `segmentation='surface-pv'` (no longer the
+default, but still available) these
 probabilities are what the GM and WM isosurfaces are extracted from.
 
 GM is the max over the cortex structures and WM the max over the white matter

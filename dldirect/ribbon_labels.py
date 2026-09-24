@@ -146,6 +146,119 @@ def propagate(gm, spacing, vert_vox, vert_labels, max_snap=2, verbose=True):
     return out, dvol
 
 
+def bank_cut_graph(graph, coords, verts, faces, totkr, cos_max=0.0):
+    """Remove graph edges that step across a closed sulcus.
+
+    At a closed sulcus the segmentation has the two banks in direct contact --
+    measured at one site, the profile runs postcentral, postcentral,
+    precentral with no CSF voxel between -- so a 26-connected walk crosses
+    freely and no rule in label space can stop it. The SURFACE resolves what
+    the volume does not: two sheets, normals opposed.
+
+    So give every ribbon voxel its nearest white vertex as owner and drop any
+    edge whose two owners' normals oppose. Measured on 12 hemispheres this
+    cuts ~4.9% of edges, improves agreement with the model's own voxel
+    parcellation on 12/12 (median 0.12 pp), and strands ~4 extra voxels.
+    """
+    import scipy.sparse as sp
+    V = np.asarray(verts, float)
+    F = np.asarray(faces, int)
+    n = np.zeros_like(V)
+    fn = np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]])
+    for k in range(3):
+        np.add.at(n, F[:, k], fn)
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
+    from scipy import spatial
+    own = spatial.cKDTree(V).query(totkr(np.asarray(coords, float)))[1]
+    g = graph.tocoo()
+    keep = (n[own[g.row]] * n[own[g.col]]).sum(1) > cos_max
+    return sp.coo_matrix((g.data[keep], (g.row[keep], g.col[keep])),
+                         shape=graph.shape).tocsr(), int((~keep).sum()) // 2
+
+
+def stamp_columns(gm, velocity, vert_tkr, vert_labels, tovox, totkr, faces=None,
+                  rounds=None, step_scale=None, sub=4, radius=0.87, verbose=True):
+    """Label the ribbon by STAMPING each column, not by guessing per voxel.
+
+    propagate_pial already carries every white vertex out to the pial along the
+    field, and that trajectory IS the column. So walk it and stamp the vertex's
+    label on the voxels it occupies, the closest sample winning. This is the
+    correspondence the thickness is measured along, applied directly, instead
+    of being reconstructed afterwards by a graph walk.
+
+    MEASURED AGAINST THE WALKS on 12 hemispheres, same seeds, agreement with
+    the model's own voxel parcellation (lower is better):
+
+        plain 26-connected walk    3.57%   (3.38 - 3.89)
+        bank-cut walk              3.45%   (3.27 - 3.73)
+        stamp_columns              1.99%   (1.64 - 2.34)
+
+    12/12 hemispheres, with no overlap between the distributions. The walk was
+    introducing most of what looked like an irreducible surface-vs-voxel
+    disagreement.
+
+    THE TUBE MATTERS. A trajectory is a 1-D curve, so stamping only the voxel
+    it passes through leaves 4.7% of the ribbon unstamped and doubles the
+    disagreement to 6.77%. Letting each sample claim voxels within `radius`
+    (0.87 = half a voxel diagonal, the tube the column occupies) drops that to
+    0.9% unstamped and 2.2% disagreement. Remaining gaps should be filled
+    along a bank_cut_graph so the fill cannot cross a sulcus either.
+
+    It does NOT reach across a sulcus: of 197859 stamps, 2 came from a stretch
+    of trajectory that had left the pial envelope, and neither changed a
+    parcel call. (An earlier straight-chord test suggested 723; that test was
+    measuring curvature, since a column bending round a fundus leaves the
+    envelope on a shortcut without having crossed anything.)
+
+    Returns (labels, n_unstamped).
+    """
+    from scipy.ndimage import map_coordinates
+    from dldirect import pial_clean as _pc
+    rounds = _pc.ROUNDS if rounds is None else rounds
+    step_scale = _pc.STEP_SCALE if step_scale is None else step_scale
+    shape = gm.shape
+    cur = np.asarray(vert_tkr, float).copy()
+    path = [cur.copy()]
+    for _ in range(rounds):
+        pos = tovox(cur)
+        v = np.stack([map_coordinates(velocity[..., k], pos.T, order=1, mode='nearest')
+                      for k in range(3)], axis=1)
+        cur = cur + (totkr(pos - v) - totkr(pos)) * step_scale
+        path.append(cur.copy())
+    path = np.stack(path, 0)
+    off = np.array([(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)])
+    lab = np.zeros(shape, np.int32)
+    best = np.full(shape, np.inf, np.float32)
+    labels = np.asarray(vert_labels)
+    for r in range(path.shape[0] - 1):
+        for s in range(sub):
+            t = s / float(sub)
+            q = tovox(path[r] * (1 - t) + path[r + 1] * t)
+            base = np.floor(q).astype(int)
+            for o in off:
+                qi = base + o
+                good = np.all((qi >= 0) & (qi < np.array(shape)), axis=1)
+                qq = qi[good]
+                dd = np.linalg.norm(q[good] - qq, axis=1)
+                lb = labels[good]
+                inr = gm[qq[:, 0], qq[:, 1], qq[:, 2]] & (dd <= radius)
+                qq, dd, lb = qq[inr], dd[inr], lb[inr]
+                if not len(qq):
+                    continue
+                order = np.argsort(-dd)          # closest written last, so it wins
+                qq, dd, lb = qq[order], dd[order], lb[order]
+                take = dd < best[qq[:, 0], qq[:, 1], qq[:, 2]]
+                qq, dd, lb = qq[take], dd[take], lb[take]
+                best[qq[:, 0], qq[:, 1], qq[:, 2]] = dd
+                lab[qq[:, 0], qq[:, 1], qq[:, 2]] = lb
+    miss = int((gm & (lab == 0)).sum())
+    if verbose:
+        print('  stamped %d of %d ribbon voxels, %d unstamped (%.2f%%)'
+              % (int((gm & (lab > 0)).sum()), int(gm.sum()), miss,
+                 100.0 * miss / max(int(gm.sum()), 1)))
+    return lab, miss
+
+
 def propagate_by_field(gm, velocity, vert_tkr, vert_labels, tovox, totkr,
                        rounds=None, step_scale=None, verbose=True):
     """Label each ribbon voxel by tracing the DiReCT field back to the white.

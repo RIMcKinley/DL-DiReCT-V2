@@ -46,7 +46,7 @@ from dldirect.field_pial_prototype import gm_wm_probability_from_logits
 def run(t1_file, out_dir, subject_id=None, model='v0_f1', hemis=('lh', 'rh'),
         parcellate=True, repair_intersections=False, repair_max_move=1.0,
         save_segmentation=False, save_posteriors=False, propagate_on='cuda',
-        verbose=True, **reconstruct_kw):
+        verbose=True, loaded=None, **reconstruct_kw):
     """The whole chain for one case. Returns reconstruct's result dict."""
     from dldirect.DeepSCAN_Anatomy_Newnet_apply import segment, write_segmentation
     from dldirect import pial_pipeline
@@ -55,7 +55,9 @@ def run(t1_file, out_dir, subject_id=None, model='v0_f1', hemis=('lh', 'rh'),
     subject_id = subject_id or os.path.basename(os.path.normpath(out_dir))
 
     t0 = time.time()
-    seg = segment(t1_file, model=model, verbose=verbose)
+    # `loaded` is DeepSCAN_Anatomy_Newnet_apply.load_model()'s result: pass it
+    # in a batch so the net is loaded once, not per case
+    seg = segment(t1_file, model=model, verbose=verbose, loaded=loaded)
     t_seg = time.time() - t0
     if verbose:
         print('segmentation: %.1f s, %d classes' % (t_seg, len(seg['names'])))
@@ -116,11 +118,103 @@ def run(t1_file, out_dir, subject_id=None, model='v0_f1', hemis=('lh', 'rh'),
     return res
 
 
+def run_batch(cases, out_root=None, model='v0_f1', manifest=None, verbose=True,
+              skip_done=True, **kw):
+    """Run many cases in ONE process, which is where the warm-up is paid back.
+
+    Measured on the same subject three times, model loaded once: 92.4 s cold,
+    83.8 s and 83.9 s warm. The 8.6 s is torch.compile and cuDNN autotuning --
+    7.2 s of it in the solve, matching pial_batch's documented inductor figure
+    -- and it is fully amortised after the first case. Over 840 cases that is
+    ~2 hours. (An earlier A-then-B across DIFFERENT subjects suggested 15 s;
+    that was brain size, not warm-up. Benchmark this on one subject repeated.)
+
+    `cases` is an iterable of (t1_path, out_dir[, subject_id]) or a path to a
+    file of whitespace-separated columns of the same. A failure is isolated to
+    its case and recorded; the run continues.
+
+    `manifest` is a CSV appended per case (subject, seconds, status), which is
+    also what `skip_done` reads to resume.
+    """
+    import csv as _csv
+    import traceback
+    from dldirect.DeepSCAN_Anatomy_Newnet_apply import load_model
+
+    if isinstance(cases, str):
+        rows = []
+        with open(cases) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                rows.append(tuple(line.split()))
+        cases = rows
+    cases = [tuple(c) for c in cases]
+
+    done = set()
+    if manifest and skip_done and os.path.exists(manifest):
+        with open(manifest) as fh:
+            done = {r['subject'] for r in _csv.DictReader(fh) if r.get('status') == 'ok'}
+
+    t_load = time.time()
+    loaded = load_model(model)
+    if verbose:
+        print('model loaded in %.1f s; %d cases' % (time.time() - t_load, len(cases)),
+              flush=True)
+
+    results, failed = [], []
+    for i, case in enumerate(cases):
+        t1 = case[0]
+        out_dir = case[1] if len(case) > 1 else os.path.join(out_root or '.',
+                                                             os.path.basename(t1).split('.')[0])
+        subject = case[2] if len(case) > 2 else os.path.basename(os.path.normpath(out_dir))
+        if subject in done:
+            if verbose:
+                print('[%d/%d] %s: already done' % (i + 1, len(cases), subject), flush=True)
+            continue
+        t0 = time.time()
+        status = 'ok'
+        try:
+            run(t1, out_dir, subject_id=subject, model=model, loaded=loaded,
+                verbose=verbose, **kw)
+        except Exception as exc:                      # one bad case must not end a batch
+            status = '%s: %s' % (type(exc).__name__, exc)
+            failed.append(subject)
+            print('[%d/%d] %s FAILED: %s' % (i + 1, len(cases), subject, status),
+                  file=sys.stderr, flush=True)
+            if verbose:
+                traceback.print_exc()
+        dt = time.time() - t0
+        results.append((subject, dt, status))
+        if verbose and status == 'ok':
+            print('[%d/%d] %s: %.1f s' % (i + 1, len(cases), subject, dt), flush=True)
+        if manifest:
+            new = not os.path.exists(manifest)
+            with open(manifest, 'a', newline='') as fh:
+                w = _csv.writer(fh)
+                if new:
+                    w.writerow(['subject', 'seconds', 'status'])
+                w.writerow([subject, '%.1f' % dt, status])
+    if verbose:
+        ok = [r for r in results if r[2] == 'ok']
+        if ok:
+            times = sorted(r[1] for r in ok)
+            print('%d ok, %d failed; per case median %.1f s, first %.1f s'
+                  % (len(ok), len(failed), times[len(times) // 2], results[0][1]))
+    return results
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split('WHAT THIS')[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('t1', help='skull-stripped, cropped T1 (as crop.py writes)')
-    ap.add_argument('out_dir')
+    ap.add_argument('t1', nargs='?', help='skull-stripped, cropped T1 (as crop.py writes)')
+    ap.add_argument('out_dir', nargs='?')
+    ap.add_argument('--batch', default=None,
+                    help='file of "t1_path out_dir [subject]" lines, run in ONE '
+                         'process: the 8.6 s warm-up is then paid once, not per case')
+    ap.add_argument('--manifest', default=None,
+                    help='CSV appended per case (subject, seconds, status); also '
+                         'what --batch resumes from')
     ap.add_argument('--subject', default=None)
     ap.add_argument('--model', default='v0_f1')
     ap.add_argument('--hemi', nargs='+', default=['lh', 'rh'])
@@ -134,12 +228,19 @@ def main(argv=None):
                     help='write parcel_posterior.npz (67 MB) for the same reason')
     ap.add_argument('--propagate-on', default='cuda', choices=['cuda', 'cpu'])
     args = ap.parse_args(argv)
+    common = dict(model=args.model, hemis=tuple(args.hemi),
+                  parcellate=not args.no_parcellate,
+                  repair_intersections=args.repair_intersections,
+                  repair_max_move=args.repair_max_move,
+                  save_segmentation=args.save_segmentation,
+                  save_posteriors=args.save_posteriors,
+                  propagate_on=args.propagate_on)
+    if args.batch:
+        return run_batch(args.batch, manifest=args.manifest, **common)
+    if not args.t1 or not args.out_dir:
+        ap.error('give a t1 and out_dir, or --batch')
     run(args.t1, args.out_dir, subject_id=args.subject, model=args.model,
-        hemis=tuple(args.hemi), parcellate=not args.no_parcellate,
-        repair_intersections=args.repair_intersections,
-        repair_max_move=args.repair_max_move,
-        save_segmentation=args.save_segmentation,
-        save_posteriors=args.save_posteriors, propagate_on=args.propagate_on)
+        **{k: v for k, v in common.items() if k != 'model'})
 
 
 if __name__ == '__main__':

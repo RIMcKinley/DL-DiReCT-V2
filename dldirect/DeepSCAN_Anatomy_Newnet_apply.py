@@ -414,7 +414,34 @@ def validate_input(t1, t1_data):
         print('\nWARNING: Non-zero voxels detected in background (corners). Make sure input is brain extracted (use --bet) and background intensities are exactly 0\n')
     
 
-def segment(t1_file, model='v0_f1', lowmem=False, device=None, verbose=None):
+def load_model(model='v0_f1', device=None):
+    """Load the network once, so a batch does not reload it per case.
+
+    Returns what segment() needs: the net, the label names, label_num_ignore,
+    the FS label map and the device. Loading is ~2 s and the CUDA/cuDNN
+    warm-up behind it is larger, so a batch driver should build this once and
+    pass it to every segment() call.
+    """
+    model_file = locate_model(model)
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available()
+                              else ('mps' if hasattr(torch.backends, 'mps')
+                                    and torch.backends.mps.is_available() else 'cpu'))
+    globals()['device'] = device
+    checkpoint = load_checkpoint(model_file, device)
+    names = checkpoint['label_names']
+    unet = UNET_3D_to_2D(0, channels_in=1, channels=64, growth_rate=16,
+                         dilated_layers=[4, 4, 4, 4],
+                         output_channels=len(names)).to(device)
+    unet.load_state_dict(checkpoint['state_dict'])
+    unet.eval()
+    return dict(unet=unet, names=list(names),
+                num_ignore=int(checkpoint['label_num_ignore']),
+                labels=get_label_def(names), device=device)
+
+
+def segment(t1_file, model='v0_f1', lowmem=False, device=None, verbose=None,
+            loaded=None):
     """Run the model and return everything, writing nothing.
 
     The whole of this file used to live under `if __name__ == "__main__"`, so
@@ -431,26 +458,17 @@ def segment(t1_file, model='v0_f1', lowmem=False, device=None, verbose=None):
     global VERBOSE
     if verbose is not None:
         VERBOSE = bool(verbose)
-    model_file = locate_model(model)
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available()
-                              else ('mps' if hasattr(torch.backends, 'mps')
-                                    and torch.backends.mps.is_available() else 'cpu'))
+    if loaded is None:
+        loaded = load_model(model, device)
     # apply_to_case reads `device` as a module global -- the old __main__ block
     # set it as a side effect of running at module scope, and nothing else does
-    globals()['device'] = device
-    checkpoint = load_checkpoint(model_file, device)
-    target_label_names = checkpoint['label_names']
+    globals()['device'] = loaded['device']
+    unet = loaded['unet']
+    target_label_names = loaded['names']
     # number of last labels to ignore for the hard segmentation (argmax):
     # left-hemi, right-hemi, brain -- parents, not alternatives
-    num_ignore = checkpoint['label_num_ignore']
-    LABELS = get_label_def(target_label_names)
-
-    unet = UNET_3D_to_2D(0, channels_in=1, channels=64, growth_rate=16,
-                         dilated_layers=[4, 4, 4, 4],
-                         output_channels=len(target_label_names)).to(device)
-    unet.load_state_dict(checkpoint['state_dict'])
-    unet.eval()
+    num_ignore = loaded['num_ignore']
+    LABELS = loaded['labels']
 
     t1 = nib.load(t1_file)
     t1_data = t1.get_fdata(dtype=np.float32)

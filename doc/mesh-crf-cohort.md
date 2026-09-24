@@ -314,3 +314,78 @@ negative in 24 of 24 arm/hemisphere rows (median -0.049). These borders sit
 reliably deep and reliably LESS concave than average -- i.e. on sulcal walls,
 not on curvature ridges. "Moves boundaries into deep regions" is the claim the
 evidence supports; "moves boundaries to the fundus" is not.
+
+---
+
+# Part three: does any of it improve a measurement?
+
+Everything above is scored against FreeSurfer's parcellation, or against the
+CRF's own objective. Neither can say whether the parcellation is BETTER --
+FreeSurfer's aparc is an atlas-driven estimate with its own errors, not truth.
+
+Test-retest answers that without a reference. OASIS-3 has same-session
+re-scans: two acquisitions of the same brain minutes apart, so the true
+parcellation is identical by construction and any difference is error.
+30 pairs, 60 scans, `data/mesh-crf-reproducibility-30pairs.csv`, run with
+`scripts/mesh_crf_reproducibility.py`.
+
+## Measure AREA, not thickness
+
+Thickness varies smoothly across a border, so exchanging vertices between
+adjacent parcels swaps near-equal values. Measured on one scan: relabelling
+2.87% of vertices moved parcel AREA by 1.70% (median) and mean THICKNESS by
+0.25% -- **area responds 6.7x more** to exactly the thing being varied, and
+per parcel the gap is starker (bankssts 17.4% vs 1.6%, cuneus 6.5% vs 0.08%).
+
+The full run confirms it: eps_mu(thickness) is 1.099-1.121% for ALL SEVEN
+arms, across a 40x range of fragmentation. A thickness-only test would have
+reported "no difference" for every comparison below.
+
+## The result
+
+| arm | eps area | eps thick | strays/hemi | frag area |
+|---|---|---|---|---|
+| voxel        | 1.307% | 1.105% | 33.3 | 0.528% |
+| ribbon-raw   | 1.268% | 1.107% | 21.5 | 0.474% |
+| ribbon-clean | 1.285% | 1.110% | **0.8** | 0.230% |
+| ribbon-crf   | 1.504% | 1.121% | 7.2 | 0.286% |
+| column-raw   | **1.255%** | 1.099% | 13.0 | 0.393% |
+| column-clean | 1.283% | 1.100% | **0.8** | 0.249% |
+| column-crf   | 1.506% | 1.111% | 2.0 | 0.210% |
+
+Paired over 68 parcels, against the same unary's raw output:
+
+| | delta eps_mu | better in |
+|---|---|---|
+| ribbon: absorb islands | +0.008 pp | 27/68 |
+| ribbon: CRF | +0.117 pp | 11/68 |
+| column: absorb islands | +0.010 pp | 22/68 |
+| column: CRF | +0.148 pp | 10/68 |
+| **ribbon: CRF vs absorb** | **+0.112 pp** | **12/68** |
+| **column: CRF vs absorb** | **+0.139 pp** | **9/68** |
+
+**Island absorption dominates the CRF for contiguity.** It beats it on
+reproducibility in 56 and 59 of 68 parcels, gives better contiguity on the
+ribbon unary (0.8 vs 7.2 strays/hemisphere) and near-equal on the column
+(0.8 vs 2.0). The CRF costs ~12% of reproducibility in relative terms; the
+cleanup costs ~0.7%.
+
+That is the honest conclusion of this whole document: **for the job the CRF
+was doing here, a deterministic post-process is better.** What the CRF
+uniquely provides is moving borders into deeper tissue -- established at 60/60
+in Part one -- but no reproducibility or agreement evidence supports that as
+an improvement, and Part two showed the borders land on sulcal walls rather
+than curvature fundi.
+
+The arms were crossed deliberately (raw / clean / crf for each unary) because
+a three-arm design comparing only `voxel` against `ribbon-crf` attributed the
+whole loss to the unary, which contributes nothing either way: hard label ->
+soft posterior is +/-0.004 pp, and column -> ribbon is 0.007 pp.
+
+## Note on method
+
+Labellings are saved per scan (`repro30_labels/`, 120 MB for 60 scans). The
+expensive part of a scan is the model and its logits; every label-space
+experiment after that is seconds of work. Three restarts were burned here
+adding post-processing arms that should never have required re-running the
+chain.

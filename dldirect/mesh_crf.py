@@ -500,6 +500,78 @@ def banded_anneal(unary, edges, w, G, Wm, beta=1.0, init=None, band=3,
     return lab, int(active.sum())
 
 
+def absorb_islands(ids, Wm, vertex_area=None, max_area=50.0, max_frac=0.25):
+    """Dissolve small isolated components into their surroundings. Nothing else moves.
+
+    The minimal fix for fragmentation, and the alternative to asking the CRF for
+    it. Every vertex of a too-small component takes the label of the nearest
+    vertex OUTSIDE the island, by graph distance. A border between two
+    legitimate parcel bodies is untouched -- only vertices inside an island
+    change, which is 0.05-0.13% of cortical area.
+
+    Three reasons to prefer this to smoothing when contiguity is the goal:
+    it is deterministic (an annealer's trajectory can amplify a small input
+    difference, a BFS cannot); its effect is bounded by the island area, so it
+    cannot cost much test-retest reproducibility; and it needs none of the
+    sulcal weighting, beta, theta or G.
+
+    SIZE THRESHOLD, because not every split is an error. Measured on this data,
+    bankssts (a sulcal bank) and pericalcarine (wrapping a sulcus) split into
+    pieces of 301 and 173 vertices under BOTH unaries and in FreeSurfer's own
+    parcellation. A blanket keep-the-largest rule would merge a real second bank
+    into its neighbour. A component is absorbed only if it is both smaller than
+    `max_area` mm^2 and less than `max_frac` of its parcel's area.
+
+    vertex_area: per-vertex Voronoi area in mm^2 (one third of each incident
+    triangle). Without it the thresholds are counted in vertices instead.
+    """
+    from scipy.sparse.csgraph import connected_components
+    ids = np.asarray(ids).copy()
+    A = (Wm > 0).tocsr()
+    w = np.ones(len(ids)) if vertex_area is None else np.asarray(vertex_area, float)
+    doomed = np.zeros(len(ids), bool)
+    for pid in np.unique(ids):
+        if pid <= 1000:                       # null / non-cortical: leave alone
+            continue
+        m = ids == pid
+        if m.sum() < 2:
+            continue
+        k, cc = connected_components(A[m][:, m], directed=False)
+        if k < 2:
+            continue
+        idx = np.where(m)[0]
+        area = np.array([w[idx[cc == c]].sum() for c in range(k)])
+        keep = area.argmax()
+        for c in range(k):
+            if c == keep:
+                continue
+            if area[c] < max_area and area[c] < max_frac * area.sum():
+                doomed[idx[cc == c]] = True
+    if not doomed.any():
+        return ids, 0
+    # multi-source BFS outward from the surviving labels
+    frontier = ~doomed
+    out = ids.copy()
+    while doomed.any():
+        nb = A[doomed][:, frontier]
+        rows = np.where(doomed)[0]
+        src = np.where(frontier)[0]
+        took = 0
+        for r, row in zip(rows, range(nb.shape[0])):
+            cols = nb.indices[nb.indptr[row]:nb.indptr[row + 1]]
+            if len(cols) == 0:
+                continue
+            cand = out[src[cols]]
+            vals, counts = np.unique(cand, return_counts=True)
+            out[r] = vals[np.lexsort((vals, -counts))[0]]   # ties -> smaller id
+            doomed[r] = False
+            took += 1
+        frontier = ~doomed
+        if took == 0:                          # nothing reachable; leave as is
+            break
+    return out, int((out != ids).sum())
+
+
 def n_stray(ids, Wm, labels):
     """Connected components beyond the first, summed over parcels."""
     from scipy.sparse.csgraph import connected_components

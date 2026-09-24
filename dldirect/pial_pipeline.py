@@ -273,7 +273,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 write_white=True, stats=False, subject_id=None,
                 reuse_white=None, smoothing='gated', correct_ribbon=True,
-                dtype=torch.float32, device=None, parcellate=False):
+                dtype=torch.float32, device=None, parcellate=False,
+                repair_intersections=False, repair_max_move=1.0):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -304,6 +305,13 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     does and does not buy -- it ties the model's own voxel
                     parcellation on reproducibility rather than beating it; what
                     it buys is a ribbon that agrees with the surfaces.
+    repair_intersections
+                    slide intersecting vertices back along their own
+                    trajectories until the pial is untangled. OFF by default:
+                    it clears every crossing at repair_max_move 1.0 but costs
+                    1.1-1.9% of thickness in ventral/medial temporal parcels
+                    and 0% frontally, and adds test-retest error in the same
+                    parcels. See repair_intersections for the measurements.
     write_white     also write ?h.white beside ?h.pial when out_dir is given
                     (default). It is the mesh the propagation started from, in
                     the pial's frame; under `surface-pv` nothing else writes it.
@@ -415,6 +423,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                     smoothing=smoothing,
                                     solve_margin=solve_margin, write_white=write_white,
                                     parcellate=parcellate,
+                                    repair_intersections=repair_intersections,
+                                    repair_max_move=repair_max_move,
                                     stats=stats, subject_id=subject_id,
                                     white_build=_white_build_record(nsmooth, topology, crop),
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
@@ -451,7 +461,61 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                 smoothing=smoothing,
                                 solve_margin=solve_margin, write_white=write_white,
                                 parcellate=parcellate,
+                                repair_intersections=repair_intersections,
+                                repair_max_move=repair_max_move,
                                 stats=stats, subject_id=subject_id)
+
+
+def repair_intersections_fn(pial, faces, path, max_move=1.0, verbose=True):
+    """Untangle the pial by sliding vertices back along their own trajectories.
+
+    OFF BY DEFAULT, AND THE REASON IS MEASURED. It works: at max_move 1.0 it
+    clears every self-intersection on 12/12 hemispheres (median 5470 before,
+    0 after). But the cost is regional, not a global offset -- over 12
+    hemispheres, mean thickness by parcel:
+
+        inferiortemporal  -1.85%      postcentral        -0.22%
+        fusiform          -1.73%      transversetemporal -0.10%
+        bankssts          -1.62%      parsorbitalis      -0.00%
+        parahippocampal   -1.40%      frontalpole        -0.00%
+        entorhinal        -1.09%      median over 34     -0.44%
+
+    The gradient is anatomical: these crossings are opposing sulcal banks in
+    contact, and the ventral/medial temporal parcels sit around the collateral
+    and occipitotemporal sulci. Frontal and central cortex is untouched.
+
+    Test-retest over 10 same-session pairs says it is reproducibility-NEUTRAL
+    overall (eps_mu 1.059% -> 1.056%, better in 39/68 parcels) but WORSE in
+    exactly the biased parcels (ventral/medial temporal +0.028 pp, better in
+    4/12; lh-entorhinal +0.163, rh-parahippocampal +0.108). So it both shifts
+    and destabilises medial temporal thickness -- the measurement regions of an
+    AD cohort, which OASIS-3 is.
+
+    Use it when a downstream tool needs a surface without self-intersections
+    (meshing, registration, some volume tools). Do not use it when the
+    measurement is medial temporal thickness, and never compare repaired
+    against unrepaired data.
+
+    max_move bounds each stage in mm of travel back along the path, so total
+    displacement can reach twice it (measured median 1.68 mm at max_move 1.0).
+    Below ~0.25 the repair FAILS on this arm -- the per-vertex pullback leaves
+    dimples that are themselves crossings and the budget cannot repair them:
+    at 0.05, 5470 crossings became 8869.
+    """
+    from dldirect import field_pial_prototype as fp
+    from dldirect.field_pial_prototype import _mesh_adjacency
+    _m, Wm, deg = _mesh_adjacency(np.asarray(pial, float), np.asarray(faces))
+    before = fp._count_self_intersections(pial, faces)[0]
+    verts, s, _i = fp.retract_self_intersections(np.asarray(path, np.float64), faces,
+                                                 Wm=Wm, max_move=max_move)
+    verts, _s2, _j = fp.smooth_retraction(np.asarray(path, np.float64), s, faces,
+                                          Wm, deg, max_move=max_move)
+    after = fp._count_self_intersections(verts, faces)[0]
+    if verbose:
+        moved = np.linalg.norm(verts - np.asarray(pial, float), axis=1)
+        print('  intersecting faces %d -> %d (cap %.2f mm, moved max %.2f mm)'
+              % (before, after, max_move, float(moved.max())))
+    return verts, dict(before=int(before), after=int(after), max_move=float(max_move))
 
 
 def parcellate_ribbon(prep_dir, hemi, white, faces, path, seg_shape, tovox, totkr,
@@ -518,7 +582,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          blend_beta=pc.GATE_BLEND_BETA, smoothing='gated',
                          solve_margin=solve_grid.MARGIN,
                          write_white=True, stats=False, subject_id=None,
-                         parcellate=False,
+                         parcellate=False, repair_intersections=False,
+                         repair_max_move=1.0,
                          white_build=None, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
@@ -583,8 +648,12 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                       % (hemi, no_push.sum(), len(no_push), pin_mask.sum()))
         got = propagate(white, faces, velocity, seg, tovox, totkr, ref_img=ref_img,
                         pin_mask=pin_mask, on=propagate_on, device=device, dtype=dtype,
-                        return_path=bool(parcellate))
-        pial, path = got if parcellate else (got, None)
+                        return_path=bool(parcellate or repair_intersections))
+        pial, path = got if (parcellate or repair_intersections) else (got, None)
+        if repair_intersections:
+            pial, _rinfo = repair_intersections_fn(pial, faces, path,
+                                                   max_move=repair_max_move,
+                                                   verbose=verbose)
         if parcellate:
             if soft_seg is None:
                 print('WARNING: parcellate needs softmax_seg.nii.gz; skipping',
@@ -703,6 +772,12 @@ def main():
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f; 0 = plain field gate)'
                         % pc.GATE_BLEND_BETA)
+    p.add_argument('--repair-intersections', action='store_true',
+                   help='untangle the pial by retraction along the trajectories. '
+                        'Costs 1.1-1.9%% of thickness in ventral/medial temporal '
+                        'parcels; see repair_intersections_fn.')
+    p.add_argument('--repair-max-move', type=float, default=1.0,
+                   help='cap per stage, mm of travel back along the path (default 1.0)')
     p.add_argument('--parcellate', action='store_true',
                    help='label the ribbon: read the parcel posteriors at the ribbon '
                         'voxels for each vertex, stamp along the propagated column. '
@@ -773,7 +848,9 @@ def main():
                     stats=args.stats, subject_id=args.subject,
                     reuse_white=args.reuse_white, smoothing=args.smoothing,
                     correct_ribbon=args.correct_ribbon,
-                    parcellate=args.parcellate)
+                    parcellate=args.parcellate,
+                    repair_intersections=args.repair_intersections,
+                    repair_max_move=args.repair_max_move)
         return
 
     import time

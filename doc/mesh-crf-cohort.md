@@ -255,6 +255,24 @@ path to leave the bank. Four hemispheres, same CRF:
 hemisphere; the CRF clears ribbon islands well on three of four (79-89%) and
 badly on one (35%).
 
+### The averaging radius, and what the stray count is really counting
+
+Swept k/sigma from 4/0.5 to 40/3.0 with the null region held fixed
+(`data/mesh-crf-unary-radius-sweep.csv`). The fundus gap falls monotonically as
+the radius grows -- 2.102 -> 1.930 (lh), 2.196 -> 2.024 (rh) -- while
+post-inference stray components do not move (21 -> 19 lh, flat at 6 rh). Wider
+averaging suppresses islands BEFORE inference (37 -> 28) but those are the ones
+the CRF removes anyway. **k=4, sigma=0.5 is the default**: best gap on both
+hemispheres, same strays, half the voxels read.
+
+Inspecting the strays directly changes how the metric should be read. Only 1 of
+7 components is enclosed by a single other label (and that one by Unknown, the
+medial wall); the rest straddle a border between two parcels, median size 44
+vertices, max 301. The same parcels fragment under both unaries -- bankssts and
+pericalcarine lead both lists -- and FreeSurfer's own parcellation has 8 strays
+on this subject. Most of the count is awkward DK geometry, not labelling noise,
+so **it is a poor tiebreaker** and is over-weighted elsewhere in this document.
+
 The null rule had to be geometric, not probabilistic: vertices that the column
 nulls and a 3 mm range rule does not sit at median 1.89 mm from the nearest
 ribbon voxel, against 0.59 mm for correctly labelled ones, and a 1.5 mm cutoff

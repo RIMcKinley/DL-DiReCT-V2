@@ -311,7 +311,7 @@ def icm_pairwise(unary, edges, w, G, beta=1.0, n_iter=30, verbose=False):
 
 
 def ribbon_unary(white_tkr, parc, lo, hi, post, names, allnames, totkr,
-                 k=8, sigma=1.0, null_d=1.5, gated=True, eps=1e-6):
+                 k=4, sigma=0.5, null_d=1.5, gated=True, eps=1e-6):
     """Unary from the nearest RIBBON VOXELS, distance-weighted.
 
     The alternative to column_unary, and measurably better where it matters
@@ -346,6 +346,23 @@ def ribbon_unary(white_tkr, parc, lo, hi, post, names, allnames, totkr,
     0.003, null-vs-unknown Dice is ~0.02 worse, stray components are worse 4/4
     (dominated by one hemisphere: 20 vs 4, then 6 vs 3, 1 vs 0, 1 vs 0), and it
     runs in 31 s against 48 s.
+
+    k=4, sigma=0.5 FROM A SWEPT RADIUS, and tighter than it looks reasonable to
+    go. Swept 4/0.5 through 40/3.0 on both hemispheres of one subject with the
+    null region held fixed: the fundus gap FALLS monotonically as the radius
+    grows (2.102 -> 1.930 lh, 2.196 -> 2.024 rh) while post-inference stray
+    components do not move at all (21 -> 19 lh, flat at 6 rh). Wider averaging
+    does suppress islands BEFORE inference (37 -> 28 pre-CRF), but those are
+    exactly the ones the CRF removes anyway, so the smoothing pays in blurred
+    borders for something the inference already does.
+
+    THE STRAY COUNT IS A POOR TIEBREAKER HERE, and was over-used in earlier
+    versions of this work. Inspected directly, only 1 of 7 stray components is
+    enclosed by a single other label; the rest straddle a border between two
+    parcels, with a median size of 44 vertices and a maximum of 301. The same
+    parcels fragment under BOTH unaries and in FreeSurfer's own parcellation --
+    bankssts (a sulcal bank) and pericalcarine (wrapping a sulcus) lead both
+    lists. Most of the count is awkward DK geometry, not labelling noise.
 
     `post` is the softmax over the real classes AT THE RIBBON VOXELS -- the
     voxels of `parc` in (lo, hi) in C order -- with `allnames` its class names.

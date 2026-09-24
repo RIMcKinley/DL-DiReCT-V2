@@ -1644,7 +1644,7 @@ def build_no_push_mask(white_verts, faces, seg, soft_seg, id_map, tovox,
 # ---------------------------------------------------------------------------
 
 def smooth_retraction(traj, s, faces, Wm, deg, iters=10, lam=0.6,
-                      max_iter=40, min_s=1.0, stats=None):
+                      max_iter=40, min_s=1.0, stats=None, max_move=None):
     """Remove the dimples a per-vertex retraction leaves, WITHOUT moving any
     vertex off its own trajectory.
 
@@ -1654,6 +1654,13 @@ def smooth_retraction(traj, s, faces, Wm, deg, iters=10, lam=0.6,
     the FIELD rather than the positions fixes the shape while every vertex stays
     on the path the propagation took it along, so index correspondence with the
     white surface survives exactly.
+
+    `max_move` bounds the clean-up retractions below in mm of travel back along
+    each path, exactly as retract_self_intersections does, and SHOULD normALLY
+    BE THE SAME VALUE. Without it the cap is not a cap: measured on a sigma
+    0.65 hemisphere, retraction capped at 0.05 mm still moved vertices up to
+    1.87 mm once this stage ran, because its own retractions were floored only
+    at min_s. The parameter then does not mean what its docstring claims.
 
     The smoothed field is clamped with `np.minimum` against the current one, so
     a vertex can only ever retract FURTHER. That turns each spike into a shallow
@@ -1682,6 +1689,26 @@ def smooth_retraction(traj, s, faces, Wm, deg, iters=10, lam=0.6,
 
     verts = positions(s)
     n_after = _count_self_intersections(verts, faces)[0]
+    # The floor for the clean-up retractions below. retract_self_intersections
+    # derives its own from max_move; here there is no cap to derive one from,
+    # so min_s is it. Without this the loop raised NameError -- and only on
+    # surfaces where intersections REAPPEAR after smoothing, which is why a
+    # prototype exercised on cleaner arms never hit it.
+    floor_s = np.full(n, min_s, float)
+    if max_move is not None:
+        # arc length back along each path, matching retract_self_intersections
+        seg = np.linalg.norm(np.diff(traj, axis=0), axis=2)          # (R, n)
+        cum = np.concatenate([np.zeros((1, n)), np.cumsum(seg, 0)], 0)
+        here = np.empty(n)
+        lo = np.clip(np.floor(s).astype(int), 0, R - 1)
+        frac = s - lo
+        idx = np.arange(n)
+        here = cum[lo, idx] + frac * seg[lo, idx]
+        want = np.maximum(here - float(max_move), 0.0)
+        s_cap = np.empty(n)
+        for i in range(n):
+            s_cap[i] = np.interp(want[i], cum[:, i], np.arange(R + 1))
+        floor_s = np.maximum(floor_s, s_cap)
     extra = 0
     for _ in range(max_iter):
         sel = _self_intersecting_faces(verts, faces)

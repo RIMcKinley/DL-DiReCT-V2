@@ -153,9 +153,13 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
         pin_w = torch.from_numpy(_pin_weights(np.asarray(pin_mask), Wm, pin_feather)) \
             .to(device=device, dtype=dtype).unsqueeze(1)
 
+    # The trajectory is accumulated ON DEVICE and copied once at the end: a
+    # per-round .cpu() is a sync point in the propagation loop, and this
+    # pipeline has already paid 16.6% of a runtime to exactly that mistake in
+    # the gated smoothing. 21 x n x 3 floats is ~29 MB for a hemisphere.
     path = [] if return_path else None
     if path is not None:
-        path.append((pos @ A[:3, :3].T + A[:3, 3]).float().cpu().numpy())
+        path.append(pos @ A[:3, :3].T + A[:3, 3])
     for rnd in range(rounds):
         pos = pos - _sample_trilinear(field, pos) * step_scale
         iters = relax_iters if rnd < rounds - 1 else relax_iters_final
@@ -166,11 +170,12 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
         if pin_w is not None:
             pos = pin_w * start + (1.0 - pin_w) * pos
         if path is not None:
-            path.append((pos @ A[:3, :3].T + A[:3, 3]).float().cpu().numpy())
+            path.append(pos @ A[:3, :3].T + A[:3, 3])
 
     out = pos @ A[:3, :3].T + A[:3, 3]
     if path is not None:
-        return out.double().cpu().numpy(), np.stack(path, 0)
+        return (out.double().cpu().numpy(),
+                torch.stack(path, 0).float().cpu().numpy())
     return out.double().cpu().numpy()
 
 

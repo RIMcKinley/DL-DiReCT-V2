@@ -151,3 +151,148 @@ on one subject. Over 30:
 and also carries the most stray components (27 / 16). That pattern is
 case-level, not method-level, and it should go through the segmentation QC
 channels rather than be treated as a CRF result.
+
+---
+
+# Part two: the solver, the coupling, and where the unary comes from
+
+Everything above tunes the smoothness term. This part measures the three
+things that turned out to matter more, and records four ideas that failed.
+
+## ICM is a poor optimiser of this energy
+
+Annealing from ICM's own solution finds **3.92% lower energy on 10 of 10
+hemispheres** (range 3.50-4.48%). The gap ICM leaves is larger than the gap it
+closes from the unary. The reason is structural: shifting a border segment
+needs a coordinated move whose intermediate states are uphill, and ICM only
+takes moves that are downhill immediately.
+
+The scale of the block is measurable. At beta 8, the pairwise term opposes a
+single-vertex flip at a border by ~32 units, against a unary margin of ~0.4 --
+a factor of 80. The unary at borders IS soft (margin 0.400 there against 2.046
+cortex-wide); it is simply outvoted.
+
+What the lower energy buys is modest and should not be oversold: median
+agreement with FreeSurfer moved **-0.0005** (better in 4/10) and strays 3 -> 2
+(better in 6/10, worse in 1/10). Rows in `data/mesh-crf-annealing-10.csv`.
+
+Two practical findings came with it, both in `mesh_crf.banded_anneal`:
+
+* **The interior cannot move.** Of the vertices a full anneal relabelled, 100%
+  lay within 3 hops of a border (median 0, p99 1, max 2) and 12% outside their
+  parcel's main component. Restricting to that set touches 28% of the mesh,
+  runs 3.3x faster, and reached a LOWER energy than annealing everything.
+* **ICM is not needed first.** Annealing from the unary argmax reaches the same
+  energy to within 0.13% and saves 30% of the runtime.
+
+## The sulcal weight and the model's uncertainty are unrelated fields
+
+The CRF can only act where the unary is soft AND the weights are loose. Those
+two conditions turn out to be nearly independent:
+
+| inside the active band | median over 6 hemispheres |
+|---|---|
+| AUC, hull-depth z predicting where the unary is soft | 0.487 |
+| AUC, curvature predicting it | 0.512 |
+| lift of (soft AND sulcal) over chance | 0.95 |
+
+Cortex-wide the lift looks like 1.24, but that is an artefact of the frozen
+interior; conditioned on being near a border, depth carries no information
+about whether the model is undecided there. This is not a defect -- the weight
+encodes "a border is cheap here because this is a fundus", and was never meant
+to track uncertainty, which already enters through the unary margin on the
+other side of the same inequality. Adding softness to the weight as well would
+count it twice.
+
+But it does explain the day's flat sweeps: every knob on the smoothness term
+adjusts the 32 by a few percent, on the wrong side of a factor of 80.
+
+## beta, swept below 1 for the first time
+
+| beta vs 8 | median change in the fundus gap | better in |
+|---|---|---|
+| 0.125 | -0.0770 | 0/6 |
+| 0.25 | -0.0327 | 2/6 |
+| 0.5 | -0.0255 | 2/6 |
+| 1.0 | +0.0504 | 4/6 |
+| 2.0 | +0.0036 | 3/6 |
+
+reach/margin tracks beta linearly (1.0 at beta 0.125, 67 at beta 8), so beta is
+the direct lever on that factor of 80 -- and pulling it down to parity does NOT
+let the unary place borders better: beta below 0.5 is worst on the gap in all
+six and worst on fragmentation where fragmentation exists. beta 1 is the best
+cell (4/6, and strays 2 vs 3.5) but the per-hemisphere winner is inconsistent
+(1, 8, 1, 8, 1, 2) and agreement moves 0.002 across a 64-fold change.
+`data/mesh-crf-beta-sweep.csv`.
+
+NOTE a confound in that table: a fixed temperature schedule anneals a beta
+0.125 energy far hotter than a beta 8 one, since the cost gaps scale with beta.
+`banded_anneal` now scales temperature by the arm's own median cost gap.
+
+## Where the unary comes from matters more than any of it
+
+`column_unary` walks white -> pial and samples along the chord. That chord
+leaves the vertex's own bank for **2.6-2.9% of cortical vertices** at depth
+0.5, rising to 6-10% near the pial. Integrating the DiReCT field instead does
+NOT fix it (2.72% vs 2.64%, worse toward the pial): where the banks merge in
+the segmentation, no path can stay on one side. The field's gated smoothing
+refuses to AVERAGE across banks, which is not the same as a trajectory staying
+on one.
+
+`mesh_crf.ribbon_unary` removes the failure mode instead of mitigating it: read
+the k nearest ribbon voxels, which sit a median 0.60 mm away, so there is no
+path to leave the bank. Four hemispheres, same CRF:
+
+| | ribbon vs column |
+|---|---|
+| fundus gap (FreeSurfer sulc, independent) | better **4/4** (+0.29, +0.14, +0.09, +0.06) |
+| agreement with aparc | worse 3/4, all <= 0.003 |
+| null vs FreeSurfer unknown | worse 4/4, by ~0.02 |
+| stray components | worse 4/4 (20/4, 6/3, 1/0, 1/0) |
+| runtime | **faster 4/4** (31 s vs 48 s median) |
+
+`data/mesh-crf-unary-comparison.csv`. The fragmentation is dominated by one
+hemisphere; the CRF clears ribbon islands well on three of four (79-89%) and
+badly on one (35%).
+
+The null rule had to be geometric, not probabilistic: vertices that the column
+nulls and a 3 mm range rule does not sit at median 1.89 mm from the nearest
+ribbon voxel, against 0.59 mm for correctly labelled ones, and a 1.5 mm cutoff
+separates them almost perfectly (1582 of 2165 caught, 3 of 145899 lost).
+Cortical MASS does not separate them at all.
+
+## Cost, and why nearly all of it is avoidable
+
+Measured per case, both hemispheres, on top of a ~69 s pipeline:
+
+| stage | s |
+|---|---|
+| writing 94 logit volumes | 21.4 |
+| sampling them back | 33.4 |
+| mesh adjacency | 2.8 |
+| rasterize pial + hull EDT | 6.6 |
+| geodesic z-score | 0.4 |
+| edge weights + prior + inference | 12.1 |
+| ribbon propagation | 5.7 |
+
+Two thirds is moving logits through 389 MB of gzipped NIfTI. Computed inside
+the pipeline while the model's output is still in memory -- ~190 MB holds the
+posterior at every ribbon voxel -- the realistic cost is **~25 s/case**, and the
+mesh adjacency is already built by `propagate_pial`.
+
+## Failed ideas, recorded so they are not retried
+
+* **A finer depth signal.** z at 10 geodesic smoothing iterations loses to z at
+  50 on 4/4 hemispheres, and moves FEWER vertices. Coarser is better here.
+* **Curvature as the weight.** Worst single signal (0/4), and in the band its
+  AUC for softness is 0.512 -- no information. Combining it with z by max or
+  mean wins on one hemisphere each and loses elsewhere; the per-hemisphere
+  winner is different every time and the whole spread is ~2%.
+* **Field-trajectory sampling.** See above: no better than the chord.
+* **Lowering beta to balance the terms.** See above: 0/6.
+
+One robust oddity, unexplained: the fundus gap measured in CURVATURE is
+negative in 24 of 24 arm/hemisphere rows (median -0.049). These borders sit
+reliably deep and reliably LESS concave than average -- i.e. on sulcal walls,
+not on curvature ridges. "Moves boundaries into deep regions" is the claim the
+evidence supports; "moves boundaries to the fundus" is not.

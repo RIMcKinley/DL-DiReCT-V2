@@ -310,6 +310,179 @@ def icm_pairwise(unary, edges, w, G, beta=1.0, n_iter=30, verbose=False):
     return best, best_e
 
 
+def ribbon_unary(white_tkr, parc, lo, hi, post, names, allnames, totkr,
+                 k=8, sigma=1.0, null_d=1.5, gated=True, eps=1e-6):
+    """Unary from the nearest RIBBON VOXELS, distance-weighted.
+
+    The alternative to column_unary, and measurably better where it matters
+    most. column_unary walks white -> pial and samples along the way, and that
+    chord can leave the vertex's own bank: measured on four hemispheres, 2.6-2.9%
+    of cortical vertices have their depth-0.5 sample taken in a DIFFERENT parcel
+    than the vertex sits in, rising to 6-10% near the pial. Integrating the
+    DiReCT field instead of the chord does NOT fix it (2.72% vs 2.64%, and worse
+    toward the pial) -- where the banks merge in the segmentation, no path can
+    stay on one side.
+
+    Reading the nearest ribbon voxels instead removes the failure mode rather
+    than mitigating it: the nearest one sits a median 0.60 mm away, so there is
+    no path to leave the bank at all. It is also defined on every vertex, where
+    the column question is well posed for only ~45% of them (a white vertex
+    frequently sits on a voxel the parcellation calls white matter).
+
+    NULL AND AVERAGING ARE SEPARATE RADII, deliberately. null_d is a property of
+    the VERTEX (no ribbon voxel near it at all -> medial wall); sigma/k set how
+    much the posterior is smoothed. Conflating them, as a single cutoff does,
+    makes the null region move whenever the smoothing is retuned.
+
+    null_d = 1.5 mm from measurement, not taste: vertices that column_unary nulls
+    and a 3 mm rule does not sit at median 1.89 mm from the nearest ribbon voxel,
+    while correctly labelled vertices sit at 0.59 mm (p95 0.86). A 1.5 mm cutoff
+    nulls 1582 of those 2165 and 3 of 145899 correctly labelled ones. Cortical
+    MASS does not separate them at all (0 of 2165 below 0.10), so the rule has to
+    be geometric.
+
+    Measured against column_unary on four hemispheres, same CRF: the independent
+    fundus gap (FreeSurfer's sulc) is better 4/4, agreement with aparc is within
+    0.003, null-vs-unknown Dice is ~0.02 worse, stray components are worse 4/4
+    (dominated by one hemisphere: 20 vs 4, then 6 vs 3, 1 vs 0, 1 vs 0), and it
+    runs in 31 s against 48 s.
+
+    `post` is the softmax over the real classes AT THE RIBBON VOXELS -- the
+    voxels of `parc` in (lo, hi) in C order -- with `allnames` its class names.
+    Passing it in rather than reading volumes is the point: computed inside the
+    pipeline while the model's output is still in memory, this costs seconds,
+    and ~190 MB holds every ribbon voxel's posterior.
+    """
+    from scipy import spatial
+    gm = (parc > lo) & (parc < hi)
+    coords = np.array(np.nonzero(gm)).T
+    if len(coords) != len(post):
+        raise ValueError('post has %d rows for %d ribbon voxels'
+                         % (len(post), len(coords)))
+    cidx = [allnames.index(n) for n in names]
+    Pc = post[:, cidx]
+    voter = np.isin(post.argmax(1), np.asarray(cidx))
+    tree = spatial.cKDTree(totkr(coords.astype(float)))
+    V = np.asarray(white_tkr, float)
+    dn, _jn = tree.query(V)                       # nearest: the NULL test
+    d, j = tree.query(V, k=k)
+    w = np.exp(-(d ** 2) / (2.0 * sigma ** 2))
+    if gated:
+        # a voxel votes only if its own argmax is a parcel of this hemisphere.
+        # NOTE this is close to inert when the ribbon is taken from the
+        # parcellation itself, since such a voxel is cortical by construction;
+        # it earns its keep only if the ribbon comes from the tissue labels.
+        w = w * voter[j]
+    num = (Pc[j] * w[:, :, None]).sum(1)
+    den = w.sum(1)
+    prob = num / np.maximum(den, 1e-12)[:, None]
+    prob /= np.maximum(prob.sum(1, keepdims=True), 1e-12)
+    isnull = (dn > null_d) | (den <= 0)
+    prob = np.concatenate([prob, isnull.astype(prob.dtype)[:, None]], axis=1)
+    prob[isnull, :-1] = 0.0
+    prob /= np.maximum(prob.sum(1, keepdims=True), 1e-12)
+    return (-np.log(prob + eps)).astype(np.float32), prob.astype(np.float32)
+
+
+def _graph_colouring(A):
+    """Greedy colouring; vertices of one colour share no edge, so they can be
+    resampled simultaneously and exactly."""
+    deg = np.asarray(A.sum(1)).ravel()
+    colour = np.full(A.shape[0], -1, np.int32)
+    rows = A.tolil().rows
+    for v in np.argsort(-deg):
+        used = {colour[j] for j in rows[v] if colour[j] >= 0}
+        c = 0
+        while c in used:
+            c += 1
+        colour[v] = c
+    return [np.where(colour == c)[0] for c in range(colour.max() + 1)]
+
+
+def banded_anneal(unary, edges, w, G, Wm, beta=1.0, init=None, band=3,
+                  sweeps=120, t0=1.5, t1=0.02, seed=0):
+    """Annealing restricted to the borders and the pockets. Use this, not icm.
+
+    ICM IS A POOR OPTIMISER OF THIS ENERGY, measured: annealing from its own
+    solution finds 3.92% lower energy on 10 of 10 hemispheres (range 3.50-4.48%),
+    and the gap it leaves is LARGER than the gap it closes from the unary. The
+    reason is structural -- shifting a border segment needs a coordinated move
+    whose intermediate states are uphill, and ICM only takes moves that are
+    downhill now. At beta 8 the pairwise term opposes a single-vertex flip at a
+    border by ~32 units against a unary margin of ~0.4, so essentially every
+    single-vertex move is blocked.
+
+    What the lower energy buys downstream is modest and should not be oversold:
+    over those 10 hemispheres the median agreement with FreeSurfer moved -0.0005
+    (better in 4/10) and stray components 3 -> 2 (better in 6/10, worse in 1).
+
+    BANDED, because the interior cannot move: of the vertices a full anneal
+    relabelled, 100% lay within 3 hops of a border (median 0, p99 1, max 2) and
+    12% outside their parcel's main component. Restricting to that set touches
+    28% of the mesh, runs 3.3x faster, and reached a LOWER energy than annealing
+    everything (-7676 vs -7431 on the hemisphere tested).
+
+    Init defaults to the unary argmax: ICM first is not needed -- it reaches the
+    same energy to within 0.13% and costs 30% of the runtime.
+
+    Temperature is scaled by the arm's own median cost gap, so a change of beta
+    does not silently change how hot the anneal is.
+    """
+    unary = np.asarray(unary, np.float64)
+    n, L = unary.shape
+    u = 1.0 - np.asarray(w, float)
+    rows = np.concatenate([edges[:, 0], edges[:, 1]])
+    cols = np.concatenate([edges[:, 1], edges[:, 0]])
+    U = sp.csr_matrix((np.concatenate([u, u]), (rows, cols)), shape=(n, n))
+    A = sp.csr_matrix((np.ones(2 * len(edges)), (rows, cols)), shape=(n, n))
+    ncount = np.asarray(A.sum(1)).ravel()
+    G = np.asarray(G, np.float64)
+    lab = unary.argmin(1) if init is None else np.asarray(init).copy()
+
+    def cost(state, sel):
+        onehot = sp.csr_matrix((np.ones(n), (np.arange(n), state)), shape=(n, L))
+        C = np.asarray((A[sel] @ onehot).todense())
+        Sm = np.asarray((U[sel] @ onehot).todense())
+        return unary[sel] + beta * ((ncount[sel][:, None] - C) - (Sm @ G.T))
+
+    from scipy.sparse.csgraph import dijkstra, connected_components
+    bnd = np.unique(edges[lab[edges[:, 0]] != lab[edges[:, 1]]].ravel())
+    hop = dijkstra(A, directed=False, indices=bnd, unweighted=True, min_only=True)
+    in_main = np.ones(n, bool)
+    for p in np.unique(lab):
+        m = lab == p
+        if m.sum() < 2:
+            continue
+        k, cc = connected_components(Wm[m][:, m], directed=False)
+        if k > 1:
+            idx = np.where(m)[0]
+            in_main[idx[cc != np.bincount(cc).argmax()]] = False
+    active = (hop <= band) | (~in_main)
+    classes = [c[active[c]] for c in _graph_colouring(A)]
+    classes = [c for c in classes if len(c)]
+
+    gaps = np.sort(cost(lab, np.arange(n)), axis=1)
+    scale = max(float(np.median(gaps[:, 1] - gaps[:, 0])), 1e-6)
+    rng = np.random.default_rng(seed)
+    for s in range(sweeps):
+        T = scale * t0 * (t1 / t0) ** (s / max(sweeps - 1, 1))
+        for c in classes:
+            q = cost(lab, c)
+            q -= q.min(1, keepdims=True)
+            p = np.exp(-q / T)
+            p /= p.sum(1, keepdims=True)
+            lab[c] = (np.cumsum(p, 1) < rng.random(len(c))[:, None]).sum(1).clip(0, L - 1)
+    for _ in range(15):                            # quench to a local minimum
+        changed = 0
+        for c in classes:
+            new = cost(lab, c).argmin(1)
+            changed += int((new != lab[c]).sum())
+            lab[c] = new
+        if changed == 0:
+            break
+    return lab, int(active.sum())
+
+
 def n_stray(ids, Wm, labels):
     """Connected components beyond the first, summed over parcels."""
     from scipy.sparse.csgraph import connected_components

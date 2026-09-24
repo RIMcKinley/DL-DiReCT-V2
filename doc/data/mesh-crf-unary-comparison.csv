@@ -1,0 +1,9 @@
+hemisphere,unary,null_pct,null_dice,gap_sulc,strays_pre,strays_post,agree,seconds
+OAS30625_ses-d0033.lh,column,5.04,0.9594,1.8106,23,4,0.8748,48
+OAS30625_ses-d0033.lh,ribbon-gated,4.66,0.9399,2.0997,31,20,0.8754,31
+OAS30625_ses-d0033.rh,column,4.90,0.9590,2.0207,25,3,0.8976,49
+OAS30625_ses-d0033.rh,ribbon-gated,4.66,0.9456,2.1626,28,6,0.8960,31
+OAS30001_ses-d0129_run-01.lh,column,5.86,0.9530,1.4436,7,0,0.9032,32
+OAS30001_ses-d0129_run-01.lh,ribbon-gated,5.56,0.9289,1.5371,9,1,0.9022,22
+OAS30001_ses-d0129_run-01.rh,column,5.55,0.9095,1.5687,3,0,0.9168,32
+OAS30001_ses-d0129_run-01.rh,ribbon-gated,5.27,0.8841,1.6326,4,1,0.9140,27

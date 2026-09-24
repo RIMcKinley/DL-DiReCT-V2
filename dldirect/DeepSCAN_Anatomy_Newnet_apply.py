@@ -414,75 +414,120 @@ def validate_input(t1, t1_data):
         print('\nWARNING: Non-zero voxels detected in background (corners). Make sure input is brain extracted (use --bet) and background intensities are exactly 0\n')
     
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='DeepSCAN: Deep learning based anatomy segmentation and cortex parcellation')
-    parser.add_argument("--model", required=False, default='v0_f1')
-    parser.add_argument("--lowmem", required=False, default=False)
-    parser.add_argument("T1w")
-    parser.add_argument("destination_dir")
-    parser.add_argument("subject_id")
-    
-    args = parser.parse_args()
-    t1_file = args.T1w
-    output_dir = args.destination_dir
-    model_file = locate_model(args.model)
-    subject_id = args.subject_id
-    
-    if not os.path.exists(t1_file):
-        print('T1w file {} not found'.format(t1_file))
-        sys.exit(1)
-        
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu'))
+def segment(t1_file, model='v0_f1', lowmem=False, device=None, verbose=None):
+    """Run the model and return everything, writing nothing.
+
+    The whole of this file used to live under `if __name__ == "__main__"`, so
+    the only way to reach the logits was to copy it -- which is exactly what
+    the parcellation experiments did. Factored out so the segmentation can be
+    a step in a process rather than a process: its output feeds the surfaces
+    and the parcellation directly, which is worth ~55 s and 389 MB per case
+    (see parcel_posterior).
+
+    Returns a dict with the raw `logit` [C, D, H, W], the label `names`, the
+    FS-labelled `softmax_seg`, `brain_tissue`, per-class `volumes`, the
+    `labels` name->id map, `num_ignore`, and the input `affine` / `image`.
+    """
+    global VERBOSE
+    if verbose is not None:
+        VERBOSE = bool(verbose)
+    model_file = locate_model(model)
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available()
+                              else ('mps' if hasattr(torch.backends, 'mps')
+                                    and torch.backends.mps.is_available() else 'cpu'))
+    # apply_to_case reads `device` as a module global -- the old __main__ block
+    # set it as a side effect of running at module scope, and nothing else does
+    globals()['device'] = device
     checkpoint = load_checkpoint(model_file, device)
     target_label_names = checkpoint['label_names']
-    # number of last labels to ignore for hard segmentation (argmax), e.g. left-hemi, right-hemi, brain
-    NUM_IGNORE_LABELS = checkpoint['label_num_ignore']
+    # number of last labels to ignore for the hard segmentation (argmax):
+    # left-hemi, right-hemi, brain -- parents, not alternatives
+    num_ignore = checkpoint['label_num_ignore']
     LABELS = get_label_def(target_label_names)
-    
-    unet = UNET_3D_to_2D(0,channels_in=1,channels=64, growth_rate=16, dilated_layers=[4,4,4,4], output_channels=len(target_label_names)).to(device)
+
+    unet = UNET_3D_to_2D(0, channels_in=1, channels=64, growth_rate=16,
+                         dilated_layers=[4, 4, 4, 4],
+                         output_channels=len(target_label_names)).to(device)
     unet.load_state_dict(checkpoint['state_dict'])
     unet.eval()
 
     t1 = nib.load(t1_file)
     t1_data = t1.get_fdata(dtype=np.float32)
     validate_input(t1, t1_data)
-    
-    # apply model
-    with torch.set_grad_enabled(False):
-        logit = apply_to_case(unet, volumes = [t1_data], batch_size=BATCH_SIZE, stack_depth = stack_depth, axes=[0,1,2], lowmem=args.lowmem)
 
+    with torch.set_grad_enabled(False):
+        logit = apply_to_case(unet, volumes=[t1_data], batch_size=BATCH_SIZE,
+                              stack_depth=stack_depth, axes=[0, 1, 2], lowmem=lowmem)
     print('DONE predicting') if VERBOSE else False
-    
+
     brain_tissue = logit[-1] > 0
-    logit_sm = np.concatenate([logit[:-NUM_IGNORE_LABELS]], axis = 0)
+    logit_sm = np.concatenate([logit[:-num_ignore]], axis=0)
     segmentation_sm = np.argmax(logit_sm, axis=0) + 1
     segmentation_sm_masked = segmentation_sm * brain_tissue
-    segmentation_stacked  = np.stack([segmentation_sm_masked == x for x in range(1, len(target_label_names)-NUM_IGNORE_LABELS+1)], axis=0)
-    
-    volumes = np.sum(segmentation_stacked, axis=(1,2,3))
-    
-    # re-label with FS labels
-    segmentation_sm_fslabels = np.zeros_like(segmentation_sm_masked)
-    for idx in range(1, len(target_label_names)):
-        segmentation_sm_fslabels[segmentation_sm_masked == idx] = LABELS[target_label_names[idx-1]]
-    
-    affine = t1.affine
-    nib.save(nib.Nifti1Image(segmentation_sm_fslabels.astype(np.int32), affine), '{}/softmax_seg.nii.gz'.format(output_dir))
-    
-    # save individual logits for each class
-    for idx, x in enumerate(target_label_names):
-        lbl_name = target_label_names[idx]
-        if not SAVE_LOGITS_FILTER or lbl_name in SAVE_LOGITS_FILTER:
-            nib.save(nib.Nifti1Image(logit[idx, :, :, :].astype(np.float32), affine), '{}/seg_{}.nii.gz'.format(output_dir, lbl_name))
+    stacked = np.stack([segmentation_sm_masked == x
+                        for x in range(1, len(target_label_names) - num_ignore + 1)], axis=0)
+    volumes = np.sum(stacked, axis=(1, 2, 3))
 
+    fslabels = np.zeros_like(segmentation_sm_masked)
+    for idx in range(1, len(target_label_names)):
+        fslabels[segmentation_sm_masked == idx] = LABELS[target_label_names[idx - 1]]
+
+    return dict(logit=logit, names=list(target_label_names), num_ignore=int(num_ignore),
+                labels=LABELS, softmax_seg=fslabels, brain_tissue=brain_tissue,
+                volumes=volumes, affine=t1.affine, image=t1)
+
+
+def write_segmentation(res, output_dir, subject_id, save_logits=None):
+    """The writing half, unchanged in behaviour.
+
+    `save_logits`: None keeps the module-level SAVE_LOGITS_FILTER, a list
+    overrides it, and [] writes no logits at all. Passing the full list is
+    what the parcellation needs and what previously required a copy of this
+    file with the constant edited.
+    """
+    names = res['names']
+    filt = SAVE_LOGITS_FILTER if save_logits is None else save_logits
+    affine = res['affine']
+    nib.save(nib.Nifti1Image(res['softmax_seg'].astype(np.int32), affine),
+             '{}/softmax_seg.nii.gz'.format(output_dir))
+    for idx, lbl_name in enumerate(names):
+        if not filt or lbl_name in filt:
+            nib.save(nib.Nifti1Image(res['logit'][idx, :, :, :].astype(np.float32), affine),
+                     '{}/seg_{}.nii.gz'.format(output_dir, lbl_name))
+    n_keep = len(names) - res['num_ignore']
     with open('{}/result-vol.csv'.format(output_dir), 'w') as file:
         writer = csv.writer(file, delimiter=',')
-        writer.writerow(['SUBJECT'] + ['{}'.format(target_label_names[idx]) for idx in range(0, len(target_label_names)-NUM_IGNORE_LABELS)])
-        writer.writerow([subject_id] + ['{}'.format(i) for i in volumes])
-        
-    # write label definitions
-    pd.DataFrame([[LABELS[lbl], lbl] for lbl in LABELS], columns=['ID', 'LABEL']).to_csv('{}/label_def.csv'.format(output_dir), sep=',', index=False)
+        writer.writerow(['SUBJECT'] + ['{}'.format(names[idx]) for idx in range(0, n_keep)])
+        writer.writerow([subject_id] + ['{}'.format(i) for i in res['volumes']])
+    LABELS = res['labels']
+    pd.DataFrame([[LABELS[lbl], lbl] for lbl in LABELS],
+                 columns=['ID', 'LABEL']).to_csv('{}/label_def.csv'.format(output_dir),
+                                                 sep=',', index=False)
 
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='DeepSCAN: Deep learning based anatomy segmentation and cortex parcellation')
+    parser.add_argument("--model", required=False, default='v0_f1')
+    parser.add_argument("--lowmem", required=False, default=False)
+    parser.add_argument("--save-logits", default=None,
+                        help="'all' writes every class (the parcellation needs this); "
+                             "'none' writes none; default keeps SAVE_LOGITS_FILTER")
+    parser.add_argument("T1w")
+    parser.add_argument("destination_dir")
+    parser.add_argument("subject_id")
+
+    args = parser.parse_args()
+    if not os.path.exists(args.T1w):
+        print('T1w file {} not found'.format(args.T1w))
+        sys.exit(1)
+    if not os.path.exists(args.destination_dir):
+        os.makedirs(args.destination_dir)
+
+    res = segment(args.T1w, model=args.model, lowmem=args.lowmem)
+    keep = None
+    if args.save_logits == 'all':
+        keep = list(res['names'])
+    elif args.save_logits == 'none':
+        keep = []
+    write_segmentation(res, args.destination_dir, args.subject_id, save_logits=keep)

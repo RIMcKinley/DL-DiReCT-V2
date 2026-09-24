@@ -146,6 +146,60 @@ def propagate(gm, spacing, vert_vox, vert_labels, max_snap=2, verbose=True):
     return out, dvol
 
 
+def label_ribbon(gm, path, vert_labels, tovox, totkr, verts, faces, spacing,
+                 radius=0.87, sub=4, verbose=True):
+    """The whole ribbon parcellation, from a propagation that kept its path.
+
+    Stamp each column's tube, then fill whatever no column reached along a
+    bank_cut_graph, so neither the stamp nor the fill can step across a closed
+    sulcus. This is the labelling the surfaces imply: same vertex
+    correspondence as the thickness, by construction.
+
+    Measured against carrying the same vertex labels with a graph walk --
+    12 hemispheres, disagreement with the model's own voxel parcellation:
+
+        plain 26-connected walk   3.57%
+        bank-cut walk             3.45%
+        stamping (this)           1.99%      12/12, distributions disjoint
+
+    and on 30 same-session re-scan pairs, per-parcel ribbon volume eps_mu:
+
+        bank-cut walk   1.498%
+        stamping        1.401%      better in 56/68 parcels
+        the model's own voxel parcellation, unaltered:   1.381%
+
+    READ THAT LAST LINE BEFORE CLAIMING AN IMPROVEMENT. Stamping ties the
+    do-nothing baseline (+0.008 pp, 25/68) and the walk loses to it (+0.066 pp,
+    15/68). The case for propagating at all is that the ribbon then AGREES
+    WITH THE SURFACES -- same columns, contiguous, no bank crossing -- not that
+    it measures volumes better. Before this, the only propagation available
+    made the volumes measurably worse.
+
+    Returns (labels, n_unstamped, n_edges_cut).
+    """
+    lab, miss = stamp_columns(gm, None, None, vert_labels, tovox, totkr,
+                              sub=sub, radius=radius, verbose=verbose, path=path)
+    graph, idx, coords = _ribbon_graph(gm, spacing)
+    cut_graph, n_cut = bank_cut_graph(graph, coords, verts, faces, totkr)
+    if miss:
+        from scipy.sparse.csgraph import dijkstra
+        here = lab[coords[:, 0], coords[:, 1], coords[:, 2]]
+        src = np.where(here > 0)[0]
+        if len(src):
+            _d, _p, reached = dijkstra(cut_graph, directed=False, indices=src,
+                                       min_only=True, return_predecessors=True)
+            look = np.full(cut_graph.shape[0], -1, np.int64)
+            look[src] = here[src]
+            fill = np.where(reached >= 0, look[np.clip(reached, 0, None)], 0)
+            gap = here == 0
+            lab[coords[gap, 0], coords[gap, 1], coords[gap, 2]] = np.maximum(fill[gap], 0)
+    if verbose:
+        left = int((gm & (lab == 0)).sum())
+        print('  ribbon parcellation: %d cut edges, %d voxels still unlabelled'
+              % (n_cut, left))
+    return lab, miss, n_cut
+
+
 def bank_cut_graph(graph, coords, verts, faces, totkr, cos_max=0.0):
     """Remove graph edges that step across a closed sulcus.
 
@@ -177,7 +231,8 @@ def bank_cut_graph(graph, coords, verts, faces, totkr, cos_max=0.0):
 
 
 def stamp_columns(gm, velocity, vert_tkr, vert_labels, tovox, totkr, faces=None,
-                  rounds=None, step_scale=None, sub=4, radius=0.87, verbose=True):
+                  rounds=None, step_scale=None, sub=4, radius=0.87, verbose=True,
+                  path=None):
     """Label the ribbon by STAMPING each column, not by guessing per voxel.
 
     propagate_pial already carries every white vertex out to the pial along the
@@ -210,22 +265,34 @@ def stamp_columns(gm, velocity, vert_tkr, vert_labels, tovox, totkr, faces=None,
     measuring curvature, since a column bending round a fundus leaves the
     envelope on a shortcut without having crossed anything.)
 
+    PASS `path` WHEN THE PIPELINE ALREADY HAS IT. propagate_pial(...,
+    return_path=True) returns the trajectory it actually flew, relaxation and
+    pinning included; re-integrating the bare field here would stamp a
+    slightly different column than the one the pial and the thickness came
+    from. With `path` given, `velocity` is unused.
+
     Returns (labels, n_unstamped).
     """
     from scipy.ndimage import map_coordinates
     from dldirect import pial_clean as _pc
-    rounds = _pc.ROUNDS if rounds is None else rounds
-    step_scale = _pc.STEP_SCALE if step_scale is None else step_scale
     shape = gm.shape
-    cur = np.asarray(vert_tkr, float).copy()
-    path = [cur.copy()]
-    for _ in range(rounds):
-        pos = tovox(cur)
-        v = np.stack([map_coordinates(velocity[..., k], pos.T, order=1, mode='nearest')
-                      for k in range(3)], axis=1)
-        cur = cur + (totkr(pos - v) - totkr(pos)) * step_scale
-        path.append(cur.copy())
-    path = np.stack(path, 0)
+    if path is None:
+        rounds = _pc.ROUNDS if rounds is None else rounds
+        step_scale = _pc.STEP_SCALE if step_scale is None else step_scale
+        cur = np.asarray(vert_tkr, float).copy()
+        acc = [cur.copy()]
+        for _ in range(rounds):
+            pos = tovox(cur)
+            v = np.stack([map_coordinates(velocity[..., k], pos.T, order=1, mode='nearest')
+                          for k in range(3)], axis=1)
+            cur = cur + (totkr(pos - v) - totkr(pos)) * step_scale
+            acc.append(cur.copy())
+        path = np.stack(acc, 0)
+    else:
+        path = np.asarray(path, float)
+        if path.ndim != 3 or path.shape[1] != len(np.asarray(vert_labels)):
+            raise ValueError('path must be [rounds+1, n_vertices, 3] matching '
+                             'vert_labels, got %s' % (tuple(path.shape),))
     off = np.array([(a, b, c) for a in (0, 1) for b in (0, 1) for c in (0, 1)])
     lab = np.zeros(shape, np.int32)
     best = np.full(shape, np.inf, np.float32)

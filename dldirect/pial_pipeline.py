@@ -109,7 +109,8 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
                          rounds=pc.ROUNDS, step_scale=pc.STEP_SCALE,
                          relax_iters=pc.RELAX_ITERS,
                          relax_iters_final=pc.RELAX_ITERS_FINAL,
-                         relax_lambda=pc.RELAX_LAMBDA, pin_feather=pc.PIN_FEATHER):
+                         relax_lambda=pc.RELAX_LAMBDA, pin_feather=pc.PIN_FEATHER,
+                         return_path=False):
     """Carry a surface along the velocity field, entirely on the GPU.
 
     `velocity` is either the [1, 3, D, H, W] tensor solve_velocity_field_t
@@ -117,7 +118,11 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
     uploaded once. `tovox_affine` / `totkr_affine` are the 4x4 matrices, not the
     callables -- the loop needs the linear block, not a host round-trip.
 
-    Returns the propagated vertices as a float64 numpy array in tkrRAS.
+    Returns the propagated vertices as a float64 numpy array in tkrRAS, and
+    with return_path also the trajectory [rounds+1, n, 3] in tkrRAS -- the
+    column each vertex swept, for ribbon_labels.stamp_columns. It is built by
+    moving each round's positions back to tkrRAS on the device and copying
+    once, so the loop itself is untouched.
     """
     if device is None:
         device = velocity.device if torch.is_tensor(velocity) else \
@@ -148,6 +153,9 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
         pin_w = torch.from_numpy(_pin_weights(np.asarray(pin_mask), Wm, pin_feather)) \
             .to(device=device, dtype=dtype).unsqueeze(1)
 
+    path = [] if return_path else None
+    if path is not None:
+        path.append((pos @ A[:3, :3].T + A[:3, 3]).float().cpu().numpy())
     for rnd in range(rounds):
         pos = pos - _sample_trilinear(field, pos) * step_scale
         iters = relax_iters if rnd < rounds - 1 else relax_iters_final
@@ -157,8 +165,12 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
             pos = pos + mu * (neighbour_mean - pos)
         if pin_w is not None:
             pos = pin_w * start + (1.0 - pin_w) * pos
+        if path is not None:
+            path.append((pos @ A[:3, :3].T + A[:3, 3]).float().cpu().numpy())
 
     out = pos @ A[:3, :3].T + A[:3, 3]
+    if path is not None:
+        return out.double().cpu().numpy(), np.stack(path, 0)
     return out.double().cpu().numpy()
 
 
@@ -166,7 +178,8 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
 # dispatcher
 # ---------------------------------------------------------------------------
 def propagate(white_verts, faces, velocity, seg, tovox, totkr, ref_img=None,
-              pin_mask=None, on='cuda', device=None, dtype=torch.float32):
+              pin_mask=None, on='cuda', device=None, dtype=torch.float32,
+              return_path=False):
     """Propagate on 'cpu' (numpy reference) or 'cuda' (field resident on GPU).
 
     On the CPU path `velocity` must be, or be convertible to, the [D, H, W, 3]
@@ -182,12 +195,13 @@ def propagate(white_verts, faces, velocity, seg, tovox, totkr, ref_img=None,
         if torch.is_tensor(velocity):
             velocity = pc.velocity_to_numpy(velocity)
         return pc.propagate_pial(white_verts, faces, velocity, seg, tovox, totkr,
-                                 pin_mask=pin_mask)
+                                 pin_mask=pin_mask, return_path=return_path)
     if ref_img is None:
         raise ValueError('the cuda path needs ref_img for the vox2ras_tkr affine')
     A = get_vox2ras_tkr(ref_img)
     return propagate_pial_torch(white_verts, faces, velocity, np.linalg.inv(A), A,
-                                pin_mask=pin_mask, device=device, dtype=dtype)
+                                pin_mask=pin_mask, device=device, dtype=dtype,
+                                return_path=return_path)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +268,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
                 write_white=True, stats=False, subject_id=None,
                 reuse_white=None, smoothing='gated', correct_ribbon=True,
-                dtype=torch.float32, device=None):
+                dtype=torch.float32, device=None, parcellate=False):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -275,6 +289,16 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                     routes: under `surface-pv` it is forwarded to
                     surface_seg.build_surface_segmentation, which used to
                     hardcode 'gpu' and so ignored this flag entirely.
+    parcellate      also label the ribbon: read the model's parcel posteriors
+                    at the ribbon voxels for each white vertex, then stamp that
+                    label along the column the propagation actually flew. Needs
+                    the prep to carry per-parcel seg_<Label>.nii.gz, which a
+                    stock DeepSCAN apply does not write (it keeps the tissue
+                    classes only). Writes ribbon_parc.nii.gz and ?h.parc.labels
+                    into out_dir. See ribbon_labels.label_ribbon for what this
+                    does and does not buy -- it ties the model's own voxel
+                    parcellation on reproducibility rather than beating it; what
+                    it buys is a ribbon that agrees with the surfaces.
     write_white     also write ?h.white beside ?h.pial when out_dir is given
                     (default). It is the mesh the propagation started from, in
                     the pial's frame; under `surface-pv` nothing else writes it.
@@ -385,6 +409,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                     smoothing=smoothing,
                                     solve_margin=solve_margin, write_white=write_white,
+                                    parcellate=parcellate,
                                     stats=stats, subject_id=subject_id,
                                     white_build=_white_build_record(nsmooth, topology, crop),
                                     extra=dict(gm_surfaces=sd['gm_surfaces'],
@@ -420,7 +445,66 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                 smoothing=smoothing,
                                 solve_margin=solve_margin, write_white=write_white,
+                                parcellate=parcellate,
                                 stats=stats, subject_id=subject_id)
+
+
+def parcellate_ribbon(prep_dir, hemi, white, faces, path, seg_shape, tovox, totkr,
+                      spacing, softmax_seg, id_map, verbose=True, posterior=None):
+    """Vertex labels from the model's parcel posteriors, stamped through the ribbon.
+
+    The two halves the pipeline already had but never joined: the model knows
+    which parcel each ribbon voxel belongs to, and the propagation knows which
+    column each vertex swept. Reading the first at the nearest ribbon voxels
+    gives a vertex labelling that cannot cross a sulcal bank (the voxels sit a
+    median 0.60 mm away, so there is no path to leave the bank), and stamping
+    it along the second gives a ribbon parcellation that agrees with the
+    surfaces by construction.
+
+    `posterior` is a parcel_posterior.CorticalPosterior carried from the
+    segmentation -- 83 MB of float16 for both hemispheres, against 941 MB for
+    the full volume or 389 MB written and read back through disk, which is two
+    thirds of the whole cost. Without it the posteriors are rebuilt from
+    prep_dir, which works and is slow.
+
+    Returns (vertex_labels, ribbon_volume, parcel_ids, parcel_names).
+    """
+    from dldirect.mesh_crf import META_CLASSES, ribbon_unary
+    from dldirect.ribbon_labels import label_ribbon
+    from dldirect import regional_stats as rs
+    import glob
+    lut, valid, _c = rs.get_labels()
+    names = [k for k in valid if k.startswith('%s-' % hemi) and lut[k] > 1000]
+    ids = np.array([lut[k] for k in names])
+    want = set(int(lut[k]) for k in names)
+    gm = np.isin(softmax_seg, list(want))
+    if not gm.any():
+        raise ValueError('no %s cortical voxels in softmax_seg; is label_def the '
+                         'parcellated one?' % hemi)
+    coords = np.array(np.nonzero(gm)).T
+    if posterior is None:
+        from dldirect.parcel_posterior import CorticalPosterior
+        posterior = CorticalPosterior.from_dir(prep_dir)
+    missing = [n for n in names if n not in posterior.names]
+    if missing:
+        raise ValueError('the posterior has no parcel %s (a stock DeepSCAN apply '
+                         'writes the tissue classes only)' % missing[:3])
+    # parcels of this hemisphere, then everything else in one column: the
+    # layout ribbon_unary reads, with the null mass preserved
+    post = posterior.rows_for(coords, names)
+    allnames = list(names) + ['__other__']
+    lo, hi = (1000, 1036) if hemi == 'lh' else (2000, 2036)
+    parc_like = np.zeros(seg_shape, np.int32)
+    parc_like[gm] = softmax_seg[gm]
+    unary, _prob = ribbon_unary(white, parc_like, lo, hi, post, names, allnames, totkr)
+    labels = np.concatenate([ids, [0]])[unary.argmin(1)]
+    ok = labels > 0
+    vol, _miss, _cut = label_ribbon(gm, path[:, ok, :], labels[ok], tovox, totkr,
+                                    white, faces, spacing, verbose=verbose)
+    if verbose:
+        print('%s: %d/%d vertices labelled, %d ribbon voxels parcellated'
+              % (hemi, int(ok.sum()), len(labels), int((vol > 0).sum())))
+    return labels, vol, ids, names
 
 
 def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
@@ -429,6 +513,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          blend_beta=pc.GATE_BLEND_BETA, smoothing='gated',
                          solve_margin=solve_grid.MARGIN,
                          write_white=True, stats=False, subject_id=None,
+                         parcellate=False,
                          white_build=None, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
@@ -480,6 +565,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                   'not be pinned and will be dragged outward.', file=sys.stderr)
 
     out = {}
+    parc_out = {}
     for hemi in hemis:
         white, faces = d['surfaces'][hemi]
         pin_mask = None
@@ -490,8 +576,20 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             if verbose:
                 print('%s: %d/%d vertices with no cortex to move into, %d pinned'
                       % (hemi, no_push.sum(), len(no_push), pin_mask.sum()))
-        pial = propagate(white, faces, velocity, seg, tovox, totkr, ref_img=ref_img,
-                         pin_mask=pin_mask, on=propagate_on, device=device, dtype=dtype)
+        got = propagate(white, faces, velocity, seg, tovox, totkr, ref_img=ref_img,
+                        pin_mask=pin_mask, on=propagate_on, device=device, dtype=dtype,
+                        return_path=bool(parcellate))
+        pial, path = got if parcellate else (got, None)
+        if parcellate:
+            if soft_seg is None:
+                print('WARNING: parcellate needs softmax_seg.nii.gz; skipping',
+                      file=sys.stderr)
+            else:
+                spacing = tuple(float(z) for z in ref_img.header.get_zooms()[:3])
+                vlab, rvol, _ids, _nm = parcellate_ribbon(
+                    prep_dir, hemi, white, faces, path, seg.shape, tovox, totkr,
+                    spacing, soft_seg, id_map, verbose=verbose)
+                parc_out[hemi] = (vlab, rvol)
         if sub is not None:
             pial = sub.to_parent(pial)
         out[hemi] = (pial, faces)
@@ -500,6 +598,12 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             nib.freesurfer.io.write_geometry(os.path.join(out_dir, '%s.pial' % hemi),
                                              pial, faces, create_stamp=None,
                                              volume_info=vinfo)
+            if hemi in parc_out:
+                # per-vertex parcel ids in FreeSurfer's numbering. A plain
+                # array, not an .annot: the colour table lives in a recon-all
+                # directory this pipeline does not require.
+                np.save(os.path.join(out_dir, '%s.parc.labels.npy' % hemi),
+                        parc_out[hemi][0])
             if write_white:
                 # The surface the propagation STARTED from, in the same frame as
                 # the pial beside it (outer, i.e. before solve_grid.tighten).
@@ -560,9 +664,22 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                hemis=tuple(out), sd=outer,
                                pials={h: out[h][0] for h in out},
                                velocity=vel_np, verbose=verbose)
+    if out_dir and parc_out:
+        total = None
+        for _h, (_vl, rvol) in parc_out.items():
+            total = rvol.copy() if total is None else np.where(rvol > 0, rvol, total)
+        img = nib.Nifti1Image(total.astype(np.int16), outer['ref_img'].affine,
+                              outer['ref_img'].header)
+        img.header.set_data_dtype(np.int16)
+        nib.save(img, os.path.join(out_dir, 'ribbon_parc.nii.gz'))
+        if verbose:
+            print('wrote ribbon_parc.nii.gz (%d labelled voxels)' % int((total > 0).sum()))
+
     res = dict(surfaces=out, white=outer['surfaces'], velocity=velocity,
                thickness=thickness, seg=outer['seg'], ref_img=outer['ref_img'],
                tovox=outer['tovox'], totkr=outer['totkr'])
+    if parc_out:
+        res['parcellation'] = parc_out
     if extra:
         res.update(extra)
     return res
@@ -581,6 +698,10 @@ def main():
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f; 0 = plain field gate)'
                         % pc.GATE_BLEND_BETA)
+    p.add_argument('--parcellate', action='store_true',
+                   help='label the ribbon: read the parcel posteriors at the ribbon '
+                        'voxels for each vertex, stamp along the propagated column. '
+                        'Needs per-parcel seg_<Label>.nii.gz in the prep.')
     p.add_argument('--segmentation', default='logits',
                    choices=['logits', 'surface-pv'],
                    help='surface-pv builds both boundaries as surfaces and rasterises '
@@ -646,7 +767,8 @@ def main():
                     write_white=not args.no_white,
                     stats=args.stats, subject_id=args.subject,
                     reuse_white=args.reuse_white, smoothing=args.smoothing,
-                    correct_ribbon=args.correct_ribbon)
+                    correct_ribbon=args.correct_ribbon,
+                    parcellate=args.parcellate)
         return
 
     import time

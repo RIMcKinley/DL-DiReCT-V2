@@ -341,13 +341,20 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
                  if cortical_thickness is not None else None)
 
 
-def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=None):
+def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=None,
+                   return_path=False):
     """Carry the white surface along the velocity field.
 
     DiReCT's velocity points GM->WM, so the outward direction is its negative.
     The field is sampled AT the vertex (the old out-of-WM offset was a
     workaround for the dead WM shell and made a vertex step on a field half a
     millimetre from where it is).
+
+    return_path also returns the TRAJECTORY, [ROUNDS+1, n, 3] in tkrRAS: the
+    path each vertex took, which IS its cortical column. ribbon_labels.
+    stamp_columns turns that into a ribbon parcellation without re-integrating
+    anything, and it is the real path including relaxation, not a pure-field
+    reconstruction of it. Costs ~38 MB for a 150k-vertex hemisphere.
     """
     mesh, Wm, deg = _mesh_adjacency(white_verts, faces)
     from scipy.ndimage import distance_transform_edt
@@ -361,6 +368,7 @@ def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=Non
         if (pin_mask is not None and pin_mask.any()) else None
     start = np.asarray(white_verts).copy()
     cur = white_verts
+    path = [np.asarray(cur, np.float32).copy()] if return_path else None
     for rnd in range(ROUNDS):
         pos = tovox(cur)
         v = np.stack([map_coordinates(velocity[..., k], pos.T, order=1, mode='nearest')
@@ -372,6 +380,10 @@ def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=Non
                                       cache=cache)
         if pin_w is not None:
             cur = pin_w * start + (1.0 - pin_w) * cur
+        if path is not None:
+            path.append(np.asarray(cur, np.float32).copy())
+    if path is not None:
+        return cur, np.stack(path, 0)
     return cur
 
 

@@ -387,7 +387,7 @@ def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=Non
     return cur
 
 
-def prepare(prep_dir, surf_dir=None, hemis=('lh', 'rh'), surfaces=None):
+def prepare(prep_dir, surf_dir=None, hemis=('lh', 'rh'), surfaces=None, tissue=None):
     """seg/gmT/wmT reconciled against the white surfaces, plus the transforms.
 
     `surfaces` optionally supplies {hemi: (verts, faces)} already in the cropped
@@ -396,7 +396,14 @@ def prepare(prep_dir, surf_dir=None, hemis=('lh', 'rh'), surfaces=None):
     surfaces, so a one-hemisphere call would demote the other hemisphere's WM.
     """
     import pandas as pd
-    gm_prob, wm_prob, ref_img = load_gm_wm_probability(prep_dir)
+    # `tissue` is (gm_prob, wm_prob, ref_img) already in memory -- what
+    # field_pial_prototype.gm_wm_probability_from_logits returns straight from
+    # the model, so the 94 logit volumes never touch disk. Verified identical
+    # to the on-disk collapse (max|diff| 0).
+    if tissue is not None:
+        gm_prob, wm_prob, ref_img = tissue
+    else:
+        gm_prob, wm_prob, ref_img = load_gm_wm_probability(prep_dir)
     seg, gmT, wmT = build_seg_maps(gm_prob, wm_prob)
     tovox, totkr = make_transforms(ref_img)
     shape = tuple(ref_img.shape[:3])

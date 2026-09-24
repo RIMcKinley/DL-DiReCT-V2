@@ -274,7 +274,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 write_white=True, stats=False, subject_id=None,
                 reuse_white=None, smoothing='gated', correct_ribbon=True,
                 dtype=torch.float32, device=None, parcellate=False,
-                repair_intersections=False, repair_max_move=1.0):
+                repair_intersections=False, repair_max_move=1.0,
+                tissue=None, parcel_posterior=None):
     """Solve the field and propagate, returning the propagated surfaces.
 
     prep_dir        a --space cropped prep (seg_<Label>.nii.gz, softmax_seg.nii.gz,
@@ -454,7 +455,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                                    crop=crop)
         surf_dir = None
 
-    d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces)
+    d = pc.prepare(prep_dir, surf_dir, hemis=tuple(hemis), surfaces=surfaces,
+                   tissue=tissue)
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
@@ -463,6 +465,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                 parcellate=parcellate,
                                 repair_intersections=repair_intersections,
                                 repair_max_move=repair_max_move,
+                                parcel_posterior=parcel_posterior,
                                 stats=stats, subject_id=subject_id)
 
 
@@ -519,7 +522,8 @@ def repair_intersections_fn(pial, faces, path, max_move=1.0, verbose=True):
 
 
 def parcellate_ribbon(prep_dir, hemi, white, faces, path, seg_shape, tovox, totkr,
-                      spacing, softmax_seg, id_map, verbose=True, posterior=None):
+                      spacing, softmax_seg, id_map, verbose=True, posterior=None,
+                      sub=None):
     """Vertex labels from the model's parcel posteriors, stamped through the ribbon.
 
     The two halves the pipeline already had but never joined: the model knows
@@ -560,7 +564,13 @@ def parcellate_ribbon(prep_dir, hemi, white, faces, path, seg_shape, tovox, totk
                          'writes the tissue classes only)' % missing[:3])
     # parcels of this hemisphere, then everything else in one column: the
     # layout ribbon_unary reads, with the null mass preserved
-    post = posterior.rows_for(coords, names)
+    # THE POSTERIOR LIVES ON THE MODEL'S GRID, these coords on the solve grid.
+    # solve_grid.tighten crops to the ribbon before the solve, so the two
+    # differ by sub.lo. Without the shift every lookup misses and rows_for
+    # returns "nothing cortical here": measured, 34% of vertices came back
+    # null against the 5.3% the geometry actually implies.
+    look = coords if sub is None else coords + np.asarray(sub.lo, int)
+    post = posterior.rows_for(look, names)
     allnames = list(names) + ['__other__']
     lo, hi = (1000, 1036) if hemi == 'lh' else (2000, 2036)
     parc_like = np.zeros(seg_shape, np.int32)
@@ -583,7 +593,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          solve_margin=solve_grid.MARGIN,
                          write_white=True, stats=False, subject_id=None,
                          parcellate=False, repair_intersections=False,
-                         repair_max_move=1.0,
+                         repair_max_move=1.0, parcel_posterior=None,
                          white_build=None, extra=None):
     """Shared tail: solve the field, propagate each hemisphere, report."""
     import pandas as pd
@@ -662,7 +672,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                 spacing = tuple(float(z) for z in ref_img.header.get_zooms()[:3])
                 vlab, rvol, _ids, _nm = parcellate_ribbon(
                     prep_dir, hemi, white, faces, path, seg.shape, tovox, totkr,
-                    spacing, soft_seg, id_map, verbose=verbose)
+                    spacing, soft_seg, id_map, verbose=verbose,
+                    posterior=parcel_posterior, sub=sub)
                 parc_out[hemi] = (vlab, rvol)
         if sub is not None:
             pial = sub.to_parent(pial)
@@ -742,6 +753,12 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
         total = None
         for _h, (_vl, rvol) in parc_out.items():
             total = rvol.copy() if total is None else np.where(rvol > 0, rvol, total)
+        # The parcellation is built on the SOLVE grid (solve_grid.tighten crops
+        # to the ribbon), so it must be put back on the parent grid before it
+        # is written with the parent's affine -- otherwise the header describes
+        # a different volume than the data, silently.
+        if sub is not None:
+            total = sub.restore(total)
         img = nib.Nifti1Image(total.astype(np.int16), outer['ref_img'].affine,
                               outer['ref_img'].header)
         img.header.set_data_dtype(np.int16)

@@ -328,6 +328,36 @@ def load_gm_wm_probability(prep_dir, gm_labels=None, wm_labels=None):
     return gm_prob.astype(np.float32), wm_prob.astype(np.float32), ref_img
 
 
+def gm_wm_probability_from_logits(logit, names, affine, gm_labels=None,
+                                  wm_labels=None):
+    """The same collapse as load_gm_wm_probability, from logits in memory.
+
+    Exists so the surface stage can be fed by
+    DeepSCAN_Anatomy_Newnet_apply.segment() without the logits going to disk
+    and back -- 389 MB and ~55 s a case. Kept beside the disk version and
+    written to mirror it line for line, because the two must not drift: the
+    max over the cortex labels, expit, and the `logit == 0` guard that keeps
+    untouched background at probability 0 rather than 0.5.
+    """
+    if gm_labels is None:
+        gm_labels = ['Left-Cerebral-Cortex', 'Right-Cerebral-Cortex']
+    if wm_labels is None:
+        wm_labels = ['Left-Cerebral-White-Matter', 'Right-Cerebral-White-Matter']
+        if 'WM-hypointensities' in names:
+            wm_labels = wm_labels + ['WM-hypointensities']
+    idx = {n: k for k, n in enumerate(names)}
+    missing = [l for l in list(gm_labels) + list(wm_labels) if l not in idx]
+    if missing:
+        raise ValueError('the model output has no class %s' % missing)
+    a = np.asarray(logit)
+    gm_logit = np.max(np.stack([a[idx[l]] for l in gm_labels]), axis=0)
+    wm_logit = np.max(np.stack([a[idx[l]] for l in wm_labels]), axis=0)
+    gm_prob = np.where(gm_logit == 0, 0, ss.expit(gm_logit))
+    wm_prob = np.where(wm_logit == 0, 0, ss.expit(wm_logit))
+    ref_img = nib.Nifti1Image(np.asarray(a[idx[gm_labels[0]]], np.float32), affine)
+    return gm_prob.astype(np.float32), wm_prob.astype(np.float32), ref_img
+
+
 def close_tissue_probs(gm_prob, wm_prob, radius, thr=0.5):
     """Morphologically CLOSE the GM+WM mask and relabel what the closing adds
     as grey matter. A sensitivity test, not a pipeline step.

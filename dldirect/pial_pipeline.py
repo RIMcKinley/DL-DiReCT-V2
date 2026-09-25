@@ -271,6 +271,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 topology='nighres', segmentation='logits', crop=True,
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
+                reorient_alpha=None,
                 write_white=True, stats=False, subject_id=None,
                 reuse_white=None, smoothing='gated', correct_ribbon=True,
                 dtype=torch.float32, device=None, parcellate=False,
@@ -421,7 +422,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
-                                    smoothing=smoothing,
+                                    smoothing=smoothing, reorient_alpha=reorient_alpha,
                                     solve_margin=solve_margin, write_white=write_white,
                                     parcellate=parcellate,
                                     repair_intersections=repair_intersections,
@@ -460,7 +461,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
     return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                 verbose, report, compute_thickness, dtype, device,
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
-                                smoothing=smoothing,
+                                smoothing=smoothing, reorient_alpha=reorient_alpha,
                                 solve_margin=solve_margin, write_white=write_white,
                                 parcellate=parcellate,
                                 repair_intersections=repair_intersections,
@@ -590,6 +591,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
                          velocity_sigma=pc.VELOCITY_SIGMA,
                          blend_beta=pc.GATE_BLEND_BETA, smoothing='gated',
+                         reorient_alpha=None,
                          solve_margin=solve_grid.MARGIN,
                          write_white=True, stats=False, subject_id=None,
                          parcellate=False, repair_intersections=False,
@@ -617,7 +619,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
         vel_t, thick_t, _dev = pc.solve_velocity_field_t(
             seg, d['gmT'], d['wmT'], ref_img, verbose=verbose, device=device,
             compute_thickness=compute_thickness, velocity_sigma=velocity_sigma,
-            blend_beta=blend_beta, smoothing=smoothing)
+            blend_beta=blend_beta, smoothing=smoothing,
+            reorient_alpha=reorient_alpha)
         thickness = thick_t.squeeze().cpu().numpy() if thick_t is not None else None
         # Only leave the GPU if something actually needs the host copy.
         velocity = vel_t if (on_gpu and not out_dir) else pc.velocity_to_numpy(vel_t)
@@ -786,6 +789,8 @@ def main():
     p.add_argument('--velocity-sigma', type=float, default=pc.VELOCITY_SIGMA,
                    help='ANTs -b, the velocity smoothing sigma (default %.2f)'
                         % pc.VELOCITY_SIGMA)
+    p.add_argument('--reorient-alpha', type=float, default=None,
+                   help='rotate the velocity toward -nu by this fraction before every\n                         smoothing step (0.5 = the bisector; None = off)')
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
                    help='nu/field direction blend (default %.2f; 0 = plain field gate)'
                         % pc.GATE_BLEND_BETA)
@@ -860,6 +865,7 @@ def main():
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
                     blend_beta=args.blend_beta,
+                    reorient_alpha=args.reorient_alpha,
                     solve_margin=None if args.solve_margin < 0 else args.solve_margin,
                     write_white=not args.no_white,
                     stats=args.stats, subject_id=args.subject,
@@ -880,6 +886,7 @@ def main():
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
                     blend_beta=args.blend_beta,
+                    reorient_alpha=args.reorient_alpha,
                     solve_margin=None if args.solve_margin < 0 else args.solve_margin)
     for hemi in args.hemi:
         white, faces = r['white'][hemi]

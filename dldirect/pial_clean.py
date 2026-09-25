@@ -114,6 +114,80 @@ def wm_normal_field(seg, device):
     return torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
 
 
+def lagrangian_nu(nu, inverse, identity, eps=0.5):
+    """nu carried back to each voxel's ORIGIN instead of read where it sits.
+
+    The Eulerian nu -- the normalised gradient of the WM signed distance --
+    is degenerate exactly where the gate matters most. On the medial axis of a
+    sulcal gap two banks are equidistant, the distance function creases, and a
+    centred difference averages two opposing unit vectors: |grad| collapses
+    toward 0 and the direction is decided by rounding. Measured on one case,
+    16.8% of GM voxels have |grad| < 0.8.
+
+    The degeneracy is an artefact of demanding ONE vector per voxel. A voxel in
+    the middle of a sulcal gap has two answers because two banks own it -- so
+    index the geometry by where the flow CAME FROM rather than by position.
+    `inverse` is the solve's own map back toward WM, so
+
+        nu_lag(x) = nu(x + inverse(x))
+
+    reads the WM normal at the origin of whatever is sitting at x. Voxels
+    arriving at the gap midline from opposite banks pull back to opposite
+    faces of the WM surface and carry opposite normals, which is precisely the
+    disagreement the gate needs in order to reject the far bank -- and it is
+    available where the local gradient has none to give.
+
+    This keeps the geometry FIXED in the sense that matters: what is read is
+    still the segmentation's WM normal, never the evolving flow direction. The
+    velocity enters only by choosing the sample point, so the reference remains
+    a material property of the tissue rather than a function of the field.
+
+    Where the pull-back leaves the volume, grid_sample's zero padding returns a
+    null vector with no direction; those voxels keep the Eulerian nu rather
+    than being handed noise.
+    """
+    lag = warp_image(nu, inverse, identity)
+    mag = lag.norm(dim=1, keepdim=True)
+    return torch.where(mag > eps, lag / mag.clamp(min=1e-9), nu)
+
+
+def reorient_velocity(vol, nu, alpha):
+    """Rotate the velocity toward the WM interface normal, preserving speed.
+
+        v' = |v| * normalise( alpha * (-nu) + (1 - alpha) * vhat )
+
+    This is NOT the gate's blend. gated_velocity_smooth uses the same
+    combination as a REFERENCE direction -- a test each neighbour is scored
+    against -- and leaves the vectors it averages untouched; the field it
+    produces still points wherever the data pointed it, only less
+    contaminated by the opposing bank. Here the field itself is turned, before
+    every smoothing step, so the rotation compounds over the solve's
+    iterations rather than acting once as a filter.
+
+    Read as a regulariser, this is a proximal step on a penalty against
+    deviation from the normal direction: each iteration takes the data term's
+    increment, then pulls the direction back toward -nu by a fixed fraction,
+    the way a proximal gradient method alternates a data step with a shrink.
+    alpha is the step size of that shrink, not a mixing weight -- at alpha=1
+    the field is projected ONTO -nu every iteration and the data term can only
+    set the speed.
+
+    Speed is preserved exactly, so a voxel with no velocity stays at zero
+    rather than being handed -nu as a direction: the reorientation cannot
+    create flow, only turn flow that the data term already produced.
+    """
+    if alpha is None or alpha <= 0:
+        return vol
+    mag = (vol ** 2).sum(dim=1, keepdim=True).sqrt()
+    vhat = vol / mag.clamp(min=max(FIELD_EPS, 1e-12))
+    u = alpha * (-nu) + (1.0 - alpha) * vhat
+    u = u / u.norm(dim=1, keepdim=True).clamp(min=1e-9)
+    # Below FIELD_EPS vhat is noise, so u is essentially -nu; multiplying by
+    # mag keeps such a voxel at (near) zero either way. Guard it anyway so the
+    # dead WM contour is bit-exactly untouched.
+    return torch.where(mag > FIELD_EPS, mag * u, vol)
+
+
 def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
     """Gaussian smoothing of the velocity field that refuses to average across a
     direction reversal.
@@ -201,7 +275,8 @@ def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
 
 def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
                            compute_thickness=True, blend_beta=GATE_BLEND_BETA,
-                           velocity_sigma=VELOCITY_SIGMA, smoothing='gated'):
+                           velocity_sigma=VELOCITY_SIGMA, smoothing='gated',
+                           reorient_alpha=None, nu_source='eulerian'):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -288,6 +363,21 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                 velocity = velocity * torch.where(over, frac * frac, torch.ones_like(frac))
             cortical_thickness = vals * gm_mask
 
+        # The geometry the gate and the reorientation are measured against.
+        # 'lagrangian' reads it at each voxel's origin, which gives the two
+        # banks of a sulcus different normals where the SDT has none.
+        nu_ref = nu_t
+        if nu_t is not None and nu_source == 'lagrangian':
+            nu_ref = lagrangian_nu(nu_t, inverse, identity)
+
+        if reorient_alpha:
+            # BEFORE the smoothing, every iteration: see reorient_velocity.
+            if nu_ref is None:
+                nu_t = wm_normal_field(seg, device)
+                nu_ref = (lagrangian_nu(nu_t, inverse, identity)
+                          if nu_source == 'lagrangian' else nu_t)
+            velocity = reorient_velocity(velocity, nu_ref, reorient_alpha)
+
         if smoothing == 'plain':
             # The ungated Gaussian the original DiReCT applies: no relu(cos)
             # rejection of opposing neighbours, no nu blend. For a baseline arm;
@@ -297,7 +387,7 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                                           zero_boundary=False)
         else:
             velocity = gated_velocity_smooth(velocity, velocity_sigma, device,
-                                         nu=nu_t, beta=blend_beta)
+                                         nu=nu_ref, beta=blend_beta)
         velocity = velocity * active          # MUST precede the save; see below
         if verbose and (iteration + 1) % 10 == 0:
             if compute_thickness:

@@ -419,11 +419,15 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
         d = dict(seg=sd['seg'], gmT=sd['gmT'], wmT=sd['wmT'], ref_img=sd['ref_img'],
                  tovox=sd['tovox'], totkr=sd['totkr'], surfaces=sd['surfaces'],
                  prep_dir=prep_dir)
+        if nu_mode == 'travel':
+            # build_surface_segmentation returns gmT, not the raw posterior, and
+            # gmT cannot drive the speed field -- see travel_time_normal_field.
+            from .field_pial_prototype import load_gm_wm_probability
+            d['gm_raw'] = load_gm_wm_probability(prep_dir)[0]
         return _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                     smoothing=smoothing, reorient_alpha=reorient_alpha,
-                                nu_mode=nu_mode,
                                     nu_mode=nu_mode,
                                     solve_margin=solve_margin, write_white=write_white,
                                     parcellate=parcellate,
@@ -464,6 +468,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                 verbose, report, compute_thickness, dtype, device,
                                 velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                 smoothing=smoothing, reorient_alpha=reorient_alpha,
+                                nu_mode=nu_mode,
                                 solve_margin=solve_margin, write_white=write_white,
                                 parcellate=parcellate,
                                 repair_intersections=repair_intersections,

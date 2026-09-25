@@ -125,7 +125,11 @@ def tighten(d, margin=MARGIN, verbose=True):
         return d, None
     sub = SubGrid(ref_img, lo, shape)
     out = dict(d)
-    for k in ('seg', 'gmT', 'wmT', 'pv_gm', 'pv_wm'):
+    # gm_raw is the untransformed GM posterior, on the same grid as seg and
+    # needed by travel_time_normal_field. Any volume-valued key added to the
+    # prepare() dict must be listed here or it reaches the solve on the
+    # PARENT grid and fails on the shape mismatch.
+    for k in ('seg', 'gmT', 'wmT', 'pv_gm', 'pv_wm', 'gm_raw'):
         if d.get(k) is not None:
             out[k] = sub.apply(d[k])
     out['ref_img'], out['tovox'], out['totkr'] = sub.img, sub.tovox, sub.totkr

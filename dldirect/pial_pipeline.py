@@ -648,6 +648,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                   'not be pinned and will be dragged outward.', file=sys.stderr)
 
     out = {}
+    out_raw = {}          # the pre-retraction pials, when retraction ran
     parc_out = {}
     for hemi in hemis:
         white, faces = d['surfaces'][hemi]
@@ -690,6 +691,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             if pial_raw is not None:
                 pial_raw = sub.to_parent(pial_raw)
         out[hemi] = (pial, faces)
+        if pial_raw is not None:
+            out_raw[hemi] = (pial_raw, faces)
         if out_dir:
             vinfo = volume_info_from_image(outer['ref_img'], prep_dir)
             nib.freesurfer.io.write_geometry(os.path.join(out_dir, '%s.pial' % hemi),
@@ -765,10 +768,37 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
         sid = subject_id or os.path.basename(os.path.normpath(prep_dir))
         if verbose:
             print('aggregating regional statistics...')
+        # The pipeline's OWN parcellation, handed over so the column labelling
+        # and the tube stamping reach a number instead of being carried as
+        # artefacts. The atlas aggregation is still written unchanged beside
+        # it; these are the extra result-thick-<metric>-columns.csv.
+        vlab = {h: parc_out[h][0] for h in parc_out} or None
+        rib = None
+        if parc_out:
+            for _h, (_vl, rvol) in parc_out.items():
+                rib = rvol.copy() if rib is None else np.where(rvol > 0, rvol, rib)
+            if sub is not None:
+                rib = sub.restore(rib)
         regional_stats.compute(prep_dir, out_dir=out_dir, subject_id=sid,
                                hemis=tuple(out), sd=outer,
                                pials={h: out[h][0] for h in out},
-                               velocity=vel_np, verbose=verbose)
+                               velocity=vel_np, verbose=verbose,
+                               vertex_labels=vlab, parc_volume=rib)
+        if out_raw:
+            # The same four metrics on the surface BEFORE retraction. Retraction
+            # is known to bias ventral and medial temporal parcels by 1.1-1.9%,
+            # so a cohort wants both and re-running the chain to get the second
+            # is tens of GPU-hours. Canonical filenames, separate directory, so
+            # anything reading result-thick-*.csv keeps working unchanged.
+            # qc=False: the QC channels read the white surface and the
+            # segmentation, which are identical for both, and cost ~2.5 s a
+            # hemisphere.
+            regional_stats.compute(prep_dir,
+                                   out_dir=os.path.join(out_dir, 'stats_raw'),
+                                   subject_id=sid, hemis=tuple(out_raw), sd=outer,
+                                   pials={h: out_raw[h][0] for h in out_raw},
+                                   velocity=vel_np, verbose=verbose, qc=False,
+                                   vertex_labels=vlab, parc_volume=rib)
     if out_dir and parc_out:
         total = None
         for _h, (_vl, rvol) in parc_out.items():

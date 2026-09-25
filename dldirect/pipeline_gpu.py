@@ -260,6 +260,8 @@ def main(argv=None):
     ap.add_argument('--no-parcellate', action='store_true')
     ap.add_argument('--repair-intersections', action='store_true')
     ap.add_argument('--repair-max-move', type=float, default=1.0)
+    ap.add_argument('--no-stats', action='store_true',
+                    help='skip the per-parcel thickness CSVs. They are ON by default:\n                          without them a run produces surfaces and no thickness table')
     ap.add_argument('--variational', action='store_true',
                     help='the linear-smoother configuration (blend-beta 1.0,\n                          reorient-alpha 0.5); see pial_clean.VARIATIONAL')
     ap.add_argument('--reorient-alpha', type=float, default=None,
@@ -279,6 +281,7 @@ def main(argv=None):
                   parcellate=not args.no_parcellate,
                   repair_intersections=args.repair_intersections,
                   repair_max_move=args.repair_max_move,
+                  stats=not args.no_stats,
                   save_segmentation=args.save_segmentation,
                   save_posteriors=args.save_posteriors,
                   propagate_on=args.propagate_on,

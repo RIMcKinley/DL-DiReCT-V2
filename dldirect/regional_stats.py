@@ -424,7 +424,7 @@ def aggregate_signed(values, parcel_ids, offset=0, lut_path=None):
 def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
             hemis=('lh', 'rh'), velocity_name='pial_Velocity.nii.gz',
             write_white=False, verbose=True, sd=None, pials=None, velocity=None,
-            qc=True):
+            qc=True, vertex_labels=None, parc_volume=None):
     """All four metrics, aggregated per parcel. Returns {metric: (mean, std, names)}.
 
     Run standalone, everything comes off disk: the solve segmentation is rebuilt
@@ -441,6 +441,16 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
     follows faithfully. See fragmentation() and adjacency_check().
     It costs ~2.5s a hemisphere (two distance transforms), so pass qc=False in a
     sweep that does not want it.
+
+    `vertex_labels` {hemi: per-vertex parcel id} and `parc_volume` (a labelled
+    ribbon volume) aggregate a SECOND copy of every metric over the pipeline's
+    own parcellation -- the column labelling for the surface metrics, the
+    stamped ribbon for the field one -- written as result-thick-<metric>-columns
+    .csv beside the atlas ones. The default atlas aggregation is untouched, so
+    the CSVs stay comparable with stock DL+DiReCT and with earlier runs; this
+    just stops the column labelling and the tube stamping being carried as
+    artefacts that never reach a number. Labels are taken as given: 0 means
+    unlabelled and is dropped, exactly as nearest_parcel's 0 is.
 
     `sd`, `pials` and `velocity` let a caller that has just solved hand over what
     it already holds instead -- `sd` a dict with seg/tovox/ref_img/surfaces (the
@@ -487,6 +497,10 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
                      np.median(thick[keep]), np.median(raw[keep])))
         results['field'] = aggregate(thick[keep], ids[keep], offset)
         results['field_raw'] = aggregate(raw[keep], ids[keep], offset)
+        if parc_volume is not None:
+            cid = nearest_parcel(coords, np.asarray(parc_volume))
+            ck = cid > 0
+            results['field-columns'] = aggregate(thick[ck], cid[ck], offset)
     elif verbose:
         print('no %s in %s; skipping the field metric' % (velocity_name, surf_dir))
 
@@ -504,6 +518,7 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
 
     vals = {m: [] for m in ('travel', 'nn', 'sym_nn')}
     ids_all = []
+    cids_all = []
     dev_all = []
     n_drop_named = 0
     n_off_tissue = 0
@@ -541,6 +556,14 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
         for k in range(3):
             vox[:, k] = np.clip(vox[:, k], 0, parc.shape[k] - 1)
         ids = nearest_parcel(vox, parc)
+        cids = (np.asarray(vertex_labels[h]).astype(int)
+                if vertex_labels is not None and h in vertex_labels else None)
+        if cids is not None and len(cids) != len(ids):
+            if verbose:
+                print('vertex_labels for %s has %d entries against %d vertices; '
+                      'skipping the column aggregation' % (h, len(cids), len(ids)),
+                      file=sys.stderr)
+            cids = None
 
         # A PINNED VERTEX HAS NO CORTICAL THICKNESS. The medial wall, the
         # subcortical structures the hemisphere fill swallows, anything with no
@@ -590,6 +613,11 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
         ids = np.where(drop, 0, ids)
         n_drop_named += int((drop & (nearest_parcel(vox, parc) > 0)).sum())
         ids_all.append(ids)
+        # The column labels go through the SAME drop rules -- pinned, medial
+        # wall, off-tissue -- so the two aggregations differ only in the
+        # parcellation, not in which vertices are counted.
+        cids_all.append(np.where(drop, 0, cids) if cids is not None
+                        else np.zeros(len(ids), int))
         if qc:
             # The same vertices the thickness came from, so the flag describes
             # exactly the measurement it sits beside. Per hemisphere, not the
@@ -613,6 +641,16 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
         for m in ('travel', 'nn', 'sym_nn'):
             v = np.concatenate(vals[m])
             results[m] = aggregate(v[keep], ids[keep], offset)
+        if cids_all:
+            cids = np.concatenate(cids_all)
+            ck = cids > 0
+            if ck.any():
+                if verbose:
+                    print('columns: %d of %d vertices carry a column label (%.1f%%)'
+                          % (ck.sum(), len(cids), 100 * ck.mean()))
+                for m in ('travel', 'nn', 'sym_nn'):
+                    v = np.concatenate(vals[m])
+                    results['%s-columns' % m] = aggregate(v[ck], cids[ck], offset)
 
     if qc and dev_all and vals is not None:
         dev = np.concatenate(dev_all)

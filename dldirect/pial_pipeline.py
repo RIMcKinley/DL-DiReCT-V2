@@ -271,7 +271,7 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                 topology='nighres', segmentation='logits', crop=True,
                 solve_margin=solve_grid.MARGIN,
                 velocity_sigma=pc.VELOCITY_SIGMA, blend_beta=pc.GATE_BLEND_BETA,
-                reorient_alpha=None,
+                reorient_alpha=None, nu_mode='euclidean',
                 write_white=True, stats=False, subject_id=None,
                 reuse_white=None, smoothing='gated', correct_ribbon=True,
                 dtype=torch.float32, device=None, parcellate=False,
@@ -423,6 +423,8 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
                                     verbose, report, compute_thickness, dtype, device,
                                     velocity_sigma=velocity_sigma, blend_beta=blend_beta,
                                     smoothing=smoothing, reorient_alpha=reorient_alpha,
+                                nu_mode=nu_mode,
+                                    nu_mode=nu_mode,
                                     solve_margin=solve_margin, write_white=write_white,
                                     parcellate=parcellate,
                                     repair_intersections=repair_intersections,
@@ -591,7 +593,7 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                          verbose, report, compute_thickness, dtype, device,
                          velocity_sigma=pc.VELOCITY_SIGMA,
                          blend_beta=pc.GATE_BLEND_BETA, smoothing='gated',
-                         reorient_alpha=None,
+                         reorient_alpha=None, nu_mode='euclidean',
                          solve_margin=solve_grid.MARGIN,
                          write_white=True, stats=False, subject_id=None,
                          parcellate=False, repair_intersections=False,
@@ -620,7 +622,8 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
             seg, d['gmT'], d['wmT'], ref_img, verbose=verbose, device=device,
             compute_thickness=compute_thickness, velocity_sigma=velocity_sigma,
             blend_beta=blend_beta, smoothing=smoothing,
-            reorient_alpha=reorient_alpha)
+            reorient_alpha=reorient_alpha, nu_mode=nu_mode,
+            gm_posterior=d.get('gm_raw'))
         thickness = thick_t.squeeze().cpu().numpy() if thick_t is not None else None
         # Only leave the GPU if something actually needs the host copy.
         velocity = vel_t if (on_gpu and not out_dir) else pc.velocity_to_numpy(vel_t)
@@ -836,6 +839,8 @@ def main():
     p.add_argument('--velocity-sigma', type=float, default=pc.VELOCITY_SIGMA,
                    help='ANTs -b, the velocity smoothing sigma (default %.2f)'
                         % pc.VELOCITY_SIGMA)
+    p.add_argument('--nu-mode', default='euclidean', choices=['euclidean','travel'],
+                   help="'travel': nu from a GM-speed travel time out of WM instead of\n                         the Euclidean distance transform; see travel_time_normal_field")
     p.add_argument('--variational', action='store_true',
                    help='the linear-smoother configuration: %s. See the note above\n                         pial_clean.VARIATIONAL for what it buys and what it costs'
                         % pc.VARIATIONAL)
@@ -914,6 +919,7 @@ def main():
                     topology=args.topology,
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
+                    nu_mode=args.nu_mode,
                     **(pc.VARIATIONAL if args.variational else
                        dict(blend_beta=args.blend_beta,
                             reorient_alpha=args.reorient_alpha)),
@@ -936,6 +942,7 @@ def main():
                     topology=args.topology,
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
+                    nu_mode=args.nu_mode,
                     **(pc.VARIATIONAL if args.variational else
                        dict(blend_beta=args.blend_beta,
                             reorient_alpha=args.reorient_alpha)),

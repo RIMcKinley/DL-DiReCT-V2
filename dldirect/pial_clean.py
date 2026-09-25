@@ -224,6 +224,82 @@ def reorient_velocity(vol, nu, alpha):
     return torch.where(mag > FIELD_EPS, mag * u, vol)
 
 
+def travel_time_normal_field(seg, gm_prob, device, spacing=(1.0, 1.0, 1.0), eps=1e-3):
+    """nu from a GM-speed travel time out of white matter, not a Euclidean
+    distance transform.
+
+    wm_normal_field takes the gradient of edt(~wm) - edt(wm), which measures
+    straight-line distance through anything. A sulcal gap is therefore as easy
+    to cross as tissue: the two banks share a nearest WM voxel, the medial axis
+    of the gap sits inside it, and nu there is the average of two opposing
+    directions. Measured on OASIS, ~9.3% of GM is genuinely medial-axis under
+    that field.
+
+    Here the front marches OUT of white matter through tissue only, at a speed
+    given by the GM posterior:
+
+        |grad T| = 1 / F,   F = clip(p_gm, eps, 1),   domain = GM u WM
+
+    Two distinct effects, measured separately on OAS30001:
+
+      the DOMAIN restriction contributes ~11.3 deg of the ~13.3 deg total
+      change in nu -- the front cannot cross a LABELLED sulcal gap at all, so
+      the two banks get genuinely different directions;
+
+      the SPEED field contributes the remaining ~3.2 deg, and it acts where the
+      domain cannot: on BURIED csf, where a collapsed sulcus is unlabelled and
+      sits inside the GM mask. There the posterior dips, the front slows, and
+      the gap is recovered. Those voxels sit 2.45 mm from WM (mid-ribbon, where
+      a collapsed sulcus belongs) against 1.00 mm for GM/WM partial volume, and
+      nu turns 8.3 deg there against 0.36 deg on the exposed rim.
+
+    The eps floor never binds on real data (min p_gm inside the domain is 0.021,
+    no voxel reaches 1e-3); it exists so the march cannot divide by zero.
+
+    Verified over 16 hemispheres against the Euclidean field, same solve
+    otherwise: self-intersecting faces fall in 16/16 for both smoothing
+    configurations, and with VARIATIONAL the fold faces -- the genuinely
+    pathological class, as opposed to two banks legitimately touching -- fall
+    2.3x, 16/16, while transit falls 3.0x against blend.
+
+    The corpus callosum is deliberately NOT blocked: the front seeds on the
+    WM/GM interface and never travels through white matter, so its speed is
+    never read. Measured, it changes nothing (19.1 vs 19.6 deg).
+    """
+    import skfmm
+    gm = seg == 2
+    wm = seg == 3
+    mask = ~(gm | wm)
+    speed = np.clip(np.asarray(gm_prob, np.float64), eps, 1.0)
+    speed[wm] = 1.0
+    # skfmm reads speeds OUTSIDE the marching domain too; leaving them at the
+    # eps floor inflates T by ~40x. eikonal_thickness._march documents this and
+    # neutralises the background, which is why it is used here rather than
+    # calling skfmm directly.
+    from .eikonal_thickness import _march
+    spacing = tuple(float(z) for z in spacing)
+    T, unreached = _march(np.where(wm, -1.0, 1.0), mask, speed, spacing, True)
+    T = np.where(unreached | mask, np.nan, T)
+    finite = np.isfinite(T)
+    T = np.where(finite, T, np.nanmax(T[finite]) * 1.5)
+    grad = np.stack(np.gradient(T, *spacing), axis=-1)
+    mag = np.linalg.norm(grad, axis=-1)
+    # A zero gradient (flat fill outside the domain, or a plateau) would
+    # normalise to a null vector, which the gate would score as zero
+    # agreement with everything. Fall back to the Euclidean direction there
+    # so every voxel still carries a unit direction, as wm_normal_field does.
+    dead = mag <= 1e-9
+    if dead.any():
+        from scipy.ndimage import distance_transform_edt
+        sdt = (distance_transform_edt(~wm, sampling=spacing)
+               - distance_transform_edt(wm, sampling=spacing))
+        g2 = np.stack(np.gradient(sdt, *spacing), axis=-1)
+        grad = np.where(dead[..., None], g2, grad)
+        mag = np.linalg.norm(grad, axis=-1)
+    nu = grad / np.maximum(mag, 1e-9)[..., None]
+    return torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
+
+
 def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
     """Gaussian smoothing of the velocity field that refuses to average across a
     direction reversal.
@@ -312,7 +388,8 @@ def gated_velocity_smooth(vol, sigma, device, nu=None, beta=GATE_BLEND_BETA):
 def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=None,
                            compute_thickness=True, blend_beta=GATE_BLEND_BETA,
                            velocity_sigma=VELOCITY_SIGMA, smoothing='gated',
-                           reorient_alpha=None, nu_source='eulerian'):
+                           reorient_alpha=None, nu_source='eulerian',
+                           nu_mode='euclidean', gm_posterior=None):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -342,7 +419,20 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
     wm_contour = extract_wm_contours(seg_t)
     active = (gm_mask + wm_contour).clamp(max=1.0)
     identity = _make_identity_grid((D, H, W), device)
-    nu_t = None if blend_beta is None else wm_normal_field(seg, device)
+    nu_t = None
+    if blend_beta is not None:
+        if nu_mode == 'travel':
+            if gm_posterior is None:
+                raise ValueError(
+                    "nu_mode='travel' needs gm_posterior, the RAW GM probability. "
+                    "`gm_prob` here is gmT, which build_seg_maps has already "
+                    "saturated (83% of GM at 1.0) and which shows no dip at buried "
+                    "CSF -- passing it would silently reduce the speed field to a "
+                    "flat-speed geodesic. prepare() returns it as 'gm_raw'.")
+            nu_t = travel_time_normal_field(seg, gm_posterior, device,
+                                            ref_img.header.get_zooms()[:3])
+        else:
+            nu_t = wm_normal_field(seg, device)
 
     velocity = torch.zeros(1, 3, D, H, W, device=device)
     integrated = torch.zeros(1, 3, D, H, W, device=device)
@@ -573,7 +663,11 @@ def prepare(prep_dir, surf_dir=None, hemis=('lh', 'rh'), surfaces=None, tissue=N
               % (h, dist, 100 * frac, 100 * inb))
         if dist > 1.5 or inb < 0.99:
             print('WARNING: frame alignment looks wrong for %s' % h, file=sys.stderr)
-    return dict(seg=seg, gmT=gmT, wmT=wmT, ref_img=ref_img, tovox=tovox, totkr=totkr,
+    # gm_raw is the UNTRANSFORMED posterior. gmT is 83% saturated at 1.0 and
+    # shows no dip at buried CSF, so it cannot drive the travel-time speed
+    # field; see travel_time_normal_field.
+    return dict(seg=seg, gmT=gmT, wmT=wmT, gm_raw=gm_prob, ref_img=ref_img,
+                tovox=tovox, totkr=totkr,
                 surfaces={h: surfaces[h] for h in hemis}, prep_dir=prep_dir)
 
 

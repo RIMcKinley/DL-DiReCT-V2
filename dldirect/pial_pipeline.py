@@ -663,7 +663,14 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                         pin_mask=pin_mask, on=propagate_on, device=device, dtype=dtype,
                         return_path=bool(parcellate or repair_intersections))
         pial, path = got if (parcellate or repair_intersections) else (got, None)
+        pial_raw = None
         if repair_intersections:
+            # Keep the pre-retraction surface. Retraction is post-hoc on the
+            # trajectory, so both arms of a with/without comparison come out of
+            # ONE propagation -- the alternative is a second full run, which on
+            # the OASIS set is tens of GPU-hours to recompute a segmentation and
+            # a solve that would be bit-identical.
+            pial_raw = pial.copy()
             pial, _rinfo = repair_intersections_fn(pial, faces, path,
                                                    max_move=repair_max_move,
                                                    verbose=verbose)
@@ -680,12 +687,22 @@ def _solve_and_propagate(d, prep_dir, propagate_on, velocity, pin, out_dir,
                 parc_out[hemi] = (vlab, rvol)
         if sub is not None:
             pial = sub.to_parent(pial)
+            if pial_raw is not None:
+                pial_raw = sub.to_parent(pial_raw)
         out[hemi] = (pial, faces)
         if out_dir:
             vinfo = volume_info_from_image(outer['ref_img'], prep_dir)
             nib.freesurfer.io.write_geometry(os.path.join(out_dir, '%s.pial' % hemi),
                                              pial, faces, create_stamp=None,
                                              volume_info=vinfo)
+            if pial_raw is not None:
+                # ?h.pial stays the retracted surface, so nothing downstream
+                # changes meaning; ?h.pial.raw is the same propagation before
+                # retraction, for the without-retraction arm and for regional
+                # statistics taken ahead of it.
+                nib.freesurfer.io.write_geometry(
+                    os.path.join(out_dir, '%s.pial.raw' % hemi),
+                    pial_raw, faces, create_stamp=None, volume_info=vinfo)
             if hemi in parc_out:
                 # per-vertex parcel ids in FreeSurfer's numbering. A plain
                 # array, not an .annot: the colour table lives in a recon-all

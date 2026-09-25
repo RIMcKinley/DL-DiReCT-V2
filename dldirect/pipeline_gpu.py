@@ -39,6 +39,7 @@ for _p in (_ROOT, _HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from dldirect import pial_clean as _pc
 from dldirect.parcel_posterior import CorticalPosterior
 from dldirect.field_pial_prototype import gm_wm_probability_from_logits
 
@@ -259,6 +260,8 @@ def main(argv=None):
     ap.add_argument('--no-parcellate', action='store_true')
     ap.add_argument('--repair-intersections', action='store_true')
     ap.add_argument('--repair-max-move', type=float, default=1.0)
+    ap.add_argument('--variational', action='store_true',
+                    help='the linear-smoother configuration (blend-beta 1.0,\n                          reorient-alpha 0.5); see pial_clean.VARIATIONAL')
     ap.add_argument('--reorient-alpha', type=float, default=None,
                     help='rotate the velocity toward -nu by this fraction before every\n                          smoothing step (0.5 = the bisector; default off)')
     ap.add_argument('--blend-beta', type=float, default=None,
@@ -280,10 +283,11 @@ def main(argv=None):
                   save_posteriors=args.save_posteriors,
                   propagate_on=args.propagate_on,
                   pad_margin=args.pad_margin,
-                  **({} if args.reorient_alpha is None else
-                     {'reorient_alpha': args.reorient_alpha}),
-                  **({} if args.blend_beta is None else
-                     {'blend_beta': args.blend_beta}))
+                  **(_pc.VARIATIONAL if args.variational else
+                     dict(**({} if args.reorient_alpha is None else
+                             {'reorient_alpha': args.reorient_alpha}),
+                          **({} if args.blend_beta is None else
+                             {'blend_beta': args.blend_beta}))))
     if args.batch:
         return run_batch(args.batch, manifest=args.manifest, **common)
     if not args.t1 or not args.out_dir:

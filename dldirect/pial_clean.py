@@ -114,6 +114,42 @@ def wm_normal_field(seg, device):
     return torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
 
 
+# Two smoothing regimes are supported, and BOTH are kept deliberately.
+#
+#   SHIPPED      blend_beta=0.5, reorient_alpha=None
+#                The gate's reference is an equal mix of -nu and the current
+#                velocity, so the operator adapts to the field it is smoothing.
+#                Nonlinear and solution-dependent: measured S(2*v1 - 3*v2) vs
+#                2*S(v1) - 3*S(v2) gives a relative error of 3.5e-01, and the
+#                response to an identical perturbation differs by 4.0e-02
+#                between two background fields.
+#
+#   VARIATIONAL  blend_beta=1.0, reorient_alpha=0.5
+#                The reference is -nu alone, so it does not depend on the
+#                velocity at all. The smoother is then LINEAR (same test:
+#                3.5e-07) and solution-INDEPENDENT (2.98e-08) -- a fixed
+#                anisotropic diffusion keyed to WM geometry, not an upwinding
+#                or limiter scheme, because there is nothing for its stencil to
+#                adapt to. All the nonlinearity sits in reorient_velocity,
+#                which is a direction-only map: non-additive, and positively
+#                homogeneous to 3.5e-05 (float32 rounding in the normalise)
+#                away from the FIELD_EPS guard.
+#
+#                So the solve reads as linear smoothing step + nonlinear shrink
+#                toward fixed geometry: proximal-gradient structure, which is
+#                the form a variational argument needs. The two numbers only
+#                give that property TOGETHER -- beta=1.0 alone is the gate at
+#                its plateau, alpha=0.5 with beta=0.5 leaves the smoother
+#                nonlinear -- so they are named as one configuration here
+#                rather than left as two flags to remember.
+#
+# Geometry wins go to VARIATIONAL (12/12 hemispheres on self-intersections,
+# transit, obliquity and boundary placement). Reproducibility is the open
+# question; until that is settled neither is "the" default and SHIPPED stays
+# the one you get by not asking.
+VARIATIONAL = dict(blend_beta=1.0, reorient_alpha=0.5)
+
+
 def lagrangian_nu(nu, inverse, identity, eps=0.5):
     """nu carried back to each voxel's ORIGIN instead of read where it sits.
 

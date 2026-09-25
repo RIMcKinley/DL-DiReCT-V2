@@ -789,6 +789,9 @@ def main():
     p.add_argument('--velocity-sigma', type=float, default=pc.VELOCITY_SIGMA,
                    help='ANTs -b, the velocity smoothing sigma (default %.2f)'
                         % pc.VELOCITY_SIGMA)
+    p.add_argument('--variational', action='store_true',
+                   help='the linear-smoother configuration: %s. See the note above\n                         pial_clean.VARIATIONAL for what it buys and what it costs'
+                        % pc.VARIATIONAL)
     p.add_argument('--reorient-alpha', type=float, default=None,
                    help='rotate the velocity toward -nu by this fraction before every\n                         smoothing step (0.5 = the bisector; None = off)')
     p.add_argument('--blend-beta', type=float, default=pc.GATE_BLEND_BETA,
@@ -864,8 +867,9 @@ def main():
                     topology=args.topology,
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
-                    blend_beta=args.blend_beta,
-                    reorient_alpha=args.reorient_alpha,
+                    **(pc.VARIATIONAL if args.variational else
+                       dict(blend_beta=args.blend_beta,
+                            reorient_alpha=args.reorient_alpha)),
                     solve_margin=None if args.solve_margin < 0 else args.solve_margin,
                     write_white=not args.no_white,
                     stats=args.stats, subject_id=args.subject,
@@ -885,8 +889,9 @@ def main():
                     topology=args.topology,
                     segmentation=args.segmentation,
                     velocity_sigma=args.velocity_sigma,
-                    blend_beta=args.blend_beta,
-                    reorient_alpha=args.reorient_alpha,
+                    **(pc.VARIATIONAL if args.variational else
+                       dict(blend_beta=args.blend_beta,
+                            reorient_alpha=args.reorient_alpha)),
                     solve_margin=None if args.solve_margin < 0 else args.solve_margin)
     for hemi in args.hemi:
         white, faces = r['white'][hemi]

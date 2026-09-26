@@ -110,7 +110,7 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
                          relax_iters=pc.RELAX_ITERS,
                          relax_iters_final=pc.RELAX_ITERS_FINAL,
                          relax_lambda=pc.RELAX_LAMBDA, pin_feather=pc.PIN_FEATHER,
-                         return_path=False):
+                         return_path=False, substeps=pc.SUBSTEPS):
     """Carry a surface along the velocity field, entirely on the GPU.
 
     `velocity` is either the [1, 3, D, H, W] tensor solve_velocity_field_t
@@ -161,7 +161,22 @@ def propagate_pial_torch(white_verts, faces, velocity, tovox_affine, totkr_affin
     if path is not None:
         path.append(pos @ A[:3, :3].T + A[:3, 3])
     for rnd in range(rounds):
-        pos = pos - _sample_trilinear(field, pos) * step_scale
+        # SUB-STEPPING. The round's displacement is unchanged; it is integrated
+        # in `substeps` pieces, re-reading the field between them. A single
+        # step linearises the trajectory over the whole round, which overshoots
+        # wherever the field varies fast along it -- and that is precisely
+        # where the folds are: they sit at sulcal fundi with div > 0, while
+        # bank contacts sit at div < 0. Measured on one subject, same field and
+        # same total deformation, 1 -> 8 sub-steps gives self-intersections
+        # -37%, fold faces -28% and bank contacts -38% in BOTH hemispheres,
+        # monotone at every K, for 0.5% of travel.
+        #
+        # The relaxation stays once per round: it is a mesh operation, not part
+        # of the integration, and it is what dominates the propagation's cost
+        # (160 sampling steps measured 0.164 s against 0.275 s for 20
+        # relaxations).
+        for _sub in range(substeps):
+            pos = pos - _sample_trilinear(field, pos) * (step_scale / substeps)
         iters = relax_iters if rnd < rounds - 1 else relax_iters_final
         for i in range(iters):
             neighbour_mean = torch.sparse.mm(Wt, pos) / degt

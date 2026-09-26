@@ -78,6 +78,7 @@ STEP_SCALE = INTEGRATION_POINTS / ROUNDS   # keeps the total deformation fixed
 RELAX_ITERS = 2            # Taubin iterations between rounds
 RELAX_ITERS_FINAL = 1      # odd, so the last round ends on an unpaired shrink
 RELAX_LAMBDA = 0.51        # matched to pymeshlab's filter; do not change
+SUBSTEPS = 4               # field re-reads per round; 1 is a single linear step
 PIN_FEATHER = 2            # mesh rings over which the medial-wall pin ramps off
 WM_SUPERSAMPLE = 3         # partial-volume rasterisation of the white surface
 INVERT_MAX_ITER = 20       # ANTs' cap on the inversion's fixed-point iterations
@@ -678,12 +679,18 @@ def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=Non
     cur = white_verts
     path = [np.asarray(cur, np.float32).copy()] if return_path else None
     for rnd in range(ROUNDS):
-        pos = tovox(cur)
-        v = np.stack([map_coordinates(velocity[..., k], pos.T, order=1, mode='nearest')
-                      for k in range(3)], axis=1)
-        step = (totkr(pos - v) - totkr(pos)) * STEP_SCALE
+        # SUB-STEPPED, matching propagate_pial_torch: the round's displacement
+        # is unchanged, integrated in SUBSTEPS pieces with the field re-read
+        # between them. A single step linearises the trajectory over the whole
+        # round and overshoots where the field varies fast along it -- which is
+        # where the folds are. See the note in propagate_pial_torch.
+        for _sub in range(SUBSTEPS):
+            pos = tovox(cur)
+            v = np.stack([map_coordinates(velocity[..., k], pos.T, order=1, mode='nearest')
+                          for k in range(3)], axis=1)
+            cur = cur + (totkr(pos - v) - totkr(pos)) * (STEP_SCALE / SUBSTEPS)
         iters = RELAX_ITERS if rnd < ROUNDS - 1 else RELAX_ITERS_FINAL
-        cur = build_constrained_white(cur + step, faces, seg, tovox, totkr,
+        cur = build_constrained_white(cur, faces, seg, tovox, totkr,
                                       floor=-np.inf, iters=iters, lam=RELAX_LAMBDA,
                                       cache=cache)
         if pin_w is not None:

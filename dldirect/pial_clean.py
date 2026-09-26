@@ -100,16 +100,46 @@ INVERT_CHECK_EVERY = 4     # host syncs per that many iterations; see below
 # solve by alternating arms and taking medians; a single A-then-B is worthless
 # here.
 
-def wm_normal_field(seg, device):
+def wm_normal_field(seg, device, wmT=None, spacing=(1.0, 1.0, 1.0)):
     """nu: the unit gradient of the WM signed distance, one vector per voxel.
 
     Points OUT of white matter. DiReCT's velocity runs GM->WM, so the outward
     direction the blend wants is -nu.
+
+    THE BOUNDARY. With `wmT` -- the WM map the solve actually deforms -- the
+    signed distance is taken from the 0.5 level set of that map rather than
+    from the `seg == 3` binarisation. Two defects are fixed at once:
+
+      seg == 3 is not what the solve deforms. wmT carries a partial-volume
+      band from rasterize_mesh_pv of the white surfaces (5.1% of voxels
+      strictly between 0 and 1); the two boundaries disagree in 0.73% of WM
+      and give a nu more than 20 deg apart in 7% of GM.
+
+      A mask boundary sits on a voxel STEP, so its zero level set is half a
+      voxel inside the interface. distance_transform_edt measures to voxel
+      centres, so an adjacent voxel reads 1.0 rather than 0.5.
+
+    skfmm.distance solves the same signed-distance problem from a level set
+    with sub-voxel accuracy. Its sign follows phi, and phi = 0.5 - wmT is
+    negative inside white matter, which is the convention the binary branch
+    has (edt(~wm) - edt(wm) is negative inside). Do NOT route this through
+    eikonal_thickness._march: that returns np.abs(T), which would make the
+    gradient reverse across the interface -- the bug fixed in d042362.
     """
     from scipy.ndimage import distance_transform_edt
-    wmb = (seg == 3)
-    sdt = distance_transform_edt(~wmb) - distance_transform_edt(wmb)
-    grad = np.stack(np.gradient(sdt), axis=-1)
+    spacing = tuple(float(z) for z in spacing)
+    if wmT is None:
+        wmb = (seg == 3)
+        sdt = (distance_transform_edt(~wmb, sampling=spacing)
+               - distance_transform_edt(wmb, sampling=spacing))
+    else:
+        import skfmm
+        phi = 0.5 - np.asarray(wmT, np.float64)
+        # keep the sign consistent with the labels where the two disagree
+        phi[seg == 3] = np.minimum(phi[seg == 3], -1e-3)
+        phi[seg == 2] = np.maximum(phi[seg == 2], 1e-3)
+        sdt = np.asarray(skfmm.distance(phi, dx=spacing), np.float64)
+    grad = np.stack(np.gradient(sdt, *spacing), axis=-1)
     nu = grad / np.maximum(np.linalg.norm(grad, axis=-1), 1e-9)[..., None]
     return torch.from_numpy(nu.transpose(3, 0, 1, 2)[None].astype(np.float32)).to(device)
 
@@ -493,7 +523,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                                             ref_img.header.get_zooms()[:3],
                                             wmT=wm_prob)
         else:
-            nu_t = wm_normal_field(seg, device)
+            nu_t = wm_normal_field(seg, device, wmT=wm_prob,
+                                   spacing=ref_img.header.get_zooms()[:3])
 
     velocity = torch.zeros(1, 3, D, H, W, device=device)
     integrated = torch.zeros(1, 3, D, H, W, device=device)

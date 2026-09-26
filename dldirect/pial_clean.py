@@ -313,6 +313,19 @@ def travel_time_normal_field(seg, gm_prob, device, spacing=(1.0, 1.0, 1.0), eps=
         phi[wm] = np.minimum(phi[wm], -1e-3)
         phi[gm] = np.maximum(phi[gm], 1e-3)
     T, unreached = _march(phi, mask, speed, spacing, True)
+    # SIGN IT. _march returns |T| -- the distance from the zero level set in
+    # BOTH directions -- so T has a V-shaped minimum at the WM/GM interface and
+    # its gradient REVERSES across it. Unsigned, nu points INTO white matter on
+    # the WM side: measured cos against the Euclidean nu is -0.92 at the WM
+    # contour and -0.99 in the WM interior, against +0.96 in GM.
+    #
+    # That is not cosmetic. The gate then sees the contour's reference opposing
+    # every GM neighbour's, rejects them all, and the contour's velocity
+    # collapses by a factor of 500 (|v| 0.092 -> 0.00018). GM velocity is
+    # untouched, so travel and nn look normal while the FIELD metric -- which
+    # integrates outward FROM the contour -- reads 0.34 mm instead of 2.07.
+    # The Euclidean sdt is signed by construction and never had this.
+    T = np.where(wm, -T, T)
     T = np.where(unreached | mask, np.nan, T)
     finite = np.isfinite(T)
     T = np.where(finite, T, np.nanmax(T[finite]) * 1.5)

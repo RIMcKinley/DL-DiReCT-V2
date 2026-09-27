@@ -495,32 +495,35 @@ def reconstruct(prep_dir, surf_dir=None, surfaces=None, hemis=('lh', 'rh'),
 def repair_intersections_fn(pial, faces, path, max_move=1.0, verbose=True):
     """Untangle the pial by sliding vertices back along their own trajectories.
 
-    OFF BY DEFAULT, AND THE REASON IS MEASURED. It works: at max_move 1.0 it
-    clears every self-intersection on 12/12 hemispheres (median 5470 before,
-    0 after). But the cost is regional, not a global offset -- over 12
-    hemispheres, mean thickness by parcel:
+    OPT-IN. It works: at max_move 1.0 it clears 99.28% of crossings over 190
+    hemispheres (288466 -> 2076; 41% of hemispheres reach exactly 0, median
+    residual 5 faces). The residue is per-subject and reproduces across
+    rescans, so it is a quality signal, not noise.
 
-        inferiortemporal  -1.85%      postcentral        -0.22%
-        fusiform          -1.73%      transversetemporal -0.10%
-        bankssts          -1.62%      parsorbitalis      -0.00%
-        parahippocampal   -1.40%      frontalpole        -0.00%
-        entorhinal        -1.09%      median over 34     -0.44%
+    It SHIFTS thickness, and the gradient is anatomical -- these crossings are
+    opposing sulcal banks in contact, and the ventral/medial temporal parcels
+    sit around the collateral and occipitotemporal sulci. Over 236 sessions of
+    the travel-time/sub-stepped configuration, retracted vs raw:
 
-    The gradient is anatomical: these crossings are opposing sulcal banks in
-    contact, and the ventral/medial temporal parcels sit around the collateral
-    and occipitotemporal sulci. Frontal and central cortex is untouched.
+        rh-entorhinal       -1.08%      lh-postcentral        -0.05%
+        lh-entorhinal       -0.95%      lh-pericalcarine      -0.04%
+        rh-inferiortemporal -0.75%      rh-transversetemporal -0.04%
+        rh-fusiform         -0.72%      median over 70        -0.16%
 
-    Test-retest over 10 same-session pairs says it is reproducibility-NEUTRAL
-    overall (eps_mu 1.059% -> 1.056%, better in 39/68 parcels) but WORSE in
-    exactly the biased parcels (ventral/medial temporal +0.028 pp, better in
-    4/12; lh-entorhinal +0.163, rh-parahippocampal +0.108). So it both shifts
-    and destabilises medial temporal thickness -- the measurement regions of an
-    AD cohort, which OASIS-3 is.
+    It does NOT destabilise those parcels. An earlier note here said it did,
+    on 10 pairs of a configuration that retracted ~4x as many faces (~5500 vs
+    ~1400 per hemisphere); that measurement is stale, not wrong. At 102
+    same-session pairs on the current configuration retraction is
+    reproducibility-neutral overall (eps_mu 1.012% -> 1.008%, better in 40/70
+    parcels, p=0.50) and mildly BETTER in ventral/medial temporal (better in
+    11/16; lh-entorhinal -0.104 pp, lh-parahippocampal -0.067 pp -- though
+    rh-entorhinal goes the other way at +0.021 pp, so the effect is not
+    lateralised-consistent and is small either way).
 
     Use it when a downstream tool needs a surface without self-intersections
-    (meshing, registration, some volume tools). Do not use it when the
-    measurement is medial temporal thickness, and never compare repaired
-    against unrepaired data.
+    (meshing, registration, some volume tools). The thickness shift is the
+    reason to think before turning it on for a medial temporal measurement --
+    not reproducibility. Never compare repaired against unrepaired data.
 
     max_move bounds each stage in mm of travel back along the path, so total
     displacement can reach twice it (measured median 1.68 mm at max_move 1.0).

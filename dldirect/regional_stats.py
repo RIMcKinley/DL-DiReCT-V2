@@ -310,6 +310,35 @@ def wm_deviation(white_vox, ids, wm_mask, zooms, offset=0, lut_path=None):
     return d
 
 
+def _segmentation_for_qc(prep_dir, id_map):
+    """The cerebrum label volume for fragmentation(), whichever way it was written.
+
+    Returns (volume, ids). preparedata writes a combined T1w_norm_seg.nii.gz;
+    pipeline_gpu writes seg_<Structure>.nii.gz masks instead. In the second case
+    the two labels fragmentation() asks for are rebuilt into a small volume with
+    ids 1..4, and a matching id_map is returned, so the caller is unchanged.
+    """
+    combined = os.path.join(prep_dir, 'T1w_norm_seg.nii.gz')
+    if os.path.exists(combined):
+        return np.asarray(nib.load(combined).dataobj), id_map
+    want = ['%s-Cerebral-%s' % (side, part)
+            for side in ('Left', 'Right') for part in ('White-Matter', 'Cortex')]
+    paths = [os.path.join(prep_dir, 'seg_%s.nii.gz' % w) for w in want]
+    missing = [w for w, p in zip(want, paths) if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError('no T1w_norm_seg.nii.gz and no seg_ masks for %s'
+                                % ', '.join(missing))
+    vol = None
+    ids = {}
+    for i, (w, p) in enumerate(zip(want, paths), start=1):
+        m = np.asarray(nib.load(p).dataobj) > 0
+        if vol is None:
+            vol = np.zeros(m.shape, np.int16)
+        vol[m] = i
+        ids[w] = i
+    return vol, ids
+
+
 def fragmentation(seg_labels, ids):
     """Per-side connected-component fragmentation of the cerebrum labels.
 
@@ -671,8 +700,15 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
         # because they never consult the surface. Cheap enough to run always.
         import csv as _csv
         try:
-            frag = fragmentation(np.asarray(nib.load(os.path.join(
-                prep_dir, 'T1w_norm_seg.nii.gz')).dataobj), id_map)
+            # The label volume is written under different names by different
+            # entry points: preparedata leaves T1w_norm_seg.nii.gz, while
+            # pipeline_gpu writes one mask per structure and no combined
+            # volume. Opening only the first meant this channel silently took
+            # the except path for every case of a 2660-case run. Try the
+            # combined volume, then rebuild the two labels fragmentation()
+            # needs from the per-structure masks.
+            segvol, segids = _segmentation_for_qc(prep_dir, id_map)
+            frag = fragmentation(segvol, segids)
             nov, nov_faces, miss, npairs = adjacency_check(parc)
             row = {'SUBJECT': subject_id}
             for side in ('Left', 'Right'):

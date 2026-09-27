@@ -116,7 +116,9 @@ def load_metadata(path):
                 age = np.nan
             out[r['SUBJECT_ID']] = (r.get('SOURCE_SUBJECT'), age,
                                     float(m.group(1)) if m else np.nan,
-                                    (r.get('DIAGNOSIS') or '').strip())
+                                    (r.get('DIAGNOSIS') or '').strip(),
+                                    1.0 if (r.get('SEX') or '').strip().upper().startswith('F')
+                                    else (0.0 if (r.get('SEX') or '').strip() else np.nan))
     return out
 
 
@@ -187,7 +189,7 @@ def atrophy_rates(values, cols, meta, min_years=1.0, ad_only=False):
         for scan, _ in items:
             if scan not in meta:
                 continue
-            p, age, cdr, diag = meta[scan]
+            p, age, cdr, diag = meta[scan][:4]
             subj = subj or p
             ages.append(age)
             cdrs.append(cdr)
@@ -245,7 +247,74 @@ def cohens_d(a, b):
     return (a.mean() - b.mean()) / sp if sp > 0 else np.nan
 
 
-def group_separation(groups, cols, ref='CDR 0 (healthy)'):
+def subject_covariates(groups, meta, etiv_root=None):
+    """{subject: [baseline_age, is_female, eTIV]} for every subject in `groups`.
+
+    eTIV comes from FreeSurfer's aseg.stats when `etiv_root` is given; it is the
+    only one of the three the OASIS metadata does not carry. Subjects whose eTIV
+    cannot be read keep a NaN and are dropped from the adjusted comparison only.
+    """
+    scans = defaultdict(list)
+    for scan, rec in meta.items():
+        p, age, cdr, diag = rec[:4]
+        if p is not None:
+            scans[p].append((age, scan))
+    out = {}
+    for g, (sl, ids) in groups.items():
+        for sub in ids:
+            if sub in out or sub not in scans:
+                continue
+            rows = sorted(x for x in scans[sub] if np.isfinite(x[0]))
+            if not rows:
+                continue
+            age0, scan0 = rows[0]
+            sex = meta[scan0][4] if len(meta[scan0]) > 4 else np.nan
+            tiv = np.nan
+            if etiv_root:
+                f = os.path.join(etiv_root, scan0, 'stats', 'aseg.stats')
+                if os.path.exists(f):
+                    for line in open(f):
+                        if 'EstimatedTotalIntraCranialVol' in line:
+                            try:
+                                tiv = float(line.split(',')[3])
+                            except (IndexError, ValueError):
+                                pass
+                            break
+            out[sub] = [age0, sex, tiv]
+    return out
+
+
+def adjust_slopes(vec, subs, cov, extra=None):
+    """Residualise a per-subject slope vector on the available covariates.
+
+    Columns with no usable values are dropped rather than failing, so an
+    unavailable eTIV degrades the adjustment instead of disabling it. Returns
+    (residuals + grand mean, list of covariate names actually used); adding the
+    mean back keeps the output on the mm/year scale the rest of the report uses.
+    """
+    names, cols = [], []
+    base = np.array([cov.get(s, [np.nan, np.nan, np.nan]) for s in subs], float)
+    for j, nm in enumerate(('age', 'sex', 'eTIV')):
+        c = base[:, j]
+        if np.isfinite(c).sum() > 0.8 * len(c) and np.nanstd(c) > 0:
+            names.append(nm)
+            cols.append(np.where(np.isfinite(c), c, np.nanmean(c)))
+    if extra is not None:
+        for nm, c in extra:
+            if np.isfinite(c).sum() > 0.8 * len(c) and np.nanstd(c) > 0:
+                names.append(nm)
+                cols.append(np.where(np.isfinite(c), c, np.nanmean(c)))
+    ok = np.isfinite(vec)
+    if not names or ok.sum() < 10:
+        return vec, []
+    X = np.column_stack([np.ones(ok.sum())] + [c[ok] for c in cols])
+    beta, _, _, _ = np.linalg.lstsq(X, vec[ok], rcond=None)
+    out = np.full_like(vec, np.nan)
+    out[ok] = vec[ok] - X @ beta + vec[ok].mean()
+    return out, names
+
+
+def group_separation(groups, cols, ref='CDR 0 (healthy)', cov=None):
     """(d, p, n_ref, n_other) per group against the healthy group.
 
     Welch's t-test, not Student's: the groups are unequal in both size and
@@ -259,11 +328,24 @@ def group_separation(groups, cols, ref='CDR 0 (healthy)'):
     if ref not in groups:
         return out
     a = np.nanmean(groups[ref][0][:, gi], axis=1)
+    a_ids = list(groups[ref][1])
     for g, (sl, ids) in groups.items():
         if g == ref:
             continue
         b = np.nanmean(sl[:, gi], axis=1)
-        aa, bb = a[np.isfinite(a)], b[np.isfinite(b)]
+        if cov:
+            # residualise BOTH groups on one pooled fit, so the covariate
+            # relationship is estimated on all subjects rather than separately
+            # per group (which would absorb part of the group difference).
+            pooled = np.concatenate([a, b])
+            adj, used = adjust_slopes(pooled, a_ids + list(ids), cov)
+            if used:
+                a2, b2 = adj[:len(a)], adj[len(a):]
+            else:
+                a2, b2 = a, b
+        else:
+            a2, b2 = a, b
+        aa, bb = a2[np.isfinite(a2)], b2[np.isfinite(b2)]
         if len(bb) < 2:
             continue
         t, pv = stats.ttest_ind(bb, aa, equal_var=False)
@@ -288,6 +370,15 @@ def main(argv=None):
     ap.add_argument('--table', action='append', default=[], dest='tables',
                     help='LABEL,PATH to a collected table')
     ap.add_argument('--min-years', type=float, default=1.0)
+    ap.add_argument('--adjust', action='store_true',
+                    help='also report the CDR separation adjusted for baseline '
+                         'age, sex and (with --etiv-root) eTIV. The published '
+                         'benchmark is UNADJUSTED, and in OASIS-3 the impaired '
+                         'groups are several years older than the healthy one, '
+                         'so the unadjusted d is inflated for every pipeline')
+    ap.add_argument('--etiv-root',
+                    help='FreeSurfer SUBJECTS_DIR to read '
+                         'EstimatedTotalIntraCranialVol from, for --adjust')
     ap.add_argument('--ad-only', action='store_true',
                     help='drop non-AD dementias from the CDR groups')
     args = ap.parse_args(argv)
@@ -370,20 +461,30 @@ def main(argv=None):
     sep_rows = []
     for lab, (cols, groups) in per_pipe.items():
         sep = group_separation(groups, cols)
+        sep_adj = None
+        if args.adjust:
+            cov = subject_covariates(groups, meta, args.etiv_root)
+            sep_adj = group_separation(groups, cols, cov=cov)
         cells = []
         for g in order[1:]:
             if g not in sep:
                 cells.append('%-26s' % '-')
                 continue
             d, pv, na, nb = sep[g]
-            cells.append('%-26s' % ('d=%+.2f  p=%.3g%s' % (d, pv,
-                                    '*' if pv < 0.05 else '')))
-            sep_rows.append([lab, g, d, pv, na, nb])
+            if sep_adj and g in sep_adj:
+                da, pa = sep_adj[g][0], sep_adj[g][1]
+                cells.append('%-26s' % ('d=%+.2f (adj %+.2f) p=%.3g%s'
+                                        % (d, da, pv, '*' if pv < 0.05 else '')))
+                sep_rows.append([lab, g, d, pv, na, nb, da, pa])
+            else:
+                cells.append('%-26s' % ('d=%+.2f  p=%.3g%s' % (d, pv,
+                                        '*' if pv < 0.05 else '')))
+                sep_rows.append([lab, g, d, pv, na, nb, '', ''])
         print('%-26s %s' % (lab, '  '.join(cells)))
     with open(os.path.join(args.out, 'cdr_separation.csv'), 'w', newline='') as fh:
         w = csv.writer(fh)
         w.writerow(['pipeline', 'group', 'cohens_d', 'p_welch',
-                    'n_healthy', 'n_group'])
+                    'n_healthy', 'n_group', 'cohens_d_adjusted', 'p_adjusted'])
         w.writerows(sep_rows)
 
     # ---- paired comparison between pipelines --------------------------------

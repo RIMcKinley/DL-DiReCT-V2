@@ -310,6 +310,38 @@ def wm_deviation(white_vox, ids, wm_mask, zooms, offset=0, lut_path=None):
     return d
 
 
+def segmentation_qc_row(prep_dir, parc, subject_id, id_map=None):
+    """The result-qc-segmentation.csv row: fragmentation plus adjacency.
+
+    Split out of compute() so that a backfill over finished cases writes exactly
+    what a fresh run would, rather than a second implementation that drifts.
+    """
+    segvol, segids = _segmentation_for_qc(prep_dir, id_map)
+    frag = fragmentation(segvol, segids)
+    nov, nov_faces, miss, npairs = adjacency_check(parc)
+    row = {'SUBJECT': subject_id}
+    for side in ('Left', 'Right'):
+        f = frag.get(side, (np.nan, np.nan, 0))
+        row['%s-frag' % side] = '%.6g' % f[0]
+        row['%s-stray' % side] = f[1]
+        row['%s-ncomp' % side] = f[2]
+    row['adjacency-novel'] = len(nov)
+    row['adjacency-novel-faces'] = nov_faces
+    row['adjacency-missing'] = len(miss)
+    row['adjacency-pairs'] = npairs
+    row['adjacency-novel-list'] = ';'.join('%d-%d' % k for k in nov)
+    return row
+
+
+def write_segmentation_qc(row, out_dir):
+    import csv as _csv
+    path = os.path.join(out_dir, 'result-qc-segmentation.csv')
+    with open(path, 'w', newline='') as fh:
+        w = _csv.DictWriter(fh, fieldnames=list(row))
+        w.writeheader(); w.writerow(row)
+    return path
+
+
 def _segmentation_for_qc(prep_dir, id_map):
     """The cerebrum label volume for fragmentation(), whichever way it was written.
 
@@ -698,38 +730,15 @@ def compute(prep_dir, surf_dir=None, subject_id=None, out_dir=None,
     if qc:
         # segmentation-only channels: these see failures wm_deviation cannot,
         # because they never consult the surface. Cheap enough to run always.
-        import csv as _csv
         try:
-            # The label volume is written under different names by different
-            # entry points: preparedata leaves T1w_norm_seg.nii.gz, while
-            # pipeline_gpu writes one mask per structure and no combined
-            # volume. Opening only the first meant this channel silently took
-            # the except path for every case of a 2660-case run. Try the
-            # combined volume, then rebuild the two labels fragmentation()
-            # needs from the per-structure masks.
-            segvol, segids = _segmentation_for_qc(prep_dir, id_map)
-            frag = fragmentation(segvol, segids)
-            nov, nov_faces, miss, npairs = adjacency_check(parc)
-            row = {'SUBJECT': subject_id}
-            for side in ('Left', 'Right'):
-                f = frag.get(side, (np.nan, np.nan, 0))
-                row['%s-frag' % side] = '%.6g' % f[0]
-                row['%s-stray' % side] = f[1]
-                row['%s-ncomp' % side] = f[2]
-            row['adjacency-novel'] = len(nov)
-            row['adjacency-novel-faces'] = nov_faces
-            row['adjacency-missing'] = len(miss)
-            row['adjacency-pairs'] = npairs
-            row['adjacency-novel-list'] = ';'.join('%d-%d' % k for k in nov)
-            path = os.path.join(out_dir, 'result-qc-segmentation.csv')
-            with open(path, 'w', newline='') as fh:
-                w = _csv.DictWriter(fh, fieldnames=list(row))
-                w.writeheader(); w.writerow(row)
+            row = segmentation_qc_row(prep_dir, parc, subject_id, id_map)
+            write_segmentation_qc(row, out_dir)
             if verbose:
-                print('segmentation qc: stray comps L%s/R%s, %d novel adjacencies '
-                      '(%d faces), %d missing borders -> result-qc-segmentation.csv'
-                      % (row['Left-stray'], row['Right-stray'], len(nov), nov_faces,
-                         len(miss)))
+                print('segmentation qc: stray comps L%s/R%s, %s novel adjacencies '
+                      '(%s faces), %s missing borders -> result-qc-segmentation.csv'
+                      % (row['Left-stray'], row['Right-stray'],
+                         row['adjacency-novel'], row['adjacency-novel-faces'],
+                         row['adjacency-missing']))
         except Exception as e:                       # never fail a run over QC
             if verbose:
                 print('segmentation qc skipped: %s' % e)

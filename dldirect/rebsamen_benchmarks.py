@@ -284,13 +284,20 @@ def subject_covariates(groups, meta, etiv_root=None):
     return out
 
 
-def adjust_slopes(vec, subs, cov, extra=None):
+def adjust_slopes(vec, subs, cov, extra=None, fit=None):
     """Residualise a per-subject slope vector on the available covariates.
 
     Columns with no usable values are dropped rather than failing, so an
     unavailable eTIV degrades the adjustment instead of disabling it. Returns
-    (residuals + grand mean, list of covariate names actually used); adding the
-    mean back keeps the output on the mm/year scale the rest of the report uses.
+    (residuals + mean, list of covariate names actually used); adding the mean
+    back keeps the output on the mm/year scale the rest of the report uses.
+
+    `fit` is a boolean mask selecting the entries the coefficients are ESTIMATED
+    on; the fit is then applied to every entry. Rebsamen et al. (2020) estimate
+    the nuisance model on the healthy controls alone and apply it to all
+    samples, which is what group_separation passes. Estimating on the pooled
+    sample instead lets a group difference in age or eTIV bend the very
+    covariate relationship used to remove it. Pass None to fit on everything.
     """
     names, cols = [], []
     base = np.array([cov.get(s, [np.nan, np.nan, np.nan]) for s in subs], float)
@@ -307,10 +314,13 @@ def adjust_slopes(vec, subs, cov, extra=None):
     ok = np.isfinite(vec)
     if not names or ok.sum() < 10:
         return vec, []
-    X = np.column_stack([np.ones(ok.sum())] + [c[ok] for c in cols])
-    beta, _, _, _ = np.linalg.lstsq(X, vec[ok], rcond=None)
+    D = np.column_stack([np.ones(len(vec))] + cols)
+    f = ok if fit is None else (ok & np.asarray(fit, bool))
+    if f.sum() < 10:
+        return vec, []
+    beta, _, _, _ = np.linalg.lstsq(D[f], vec[f], rcond=None)
     out = np.full_like(vec, np.nan)
-    out[ok] = vec[ok] - X @ beta + vec[ok].mean()
+    out[ok] = vec[ok] - D[ok] @ beta + vec[f].mean()
     return out, names
 
 
@@ -334,11 +344,14 @@ def group_separation(groups, cols, ref='CDR 0 (healthy)', cov=None):
             continue
         b = np.nanmean(sl[:, gi], axis=1)
         if cov:
-            # residualise BOTH groups on one pooled fit, so the covariate
-            # relationship is estimated on all subjects rather than separately
-            # per group (which would absorb part of the group difference).
+            # Estimate the covariate model on the HEALTHY CONTROLS ONLY and
+            # apply it to both groups, as Rebsamen et al. (2020) do. Fitting on
+            # the pooled sample lets the group difference in age and eTIV bend
+            # the relationship used to remove it; fitting per group would absorb
+            # the group difference outright. Controls-only avoids both.
             pooled = np.concatenate([a, b])
-            adj, used = adjust_slopes(pooled, a_ids + list(ids), cov)
+            fit = np.concatenate([np.ones(len(a), bool), np.zeros(len(b), bool)])
+            adj, used = adjust_slopes(pooled, a_ids + list(ids), cov, fit=fit)
             if used:
                 a2, b2 = adj[:len(a)], adj[len(a):]
             else:

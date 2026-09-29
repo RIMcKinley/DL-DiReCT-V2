@@ -473,7 +473,7 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                            compute_thickness=True, blend_beta=GATE_BLEND_BETA,
                            velocity_sigma=VELOCITY_SIGMA, smoothing='gated',
                            reorient_alpha=None, nu_source='eulerian',
-                           nu_mode='euclidean', gm_posterior=None):
+                           nu_mode='euclidean', gm_posterior=None, nu=None):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -495,16 +495,68 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
     """
     device = torch.device(device) if device is not None else \
         torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    D, H, W = seg.shape
-    t = lambda a: torch.from_numpy(a.astype(np.float32)).to(device).reshape(1, 1, D, H, W)
-    seg_t, gm_t, wm_t = t(seg), t(gm_prob), t(wm_prob)
+
+    # BATCHING. Every tensor below carries a leading batch dimension that used
+    # to be pinned at 1. Pass seg/gm_prob/wm_prob as SEQUENCES of equally
+    # shaped volumes and the whole solve runs them together in one set of
+    # kernels; pass single volumes and nothing changes -- B is 1 and the
+    # arithmetic is identical, which is what keeps existing callers working.
+    #
+    # The solve was already batch-agnostic everywhere it matters:
+    # gated_velocity_smooth slices with slice(None) on batch and channel and
+    # reduces over dim=1; warp_image indexes channels, not batch, and its
+    # identity_grid at [1, D, H, W, 3] BROADCASTS against a [B, ...]
+    # displacement; grid_sample and F.pad are natively batched. Only the
+    # literal allocations here needed changing.
+    #
+    # The batch must share one grid. Volumes of different shapes cannot be
+    # stacked, and silently padding them would move the anatomy.
+    def _stack(a):
+        if isinstance(a, (list, tuple)):
+            shapes = {np.asarray(x).shape for x in a}
+            if len(shapes) != 1:
+                raise ValueError('batched solve needs one grid, got %s' % sorted(shapes))
+            return np.stack([np.asarray(x, np.float32) for x in a])
+        return np.asarray(a, np.float32)[None]
+
+    seg_b, gm_b, wm_b = _stack(seg), _stack(gm_prob), _stack(wm_prob)
+    if not (seg_b.shape == gm_b.shape == wm_b.shape):
+        raise ValueError('seg/gm_prob/wm_prob disagree: %s %s %s'
+                         % (seg_b.shape, gm_b.shape, wm_b.shape))
+    B, D, H, W = seg_b.shape
+    _batched = isinstance(seg, (list, tuple))
+
+    t = lambda a: torch.from_numpy(a).to(device).reshape(B, 1, D, H, W)
+    seg_t, gm_t, wm_t = t(seg_b), t(gm_b), t(wm_b)
 
     gm_mask = (seg_t == 2).float()                 # the increment lands here ONLY
     wm_contour = extract_wm_contours(seg_t)
     active = (gm_mask + wm_contour).clamp(max=1.0)
     identity = _make_identity_grid((D, H, W), device)
+    # PRECOMPUTED nu. Building it is host work -- distance_transform_edt and
+    # np.gradient, or skfmm for travel -- and on a 2.5M-voxel grid it costs
+    # 9.3 s against a 20.6 s GPU solve, i.e. 45%. In EUCLIDEAN mode nu is a
+    # function of (seg, wmT) alone, so every batch item sharing a WM source
+    # shares a nu: an n x n grid needs n builds, not n^2. Pass it here as a
+    # [B, 3, D, H, W] tensor, or as [1, 3, D, H, W] to be copied across the
+    # whole batch (see the .repeat below -- expand is NOT safe). Travel-time nu also
+    # consumes gm_posterior and does vary per cell, so it cannot be shared
+    # across differing GM sources.
     nu_t = None
-    if blend_beta is not None:
+    if nu is not None:
+        nu_t = nu if nu.shape[0] in (1, B) else None
+        if nu_t is None:
+            raise ValueError('nu has batch %d, need 1 or %d' % (nu.shape[0], B))
+        if nu_t.shape[0] == 1 and B > 1:
+            # .repeat, NOT .expand. expand gives stride 0 on the batch axis so
+            # every item aliases one buffer, and the solve then produces items
+            # that agree with each other but do NOT match the same volume solved
+            # alone -- measured max|diff| 2.6e-2 on a two-item phantom, with the
+            # items bit-identical to each other. A real copy costs
+            # B * 3 * D*H*W * 4 bytes (1.1 GB at B=36 on a 2.5M-voxel grid),
+            # which is affordable and correct.
+            nu_t = nu_t.repeat(B, 1, 1, 1, 1)
+    elif blend_beta is not None:
         if nu_mode == 'travel':
             if gm_posterior is None:
                 raise ValueError(
@@ -526,23 +578,35 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
             # project has repeatedly been misled by ranking on small
             # differences in exactly these counts. A seed that is provably in
             # the wrong place is not worth 0.14 pp.
-            nu_t = travel_time_normal_field(seg, gm_posterior, device,
-                                            ref_img.header.get_zooms()[:3],
-                                            wmT=wm_prob)
+            # nu is built per batch item and stacked: both builders run
+            # scikit-fmm / distance transforms on the host and have no batch
+            # dimension of their own. They return [1, 3, D, H, W], so the cat
+            # gives [B, 3, D, H, W] in the same order as seg_b.
+            gp = (gm_posterior if isinstance(gm_posterior, (list, tuple))
+                  else [gm_posterior] * B)
+            if len(gp) != B:
+                raise ValueError('gm_posterior has %d entries, need %d' % (len(gp), B))
+            nu_t = torch.cat([
+                travel_time_normal_field(seg_b[k], gp[k], device,
+                                         ref_img.header.get_zooms()[:3],
+                                         wmT=wm_b[k])
+                for k in range(B)], dim=0)
         else:
-            nu_t = wm_normal_field(seg, device, wmT=wm_prob,
-                                   spacing=ref_img.header.get_zooms()[:3])
+            nu_t = torch.cat([
+                wm_normal_field(seg_b[k], device, wmT=wm_b[k],
+                                spacing=ref_img.header.get_zooms()[:3])
+                for k in range(B)], dim=0)
 
-    velocity = torch.zeros(1, 3, D, H, W, device=device)
-    integrated = torch.zeros(1, 3, D, H, W, device=device)
-    thickness_img = torch.zeros(1, 1, D, H, W, device=device)
-    cortical_thickness = torch.zeros(1, 1, D, H, W, device=device)
+    velocity = torch.zeros(B, 3, D, H, W, device=device)
+    integrated = torch.zeros(B, 3, D, H, W, device=device)
+    thickness_img = torch.zeros(B, 1, D, H, W, device=device)
+    cortical_thickness = torch.zeros(B, 1, D, H, W, device=device)
 
     for iteration in range(MAX_ITERATIONS):
-        increment = torch.zeros(1, 3, D, H, W, device=device)
-        inverse = torch.zeros(1, 3, D, H, W, device=device)
-        hit = torch.zeros(1, 1, D, H, W, device=device)
-        total = torch.zeros(1, 1, D, H, W, device=device)
+        increment = torch.zeros(B, 3, D, H, W, device=device)
+        inverse = torch.zeros(B, 3, D, H, W, device=device)
+        hit = torch.zeros(B, 1, D, H, W, device=device)
+        total = torch.zeros(B, 1, D, H, W, device=device)
 
         for pt in range(1, INTEGRATION_POINTS + 1):
             inverse = compose_fields(velocity * active, inverse, identity)
@@ -598,7 +662,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
         if reorient_alpha:
             # BEFORE the smoothing, every iteration: see reorient_velocity.
             if nu_ref is None:
-                nu_t = wm_normal_field(seg, device)
+                nu_t = torch.cat([wm_normal_field(seg_b[k], device)
+                                  for k in range(B)], dim=0)
                 nu_ref = (lagrangian_nu(nu_t, inverse, identity)
                           if nu_source == 'lagrangian' else nu_t)
             velocity = reorient_velocity(velocity, nu_ref, reorient_alpha)
@@ -626,9 +691,12 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
 
 
 def velocity_to_numpy(velocity):
-    """[1, 3, D, H, W] tensor -> [D, H, W, 3] float32 array, as the propagation
+    """[B, 3, D, H, W] tensor -> [D, H, W, 3] array, or a LIST of them when B > 1.
+
+    Kept single-volume for B == 1 so every existing caller is untouched.
     and the NIfTI export both want it."""
-    return velocity[0].cpu().numpy().transpose(1, 2, 3, 0).astype(np.float32)
+    a = velocity.detach().cpu().numpy().transpose(0, 2, 3, 4, 1).astype(np.float32)
+    return a[0] if a.shape[0] == 1 else [a[k] for k in range(a.shape[0])]
 
 
 def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbose=True,
@@ -652,8 +720,12 @@ def solve_velocity_field(seg, gm_prob, wm_prob, ref_img, out_prefix=None, verbos
         img = nib.Nifti1Image(vel, ref_img.affine)
         img.header['xyzt_units'] = 10
         nib.save(img, out_prefix + 'Velocity.nii.gz')
-    return vel, (cortical_thickness.squeeze().cpu().numpy()
-                 if cortical_thickness is not None else None)
+    if cortical_thickness is None:
+        return vel, None
+    # squeeze() alone would also drop the batch axis at B == 1, which is what
+    # we want there, but at B > 1 it must be kept: squeeze the CHANNEL only.
+    ct = cortical_thickness.detach()[:, 0].cpu().numpy()
+    return vel, (ct[0] if ct.shape[0] == 1 else [ct[k] for k in range(ct.shape[0])])
 
 
 def propagate_pial(white_verts, faces, velocity, seg, tovox, totkr, pin_mask=None,

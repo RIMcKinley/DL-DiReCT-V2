@@ -533,23 +533,18 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
     # the active bounding box is 4.7x fewer voxels and, on its own, 6.6x faster
     # (superlinear: there is a bandwidth effect on top of the work saved).
     #
-    # MEASURED END TO END THE FLAG IS 5.91x (87.5s -> 14.8s). The bare 6.6x above
-    # was measured with the STOCK criterion on both arms, and part of it was the
-    # full grid converging early on its diluted mean; the support criterion runs
-    # those iterations by design, so 5.91x is the real figure and the remainder is
-    # not recoverable without stopping too soon. _InvertGraph captures a graph per
-    # criterion (key includes the mode), verified bit-identical to the eager loop
-    # in support mode -- max|diff| 0.000e+00 on a full solve.
+    # The cropped grid also falls under INVERT_GRAPH_MAX_VOXELS, so it picks up
+    # the CUDA graph, which is worth -25.6% at 2.45M and +8.1% (i.e. a loss) at
+    # 11.53M -- the size gate is what lets the crop have it and the full grid not.
     #
     # It is NOT safe with the stock convergence test, which means the residual
     # over the whole volume and so converges sooner the more empty space there
     # is -- cropping alone shifts thickness by -0.0075 mm, as large as the entire
     # model-ensemble uncertainty at the global mean. The two therefore ship as
-    # ONE switch: crop_safe crops AND takes the mean over the field's support, and
-    # the pair reproduces the full-grid solve (SAME criterion) to a mean shift of
-    # +2.6e-05 mm. Against the stock default the shift is -8.67e-03 mm, of which
-    # -8.69e-03 is the criterion and +2.6e-05 the crop: the crop is free, the
-    # criterion is the whole cost.
+    # ONE switch: crop_safe crops AND drops invert_field's volume-dependent mean
+    # term, keeping only max_error <= tol, which is scale-free. Measured
+    # crop-vs-full shift: -7.52e-03 mm with the stock test, +1.35e-04 with
+    # max-only. The mean term was the whole problem.
     # See direct_cuda.INVERT_MEAN_OVER_SUPPORT for the deviation this accepts.
     #
     # Pass an int to set the margin in voxels (default 4). Velocity and thickness
@@ -573,8 +568,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                 gp = _g if isinstance(gp, (list, tuple)) else _g[0]
             nu_c = (nu[(slice(None), slice(None)) + sl].contiguous()
                     if nu is not None else None)
-            was = _direct_cuda.INVERT_MEAN_OVER_SUPPORT
-            _direct_cuda.INVERT_MEAN_OVER_SUPPORT = True
+            was = _direct_cuda.INVERT_MAX_ONLY
+            _direct_cuda.INVERT_MAX_ONLY = True
             try:
                 v, th, dv = solve_velocity_field_t(
                     pick(cut(seg_b)), pick(cut(gm_b)), pick(cut(wm_b)), ref_img,
@@ -584,7 +579,7 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                     nu_mode=nu_mode, gm_posterior=gp, nu=nu_c, crop_safe=False,
                     verbose=verbose)
             finally:
-                _direct_cuda.INVERT_MEAN_OVER_SUPPORT = was
+                _direct_cuda.INVERT_MAX_ONLY = was
             V = torch.zeros(B, 3, D, H, W, device=v.device, dtype=v.dtype)
             V[(slice(None), slice(None)) + sl] = v
             T = None

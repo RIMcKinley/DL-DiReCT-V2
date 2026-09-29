@@ -436,11 +436,29 @@ def rasterize_mesh_pv(verts_vox, faces, shape, supersample=3):
     S = int(supersample)
     if S <= 1:
         return rasterize_mesh(verts_vox, faces, shape).astype(np.float32)
-    ss = tuple(int(x) * S for x in shape)
-    v = (np.asarray(verts_vox, np.float64) + 0.5) * S - 0.5
-    m = rasterize_mesh(v, faces, ss)
-    return m.reshape(shape[0], S, shape[1], S, shape[2], S).mean(axis=(1, 3, 5),
-                                                                 dtype=np.float32)
+    v = np.asarray(verts_vox, np.float64)
+
+    # RASTERIZE ON THE MESH'S OWN BOUNDING BOX, not the whole grid. A closed
+    # surface only touches voxels inside its bounding box and its interior is
+    # contained there too, so the rest of the volume is zero either way -- this
+    # is EXACT, verified max|diff| 0. It matters because the supersampled buffer
+    # is shape*S per axis: S=3 on a 176x256x256 conform is 311M voxels to hold
+    # and average down, against 29M for one hemisphere's box. Measured on
+    # OAS30001 lh: 6.00 s -> 1.68 s, 3.6x, and rasterize_mesh_pv was 52% of
+    # build_surface_segmentation.
+    lo = np.maximum(np.floor(v.min(axis=0)).astype(int) - 1, 0)
+    hi = np.minimum(np.ceil(v.max(axis=0)).astype(int) + 2, np.asarray(shape, int))
+    if np.any(hi <= lo):
+        return np.zeros(shape, np.float32)
+    sub = tuple(int(x) for x in (hi - lo))
+    ss = tuple(x * S for x in sub)
+    vv = (v - lo + 0.5) * S - 0.5
+    m = rasterize_mesh(vv, faces, ss)
+    part = m.reshape(sub[0], S, sub[1], S, sub[2], S).mean(axis=(1, 3, 5),
+                                                           dtype=np.float32)
+    out = np.zeros(shape, np.float32)
+    out[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = part
+    return out
 
 
 def reconcile_seg_with_surface(seg, gmT, wmT, wm_mask, label_mask=None):

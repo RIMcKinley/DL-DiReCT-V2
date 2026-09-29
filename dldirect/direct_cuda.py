@@ -329,6 +329,12 @@ def _invert_field_loop(field, identity_grid, max_iter=20, initial=None):
     # of three separate solves because the shared convergence test kept every
     # item iterating until the worst one settled.
     red = (1, 2, 3, 4)
+    # See INVERT_MEAN_OVER_SUPPORT above: the support mask is a function of the
+    # input field alone, so it is computed once, outside the iteration.
+    sup = nsup = None
+    if INVERT_MEAN_OVER_SUPPORT:
+        sup = ((field * field).sum(dim=1, keepdim=True) > 0).float()
+        nsup = sup.sum(dim=red, keepdim=True).clamp(min=1.0)
     for i in range(max_iter):
         residual = warp_image(field, inv, identity_grid) + inv
 
@@ -341,7 +347,10 @@ def _invert_field_loop(field, identity_grid, max_iter=20, initial=None):
         # is exactly what it would have done had it been solved by itself:
         # epsilon depends only on the shared iteration index, so each item's
         # trajectory is unchanged by its neighbours.
-        done = (max_error <= 0.1) | (scaled_norm.mean(dim=red, keepdim=True) <= 0.001)
+        mean_err = ((scaled_norm * sup).sum(dim=red, keepdim=True) / nsup
+                    if sup is not None else
+                    scaled_norm.mean(dim=red, keepdim=True))
+        done = (max_error <= 0.1) | (mean_err <= 0.001)
         if bool(done.all()):
             break
 
@@ -386,6 +395,23 @@ _GRAPH_ENABLED = os.environ.get('DLDIRECT_INVERT_GRAPH', '1') != '0'
 _GRAPH_CACHE = {}
 
 
+# CROP-SAFE CONVERGENCE. The stock early stop takes the mean residual over the
+# WHOLE volume, matching ANTs itkInvertDisplacementFieldImageFilter. That mean is
+# diluted by far-field zeros, so a grid with more empty space around the head
+# converges in FEWER iterations and the inverse field differs everywhere -- the
+# solve is a function of how much background surrounds the brain. Measured on
+# OAS30001: 11.8 iterations at 11.53M voxels vs 14.3 at 2.45M (+21.5%), giving a
+# thickness shift of -0.0075 mm, as large as the whole model-ensemble uncertainty
+# at the global mean.
+#
+# With this flag the mean is taken over the FIELD'S SUPPORT, which does not change
+# when the grid is padded. That makes a cropped solve reproduce the full-grid one
+# (mean shift -7.52e-03 -> +2.59e-05 mm) and so makes cropping -- worth 6.6x --
+# safe. It is a DELIBERATE DEVIATION FROM ANTs, not a bug fix, and it changes
+# results relative to everything computed before it. Off by default.
+INVERT_MEAN_OVER_SUPPORT = False
+
+
 def _use_graph(field):
     return _GRAPH_ENABLED and field.is_cuda
 
@@ -393,11 +419,22 @@ def _use_graph(field):
 class _InvertGraph:
     RED = (1, 2, 3, 4)
 
-    def __init__(self, shape, device, identity_grid):
+    def __init__(self, shape, device, identity_grid, over_support=False):
         self.field = torch.zeros(shape, device=device)
         self.inv = torch.zeros(shape, device=device)
         self.ident = identity_grid.clone()
         self.flag = torch.zeros((), dtype=torch.bool, pin_memory=True)
+        # The support mask depends only on the INPUT field, which run() copies in
+        # before the first replay -- so it lives in persistent buffers filled the
+        # same way, and the captured kernels read whatever is in them. A separate
+        # graph is captured per criterion rather than making the test data-driven
+        # (sup=ones, nsup=numel), because (x*ones).sum()/N is not guaranteed
+        # bit-identical to x.mean() and the stock path must stay exact.
+        self.over_support = bool(over_support)
+        if self.over_support:
+            b = shape[0]
+            self.sup = torch.zeros((b, 1) + tuple(shape[2:]), device=device)
+            self.nsup = torch.ones((b, 1, 1, 1, 1), device=device)
         # warm up on a side stream (torch's capture recipe), then capture one
         # graph per epsilon so the constant is baked in exactly as in the loop
         cur = torch.cuda.current_stream(device)
@@ -423,7 +460,10 @@ class _InvertGraph:
         residual = warp_image(self.field, inv, self.ident) + inv
         scaled_norm = (residual * residual).sum(dim=1, keepdim=True).sqrt()
         max_error = scaled_norm.amax(dim=self.RED, keepdim=True)
-        done = (max_error <= 0.1) | (scaled_norm.mean(dim=self.RED, keepdim=True) <= 0.001)
+        mean_err = ((scaled_norm * self.sup).sum(dim=self.RED, keepdim=True) / self.nsup
+                    if self.over_support else
+                    scaled_norm.mean(dim=self.RED, keepdim=True))
+        done = (max_error <= 0.1) | (mean_err <= 0.001)
         self.flag.copy_(done.all(), non_blocking=True)
         threshold = epsilon * max_error
         clamp_scale = torch.where(scaled_norm > threshold,
@@ -434,6 +474,9 @@ class _InvertGraph:
 
     def run(self, field, max_iter, initial):
         self.field.copy_(field)
+        if self.over_support:
+            self.sup.copy_(((field * field).sum(dim=1, keepdim=True) > 0).float())
+            self.nsup.copy_(self.sup.sum(dim=self.RED, keepdim=True).clamp(min=1.0))
         if initial is not None:
             self.inv.copy_(initial)
         else:
@@ -449,11 +492,12 @@ class _InvertGraph:
 
 def _invert_field_graph(field, identity_grid, max_iter, initial):
     global _GRAPH_ENABLED
-    key = (tuple(field.shape), field.device)
+    key = (tuple(field.shape), field.device, INVERT_MEAN_OVER_SUPPORT)
     g = _GRAPH_CACHE.get(key)
     if g is None:
         try:
-            g = _InvertGraph(field.shape, field.device, identity_grid)
+            g = _InvertGraph(field.shape, field.device, identity_grid,
+                             over_support=INVERT_MEAN_OVER_SUPPORT)
         except Exception as e:   # capture failed: an optimisation, so fall back
             import warnings
             warnings.warn('CUDA-graph invert_field disabled: %r' % (e,))

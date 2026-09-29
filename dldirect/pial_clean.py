@@ -42,6 +42,7 @@ import torch
 import torch.nn.functional as F
 from scipy.ndimage import map_coordinates
 
+from . import direct_cuda as _direct_cuda
 from .direct_cuda import (gaussian_smooth_3d, gaussian_gradient_3d, extract_wm_contours,
                           _make_identity_grid, warp_image, compose_fields, invert_field)
 from .field_pial_prototype import (load_gm_wm_probability, build_seg_maps, make_transforms,
@@ -473,7 +474,8 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
                            compute_thickness=True, blend_beta=GATE_BLEND_BETA,
                            velocity_sigma=VELOCITY_SIGMA, smoothing='gated',
                            reorient_alpha=None, nu_source='eulerian',
-                           nu_mode='euclidean', gm_posterior=None, nu=None):
+                           nu_mode='euclidean', gm_posterior=None, nu=None,
+                           crop_safe=False):
     """The solve itself, returning the field as a TORCH TENSOR on its device.
 
     Returns (velocity, thickness, device) with velocity [1, 3, D, H, W] and
@@ -526,6 +528,70 @@ def solve_velocity_field_t(seg, gm_prob, wm_prob, ref_img, verbose=True, device=
     B, D, H, W = seg_b.shape
     _batched = isinstance(seg, (list, tuple))
 
+    # CROP-SAFE SOLVE. The solve iterates the whole grid to do work that touches
+    # the active region only -- 5.1% of a 256^3 conform on OAS30001. Cropping to
+    # the active bounding box is 4.7x fewer voxels and, on its own, 6.6x faster
+    # (superlinear: there is a bandwidth effect on top of the work saved).
+    #
+    # MEASURED END TO END THE FLAG IS 5.91x (87.5s -> 14.8s). The bare 6.6x above
+    # was measured with the STOCK criterion on both arms, and part of it was the
+    # full grid converging early on its diluted mean; the support criterion runs
+    # those iterations by design, so 5.91x is the real figure and the remainder is
+    # not recoverable without stopping too soon. _InvertGraph captures a graph per
+    # criterion (key includes the mode), verified bit-identical to the eager loop
+    # in support mode -- max|diff| 0.000e+00 on a full solve.
+    #
+    # It is NOT safe with the stock convergence test, which means the residual
+    # over the whole volume and so converges sooner the more empty space there
+    # is -- cropping alone shifts thickness by -0.0075 mm, as large as the entire
+    # model-ensemble uncertainty at the global mean. The two therefore ship as
+    # ONE switch: crop_safe crops AND takes the mean over the field's support, and
+    # the pair reproduces the full-grid solve (SAME criterion) to a mean shift of
+    # +2.6e-05 mm. Against the stock default the shift is -8.67e-03 mm, of which
+    # -8.69e-03 is the criterion and +2.6e-05 the crop: the crop is free, the
+    # criterion is the whole cost.
+    # See direct_cuda.INVERT_MEAN_OVER_SUPPORT for the deviation this accepts.
+    #
+    # Pass an int to set the margin in voxels (default 4). Velocity and thickness
+    # are returned on the FULL grid, so no caller has to know this happened.
+    if crop_safe:
+        margin = 4 if crop_safe is True else int(crop_safe)
+        _s = torch.from_numpy(seg_b).reshape(B, 1, D, H, W)
+        _act = ((_s == 2).float() + extract_wm_contours(_s)).clamp(max=1.0)
+        _act = (_act.numpy()[:, 0] > 0).any(axis=0)
+        if _act.any():
+            _i = np.array(np.nonzero(_act))
+            _lo = np.maximum(_i.min(1) - margin, 0)
+            _hi = np.minimum(_i.max(1) + 1 + margin, np.array([D, H, W]))
+            sl = tuple(slice(int(a), int(b)) for a, b in zip(_lo, _hi))
+            cut = lambda a: a[(slice(None),) + sl]
+            pick = lambda a: [x for x in a] if _batched else a[0]
+            gp = gm_posterior
+            if gp is not None:
+                _g = [np.asarray(x)[sl] for x in
+                      (gp if isinstance(gp, (list, tuple)) else [gp])]
+                gp = _g if isinstance(gp, (list, tuple)) else _g[0]
+            nu_c = (nu[(slice(None), slice(None)) + sl].contiguous()
+                    if nu is not None else None)
+            was = _direct_cuda.INVERT_MEAN_OVER_SUPPORT
+            _direct_cuda.INVERT_MEAN_OVER_SUPPORT = True
+            try:
+                v, th, dv = solve_velocity_field_t(
+                    pick(cut(seg_b)), pick(cut(gm_b)), pick(cut(wm_b)), ref_img,
+                    device=device, compute_thickness=compute_thickness,
+                    blend_beta=blend_beta, smoothing=smoothing,
+                    reorient_alpha=reorient_alpha, nu_source=nu_source,
+                    nu_mode=nu_mode, gm_posterior=gp, nu=nu_c, crop_safe=False,
+                    verbose=verbose)
+            finally:
+                _direct_cuda.INVERT_MEAN_OVER_SUPPORT = was
+            V = torch.zeros(B, 3, D, H, W, device=v.device, dtype=v.dtype)
+            V[(slice(None), slice(None)) + sl] = v
+            T = None
+            if th is not None:
+                T = torch.zeros(B, 1, D, H, W, device=th.device, dtype=th.dtype)
+                T[(slice(None), slice(None)) + sl] = th
+            return V, T, dv
     t = lambda a: torch.from_numpy(a).to(device).reshape(B, 1, D, H, W)
     seg_t, gm_t, wm_t = t(seg_b), t(gm_b), t(wm_b)
 

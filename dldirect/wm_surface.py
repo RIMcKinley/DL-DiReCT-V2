@@ -35,7 +35,7 @@ def get_vox2ras_tkr(t1):
     return v2rtkr
 
 
-def rec_surf(binary, affine, r):
+def rec_surf(binary, affine, r, return_levelset=False):
     # Reconstruct topologically correct surfaces
     # https://nighres.readthedocs.io/en/latest/shape/topology_correction.html
     # https://nighres.readthedocs.io/en/latest/surface/levelset_to_mesh.html
@@ -72,6 +72,18 @@ def rec_surf(binary, affine, r):
     vertices = l2m_ret['result']['points'] - pad
     faces = l2m_ret['result']['faces']
 
+    if return_levelset:
+        # `corrected` is the TOPOLOGY-CORRECTED levelset this mesh was cut from,
+        # negative inside, in voxels of the grid `binary` was given on. It is the
+        # right object to average across segmentations: rasterising the meshes back
+        # to occupancy and re-deriving a distance loses the correction's guarantees
+        # and bakes the Taubin smoothing in as a shape change. Padding is undone so
+        # it indexes like `binary`; the mesh vertices already have `pad` subtracted.
+        lv = np.asarray(ret['corrected'].get_fdata(), np.float32)
+        if pad:
+            sl = tuple(slice(pad, n - pad) for n in lv.shape)
+            lv = np.ascontiguousarray(lv[sl])
+        return vertices, faces, lv
     return vertices, faces
 
 
@@ -222,6 +234,26 @@ def _build_one(job):
                                     topology=topology, priority=priority)
 
 
+def ribbon_bbox_union(prep_dirs, margin=CROP_MARGIN, regions=('lh', 'rh')):
+    """One bounding box covering every prep's ribbon, so they share a grid.
+
+    Each prep's own ribbon_bbox differs, which puts its surfaces in a different
+    tkrRAS frame and makes cross-prep surface reuse invalid. The union is the
+    cheapest fix that keeps the crop's speed.
+    """
+    import os
+    import pandas as pd
+    from . import wm_labels
+    boxes = []
+    for d in prep_dirs:
+        seg = nib.load(os.path.join(d, 'mri', 'aparc.atlas+aseg.nii.gz')).get_fdata()
+        df = pd.read_csv(os.path.join(d, 'label_def.csv')).set_index('LABEL').to_dict()
+        ex = wm_labels.read_record(os.path.join(d, 'mri'))
+        boxes.append(ribbon_bbox(seg, df, ex, margin, regions))
+    return tuple(slice(min(b[a].start for b in boxes),
+                       max(b[a].stop for b in boxes)) for a in range(3))
+
+
 def ribbon_bbox(seg, df_labels, excluded, margin=CROP_MARGIN,
                 regions=('lh', 'rh')):
     """Slices bounding both hemispheres' ribbon, grown by `margin` voxels.
@@ -278,8 +310,15 @@ def load_inputs(prep_dir, crop=False, margin=CROP_MARGIN):
     # The structures preparedata.py left out of the hemisphere fill for this
     # run. Read, not re-specified, so the two masks cannot disagree.
     excluded = wm_labels.read_record(os.path.join(prep_dir, 'mri'))
-    if crop:
-        sl = ribbon_bbox(seg, df_labels, excluded, margin)
+    if crop is not False and crop is not None:
+        # `crop` may be an EXPLICIT tuple of slices instead of True. Comparing two
+        # segmentations of the same scan needs them on ONE grid: each computes its
+        # own ribbon_bbox, so a surface built under one prep's crop is not in the
+        # other's frame, and build_surface_segmentation's frame guard rejects it.
+        # Pass the union of their boxes (see ribbon_bbox_union) to get the speed of
+        # cropping with a shared frame; crop=False also works but fast-marches the
+        # whole volume for nothing.
+        sl = crop if isinstance(crop, tuple) else ribbon_bbox(seg, df_labels, excluded, margin)
         off = np.array([s.start for s in sl], float)
         seg = np.ascontiguousarray(seg[sl])
         aff = seg_img.affine.copy()

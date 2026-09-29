@@ -295,6 +295,10 @@ def compose_fields(A, B, identity_grid):
 def invert_field(field, identity_grid, max_iter=20, initial=None):
     """Invert displacement field via damped fixed-point iteration.
 
+    On CUDA the iteration runs as a replayed CUDA graph (see _InvertGraph);
+    the result is bit-identical to the eager loop below, which is the
+    reference and the fallback.
+
     Matches ANTs itkInvertDisplacementFieldImageFilter:
     - Proportional clamping: per-voxel updates are scaled down when their
       norm exceeds epsilon * maxErrorNorm, preventing outlier-driven overshoot.
@@ -307,6 +311,10 @@ def invert_field(field, identity_grid, max_iter=20, initial=None):
         max_iter: number of iterations (default 20, warm-started)
         initial: [B, 3, D, H, W] initial estimate (None = zeros)
     """
+    if _use_graph(field):
+        out = _invert_field_graph(field, identity_grid, max_iter, initial)
+        if out is not None:
+            return out
     return _invert_field_loop(field, identity_grid, max_iter, initial)
 
 
@@ -348,6 +356,112 @@ def _invert_field_loop(field, identity_grid, max_iter=20, initial=None):
         update = epsilon * clamp_scale * residual
         inv = inv - torch.where(done, torch.zeros_like(update), update)
     return inv
+
+
+# CUDA-GRAPH INVERSION. The loop above is HOST-bound, not sync-bound: profiled
+# at 127x124x159 (B=1) the GPU is busy 30% of the wall time, because every
+# iteration is ~25 kernel launches (compiled warp_image + eager norm, test,
+# clamp, update) and Python dispatch for those costs more than the GPU work
+# (~900 us wall vs ~450 us of kernels per iteration on a loaded host). The
+# earlier attempts at removing the sync itself (pial_clean.py, above
+# wm_normal_field) lost because the sync was never the bottleneck: a sync-free
+# oracle with a known trip count was only 5% faster.
+#
+# Capturing one whole iteration as a CUDA graph and replaying it collapses
+# the host work to one launch per iteration. The convergence flag is copied
+# into pinned host memory INSIDE the graph; after each replay the host waits
+# on the stream and reads it, so the loop exits on exactly the iteration the
+# eager loop breaks on. The update is masked by `done` exactly as in the loop,
+# so the exit replay (whose update is all zero) leaves inv where `break`
+# would. Verified bit-identical (max|diff| 0) on 12 captured calls at B=1 and
+# on a 3-item batch, each item identical to its single-item solve.
+#
+# Static buffers: the graph is baked to the addresses of self.field/self.inv
+# (and its own copy of the identity grid, which is a function of shape only),
+# so inputs are copied in and the result cloned out -- 3 x 30 MB per call at
+# B=1, ~0.3% of the solve. One graph set per (shape, device) is kept, the
+# most recent only: a set holds ~10 grid-sized intermediates, and a batch of
+# subjects has a new crop shape each.
+_GRAPH_ENABLED = os.environ.get('DLDIRECT_INVERT_GRAPH', '1') != '0'
+_GRAPH_CACHE = {}
+
+
+def _use_graph(field):
+    return _GRAPH_ENABLED and field.is_cuda
+
+
+class _InvertGraph:
+    RED = (1, 2, 3, 4)
+
+    def __init__(self, shape, device, identity_grid):
+        self.field = torch.zeros(shape, device=device)
+        self.inv = torch.zeros(shape, device=device)
+        self.ident = identity_grid.clone()
+        self.flag = torch.zeros((), dtype=torch.bool, pin_memory=True)
+        # warm up on a side stream (torch's capture recipe), then capture one
+        # graph per epsilon so the constant is baked in exactly as in the loop
+        cur = torch.cuda.current_stream(device)
+        s = torch.cuda.Stream(device=device)
+        s.wait_stream(cur)
+        with torch.cuda.stream(s):
+            for _ in range(2):
+                self._body(0.75)
+                self._body(0.5)
+        cur.wait_stream(s)
+        self.graphs = []
+        pool = None
+        for eps in (0.75, 0.5):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g, pool=pool):
+                self._body(eps)
+            pool = g.pool()
+            self.graphs.append(g)
+
+    def _body(self, epsilon):
+        # one fixed-point iteration, arithmetic identical to _invert_field_loop
+        inv = self.inv
+        residual = warp_image(self.field, inv, self.ident) + inv
+        scaled_norm = (residual * residual).sum(dim=1, keepdim=True).sqrt()
+        max_error = scaled_norm.amax(dim=self.RED, keepdim=True)
+        done = (max_error <= 0.1) | (scaled_norm.mean(dim=self.RED, keepdim=True) <= 0.001)
+        self.flag.copy_(done.all(), non_blocking=True)
+        threshold = epsilon * max_error
+        clamp_scale = torch.where(scaled_norm > threshold,
+                                  threshold / scaled_norm.clamp(min=1e-10),
+                                  torch.ones_like(scaled_norm))
+        update = epsilon * clamp_scale * residual
+        inv.sub_(torch.where(done, torch.zeros_like(update), update))
+
+    def run(self, field, max_iter, initial):
+        self.field.copy_(field)
+        if initial is not None:
+            self.inv.copy_(initial)
+        else:
+            self.inv.zero_()
+        stream = torch.cuda.current_stream(field.device)
+        for i in range(max_iter):
+            self.graphs[0 if i == 0 else 1].replay()
+            stream.synchronize()
+            if bool(self.flag):
+                break
+        return self.inv.clone()
+
+
+def _invert_field_graph(field, identity_grid, max_iter, initial):
+    global _GRAPH_ENABLED
+    key = (tuple(field.shape), field.device)
+    g = _GRAPH_CACHE.get(key)
+    if g is None:
+        try:
+            g = _InvertGraph(field.shape, field.device, identity_grid)
+        except Exception as e:   # capture failed: an optimisation, so fall back
+            import warnings
+            warnings.warn('CUDA-graph invert_field disabled: %r' % (e,))
+            _GRAPH_ENABLED = False
+            return None
+        _GRAPH_CACHE.clear()
+        _GRAPH_CACHE[key] = g
+    return g.run(field, max_iter, initial)
 
 
 def extract_wm_contours(seg_tensor):

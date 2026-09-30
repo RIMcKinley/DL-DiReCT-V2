@@ -46,10 +46,21 @@ alternative was tried and rejected:
   crop_safe on the solve, GPU propagation.  Together ~6x and ~166x; the
   numerical results are unchanged to the fourth decimal.
 
-The shared surface is not only for correspondence: measured on one rescan pair it
-cut the parcel-wise scan-rescan difference by ~35% and the global difference by
-3.8x against independently built surfaces, because two independently meshed
-surfaces differ before the data says anything.
+The shared surface buys CORRESPONDENCE, not reproducibility. The controlled arm
+(`nxn_pilot/reliability/independent_arm.py`: the same 40 rescan pairs, the same
+solve, only the surface differs) is a null -- parcel-wise eps_mu 1.0444% shared
+vs 1.0128% independent, ratio 1.03, shared better in 17/40, Wilcoxon p=0.115.
+An earlier "~35% parcel / 3.8x global" claim here came from an uncontrolled
+comparison on one pair and is WITHDRAWN; so is a 6-7% deficit seen in the same
+arm at n=25, which regressed to the null by n=40. Score any such comparison on
+parcels or vertices: the global eps_mu is the solve's voxelwise thickness field,
+which never touches the surface, so both arms agree exactly and the test is
+vacuous.
+
+What the shared surface does deliver is vertex correspondence across timepoints,
+and with it the cluster-mass statistic against an empirical null. It also fits
+each native segmentation somewhat better than a per-scan mesh (0.27 vs 0.36 mm
+mean deviation, 12/12 scans), for reasons that are untested.
 
 Resumable: every stage writes to `out/` and is skipped if its output is present.
 """
@@ -208,12 +219,21 @@ def place_surfaces(SD, LV, tv, ltas, Ah, out, t0, tol=0.06):
     import nibabel as nib
     from scipy.ndimage import map_coordinates
     from dldirect.field_pial_prototype import get_vox2ras_tkr
-    WV, checks = {}, {}
+    WV, checks, dev = {}, {}, {}
     for k, d in SD.items():
         ref = d['ref_img']
         Mat = np.linalg.inv(ref.affine) @ np.linalg.inv(ltas[k[0]]) @ Ah
         vn = (Mat @ np.vstack([tv.T, np.ones(len(tv))]))[:3].T
+        # BEFORE projection: the levelset value at the consensus position is
+        # exactly how far this scan-and-model's WM boundary sits from the joint
+        # surface, per vertex, in voxels. This is the single-surface QC -- it
+        # needs no other model at analysis time. The spread of the PROJECTED
+        # surfaces understates it badly (median 0.023 mm), because projection has
+        # already pulled every one of them onto its own valid boundary.
+        zz = np.abs(map_coordinates(LV[k], vn.T, order=1, mode='nearest'))
         vp = project(vn, LV[k])
+        dev[k] = np.linalg.norm(vp - vn, axis=1).astype(np.float32)
+        dev[('levelset', ) + k] = zz.astype(np.float32)
         WV[k] = nib.affines.apply_affine(get_vox2ras_tkr(ref), vp)
         w = float(np.median(map_coordinates(np.asarray(d['wmT'], np.float32),
                                             vp.T, order=1, mode='nearest')))
@@ -223,9 +243,11 @@ def place_surfaces(SD, LV, tv, ltas, Ah, out, t0, tol=0.06):
                                'vertices is %.3f, expected ~0.50. The transform '
                                'chain or the levelset is wrong -- refusing to '
                                'solve on it.' % (k[0] + 1, k[1], w))
-    log('surfaces placed; wmT at vertices %.3f-%.3f (want ~0.50)'
-        % (min(checks.values()), max(checks.values())), t0)
-    return WV, checks
+    dd = [np.median(v) for kk, v in dev.items() if not isinstance(kk[0], str)]
+    log('surfaces placed; wmT at vertices %.3f-%.3f (want ~0.50); consensus-to-model '
+        'boundary offset %.3f-%.3f voxels (median)'
+        % (min(checks.values()), max(checks.values()), min(dd), max(dd)), t0)
+    return WV, checks, dev
 
 
 # --------------------------------------------------------------------------
@@ -262,7 +284,6 @@ def solve_cells(SD, WV, tf, models, out, t0, full=False, crop_margin=4):
     PIAL = np.zeros((len(tps), n, n, NV, 3), np.float32)
     TRAV = np.zeros((len(tps), n, n, NV), np.float32)
     THK = np.full((len(tps), n, n), np.nan)
-    shape = tuple(np.asarray(SD[(tps[0], models[0])]['seg']).shape)
     for ti in tps:
         for a, i in enumerate(models):
             ck = os.path.join(out, 'cells_t%d_%s.npz' % (ti + 1, i))
@@ -273,6 +294,9 @@ def solve_cells(SD, WV, tf, models, out, t0, full=False, crop_margin=4):
                 continue
             key = (ti, i); ref = SD[key]['ref_img']
             tovox, totkr = make_transforms(ref)
+            # PER SCAN: two timepoints from different scanners do not share a
+            # grid, and nu is allocated on this scan's own shape.
+            shape = tuple(np.asarray(SD[key]['seg']).shape)
             # nu on the crop: it is a function of (seg, wmT) alone, so one build
             # per WM source serves the whole row.
             seg_i = np.asarray(SD[key]['seg'])
@@ -371,7 +395,85 @@ def parcellate(preps, WV, PIAL, models, out, t0):
 
 
 # --------------------------------------------------------------------------
-# stage 7: report
+# stage 7: QC
+# --------------------------------------------------------------------------
+
+def qc(SD, WV, PIAL, TRAV, tf, models, parc, ltas, out, t0, dev=None):
+    """Per-scan quality signals, written to qc.json and qc.npz.
+
+    Three groups:
+      GEOMETRY   self-intersecting faces, and the white surface's distance to the
+                 WM boundary it should lie on -- the established WM-deviation
+                 channel, which reaches AUC 0.94 per parcel against 0.84 global.
+      ENSEMBLE   per-scan model disagreement, which a single-model pipeline
+                 cannot produce. Where the models disagree the measurement is
+                 uncertain FOR THAT SCAN, so this is a confidence map rather than
+                 a cohort-level error bar. Also the parcellation vote agreement,
+                 whose non-unanimous vertices are the parcel borders.
+      ACQUISITION  head motion, from the registration.
+
+    Nothing is thresholded here. Flags are 2.8x commoner in AD, so filtering a
+    group comparison on them biases it; emit the numbers and let the analysis
+    decide.
+    """
+    import torch
+    from dldirect.field_pial_prototype import make_transforms, _self_intersecting_faces
+    from scipy.ndimage import distance_transform_edt, map_coordinates
+    n = len(models); rec = {}
+    arrays = {}
+    for (ti, m), d in sorted(SD.items()):
+        k = models.index(m); tag = 't%d_%s' % (ti + 1, m)
+        seg = np.asarray(d['seg']); ref = d['ref_img']
+        tovox, _ = make_transforms(ref)
+        wmb = seg == 3
+        sdt = (distance_transform_edt(~wmb).astype(np.float32)
+               - distance_transform_edt(wmb).astype(np.float32))
+        dist = np.abs(map_coordinates(sdt, tovox(WV[(ti, m)]).T, order=1, mode='nearest'))
+        pial = PIAL[ti, k, k]
+        si = _self_intersecting_faces(np.asarray(pial, np.float64), tf)
+        rec[tag] = dict(
+            wm_deviation_mean=float(dist.mean()),
+            wm_deviation_p95=float(np.percentile(dist, 95)),
+            pial_self_int_faces=int(np.asarray(si, bool).sum()) if si is not None else -1,
+            pial_self_int_pct=float(100 * np.asarray(si, bool).mean()) if si is not None else -1.0,
+            thickness_mean=float(np.nanmean(TRAV[ti, k, k])),
+            wm_voxels=int(wmb.sum()), gm_voxels=int((seg == 2).sum()))
+    for kk, v in (dev or {}).items():
+        if isinstance(kk[0], str):          # the levelset offset, in voxels
+            tag = 't%d_%s' % (kk[1] + 1, kk[2])
+            rec.setdefault(tag, {}).update(
+                consensus_offset_median_vox=float(np.median(v)),
+                consensus_offset_p95_vox=float(np.percentile(v, 95)),
+                consensus_offset_mean_vox=float(v.mean()))
+            arrays['consensus_offset_%s' % tag] = v
+    for ti in range(TRAV.shape[0]):
+        dd = TRAV[ti, np.arange(n), np.arange(n)]
+        sd = dd.std(0, ddof=1) if n > 1 else np.zeros(dd.shape[1])
+        arrays['ensemble_sd_t%d' % (ti + 1)] = sd.astype(np.float32)
+        rec['t%d_ensemble' % (ti + 1)] = dict(
+            model_sd_median=float(np.median(sd)), model_sd_p95=float(np.percentile(sd, 95)),
+            model_sd_mean=float(sd.mean()), n_models=n)
+    for name, (lab, agree) in (parc or {}).items():
+        arrays['%s_agreement' % name] = agree.astype(np.float32)
+        rec['parcellation_%s' % name] = dict(
+            unanimous_pct=float(100 * (agree == 1).mean()),
+            median_agreement=float(np.median(agree)))
+    for i, L in enumerate(ltas):
+        ang = float(np.degrees(np.arccos(np.clip((np.trace(L[:3, :3]) - 1) / 2, -1, 1))))
+        rec['t%d_motion' % (i + 1)] = dict(rotation_deg=ang,
+                                           translation_mm=float(np.linalg.norm(L[:3, 3])))
+    json.dump(rec, open(os.path.join(out, 'qc.json'), 'w'), indent=2, sort_keys=True)
+    if arrays:
+        np.savez_compressed(os.path.join(out, 'qc.npz'), **arrays)
+    wm = [v['wm_deviation_mean'] for v in rec.values() if 'wm_deviation_mean' in v]
+    si = [v['pial_self_int_pct'] for v in rec.values() if 'pial_self_int_pct' in v]
+    log('qc: WM deviation %.3f-%.3f mm, pial self-int %.3f-%.3f%% of faces'
+        % (min(wm), max(wm), min(si), max(si)), t0)
+    return rec
+
+
+# --------------------------------------------------------------------------
+# stage 8: report
 # --------------------------------------------------------------------------
 
 def report(TRAV, THK, models, out, parc=None):
@@ -447,10 +549,11 @@ def main(argv=None):
     keyed = {(ti, m): preps[(ti, m)] for ti in range(len(a.t1)) for m in a.models}
     SD, LV = build_natives(keyed, a.out, t0, nsmooth=a.nsmooth)
     tv, tf, Ah, SH = joint_template(SD, LV, hw, ltas, a.out, t0)
-    WV, checks = place_surfaces(SD, LV, tv, ltas, Ah, a.out, t0)
+    WV, checks, dev = place_surfaces(SD, LV, tv, ltas, Ah, a.out, t0)
     PIAL, TRAV, THK = solve_cells(SD, WV, tf, a.models, a.out, t0,
                                   full=a.full, crop_margin=a.crop_margin)
     parc = parcellate(keyed, WV, PIAL, list(a.models), a.out, t0)
+    qcrec = qc(SD, WV, PIAL, TRAV, tf, list(a.models), parc, ltas, a.out, t0, dev)
     np.savez_compressed(os.path.join(a.out, 'result.npz'), PIAL=PIAL, TRAV=TRAV,
                         THK=THK, tf=tf, tv=tv, models=np.array(a.models),
                         WV=np.stack([np.stack([WV[(ti, m)] for m in a.models])
@@ -458,7 +561,8 @@ def main(argv=None):
                         **{'%s_labels' % k: v[0] for k, v in parc.items()},
                         **{'%s_agreement' % k: v[1] for k, v in parc.items()})
     json.dump(dict(frame_checks=checks, models=list(a.models), full=bool(a.full),
-                   minutes=round((time.time() - t0) / 60, 2)),
+                   minutes=round((time.time() - t0) / 60, 2),
+                   qc_written=True),
               open(os.path.join(a.out, 'provenance.json'), 'w'), indent=2)
     log('done -> %s/result.npz' % a.out, t0)
     report(TRAV, THK, a.models, a.out, parc)

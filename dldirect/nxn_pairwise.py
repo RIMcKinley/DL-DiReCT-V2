@@ -150,14 +150,40 @@ def signed_distance(pv):
 
 
 def build_natives(preps, out, t0, nsmooth=50):
+    """Native PV maps, plus ONE LEVELSET PER HEMISPHERE.
+
+    surface_seg ALREADY builds the two hemispheres separately (`build_hemisphere`
+    per hemi, returned as `surfaces={'lh':..., 'rh':...}`); it is the single line
+    `pv_wm += rasterize_mesh_pv(...)` that sums them into one volume. Taking the
+    levelset of that combined wmT threw the separation away: the corpus callosum
+    is white matter, so the union is one connected object and meshes to a single
+    genus-0 whole-brain surface.
+
+    That is topologically fine but useless downstream -- `mris_register` aligns
+    to fsaverage's per-hemisphere spheres and has no target for a whole-brain
+    one. So rasterise each hemisphere's own surface, which surface_seg has
+    already handed us, and keep them apart.
+
+    The COMBINED wmT is still what the solve consumes -- the velocity field is
+    volumetric and the ribbon is whole-brain. Only the template is per-hemisphere.
+    """
     from dldirect import surface_seg
+    from dldirect.field_pial_prototype import make_transforms, rasterize_mesh_pv
     SD, LV = {}, {}
     for k, prep in preps.items():
-        SD[k] = surface_seg.build_surface_segmentation(
+        d = surface_seg.build_surface_segmentation(
             prep, hemis=('lh', 'rh'), nsmooth=nsmooth, crop=True,
             topology='none', correct_ribbon=False, verbose=False)
-        LV[k] = signed_distance(np.clip(np.asarray(SD[k]['wmT'], np.float32), 0, 1))
-    log('%d native segmentations and levelsets' % len(SD), t0)
+        SD[k] = d
+        tovox, _ = make_transforms(d['ref_img'])
+        shape = np.asarray(d['seg']).shape
+        LV[k] = {}
+        for h in ('lh', 'rh'):
+            hv, hf = d['surfaces'][h]
+            pv = np.clip(rasterize_mesh_pv(tovox(np.asarray(hv)), np.asarray(hf),
+                                           shape, 3).astype(np.float32), 0, 1)
+            LV[k][h] = signed_distance(pv)
+    log('%d native segmentations, levelsets per hemisphere' % len(SD), t0)
     return SD, LV
 
 
@@ -172,24 +198,33 @@ def joint_template(SD, LV, hw_path, ltas, out, t0):
     hw = nib.load(hw_path); Ah = hw.affine; SH = tuple(hw.shape[:3])
     if os.path.exists(cache):
         z = np.load(cache)
-        log('joint template loaded: %d vertices' % len(z['tv']), t0)
-        return z['tv'], z['tf'].astype(int), Ah, SH
+        if 'hemi' not in z:            # pre per-hemisphere cache: rebuild
+            os.remove(cache)
+        else:
+            log('joint template loaded: %d vertices' % len(z['tv']), t0)
+            return z['tv'], z['tf'].astype(int), Ah, SH, z['hemi']
     g = np.indices(SH).reshape(3, -1)
     hom = np.vstack([g, np.ones(g.shape[1])])
-    acc = np.zeros(SH, np.float64)
-    for (ti, m), lv in LV.items():
-        Mat = np.linalg.inv(SD[(ti, m)]['ref_img'].affine) @ np.linalg.inv(ltas[ti]) @ Ah
-        acc += map_coordinates(lv, (Mat @ hom)[:3], order=1,
-                               mode='nearest').reshape(SH)
-    mean = (acc / len(LV)).astype(np.float64)
-    tc = nighres.shape.topology_correction(
-        nib.Nifti1Image(mean, np.eye(4)), 'signed_distance_function',
-        minimum_distance=1e-5, propagation='background->object', connectivity='6/18')
-    r = nighres.surface.levelset_to_mesh(tc['corrected'], connectivity='6/18')
-    tv, tf = r['result']['points'], r['result']['faces'].astype(int)
-    np.savez_compressed(cache, tv=tv, tf=tf)
-    log('joint template from %d levelsets, corrected once: %d vertices' % (len(LV), len(tv)), t0)
-    return tv, tf, Ah, SH
+    TV, TF, hemi, off = [], [], [], 0
+    for h in ('lh', 'rh'):
+        acc = np.zeros(SH, np.float64)
+        for (ti, m), lv in LV.items():
+            Mat = np.linalg.inv(SD[(ti, m)]['ref_img'].affine) @ np.linalg.inv(ltas[ti]) @ Ah
+            acc += map_coordinates(lv[h], (Mat @ hom)[:3], order=1,
+                                   mode='nearest').reshape(SH)
+        mean = (acc / len(LV)).astype(np.float64)
+        tc = nighres.shape.topology_correction(
+            nib.Nifti1Image(mean, np.eye(4)), 'signed_distance_function',
+            minimum_distance=1e-5, propagation='background->object', connectivity='6/18')
+        r = nighres.surface.levelset_to_mesh(tc['corrected'], connectivity='6/18')
+        v, f = r['result']['points'], r['result']['faces'].astype(int)
+        TV.append(v); TF.append(f + off); hemi.append(np.full(len(v), 0 if h == 'lh' else 1, np.int8))
+        off += len(v)
+    tv = np.vstack(TV); tf = np.vstack(TF); hemi = np.concatenate(hemi)
+    np.savez_compressed(cache, tv=tv, tf=tf, hemi=hemi)
+    log('joint template from %d levelsets, each hemisphere corrected and meshed '
+        'separately: %d + %d vertices' % (len(LV), len(TV[0]), len(TV[1])), t0)
+    return tv, tf, Ah, SH, hemi
 
 
 def project(v, lv, iters=10, max_step=1.0, grad_floor=0.3):
@@ -212,7 +247,7 @@ def project(v, lv, iters=10, max_step=1.0, grad_floor=0.3):
     return out
 
 
-def place_surfaces(SD, LV, tv, ltas, Ah, out, t0, tol=0.06):
+def place_surfaces(SD, LV, tv, ltas, Ah, out, t0, hemi, tol=0.06):
     """Template -> each native space by affine (exact), then project. Verifies
     that wmT reads ~0.5 at the placed vertices; a frame error shows up here as a
     plausible-looking but wrong number, so it is checked, not assumed."""
@@ -230,8 +265,17 @@ def place_surfaces(SD, LV, tv, ltas, Ah, out, t0, tol=0.06):
         # needs no other model at analysis time. The spread of the PROJECTED
         # surfaces understates it badly (median 0.023 mm), because projection has
         # already pulled every one of them onto its own valid boundary.
-        zz = np.abs(map_coordinates(LV[k], vn.T, order=1, mode='nearest'))
-        vp = project(vn, LV[k])
+        # each hemisphere is projected onto ITS OWN levelset: the two are
+        # separate objects now, and projecting a vertex onto the other
+        # hemisphere's boundary would silently cross the midline.
+        zz = np.empty(len(vn), np.float64)
+        vp = np.empty_like(vn)
+        for hi, h in enumerate(('lh', 'rh')):
+            m = hemi == hi
+            if not m.any():
+                continue
+            zz[m] = np.abs(map_coordinates(LV[k][h], vn[m].T, order=1, mode='nearest'))
+            vp[m] = project(vn[m], LV[k][h])
         dev[k] = np.linalg.norm(vp - vn, axis=1).astype(np.float32)
         dev[('levelset', ) + k] = zz.astype(np.float32)
         WV[k] = nib.affines.apply_affine(get_vox2ras_tkr(ref), vp)
@@ -592,8 +636,8 @@ def main(argv=None):
             % (i + 1, ang, np.linalg.norm(L[:3, 3])))
     keyed = {(ti, m): preps[(ti, m)] for ti in range(len(a.t1)) for m in a.models}
     SD, LV = build_natives(keyed, a.out, t0, nsmooth=a.nsmooth)
-    tv, tf, Ah, SH = joint_template(SD, LV, hw, ltas, a.out, t0)
-    WV, checks, dev = place_surfaces(SD, LV, tv, ltas, Ah, a.out, t0)
+    tv, tf, Ah, SH, hemi = joint_template(SD, LV, hw, ltas, a.out, t0)
+    WV, checks, dev = place_surfaces(SD, LV, tv, ltas, Ah, a.out, t0, hemi)
     SD = match_natives(SD, WV, tf, t0)
     PIAL, TRAV, THK = solve_cells(SD, WV, tf, a.models, a.out, t0,
                                   full=a.full, crop_margin=a.crop_margin)
@@ -603,6 +647,7 @@ def main(argv=None):
                         THK=THK, tf=tf, tv=tv, models=np.array(a.models),
                         WV=np.stack([np.stack([WV[(ti, m)] for m in a.models])
                                      for ti in range(len(a.t1))]).astype(np.float32),
+                        hemi=hemi,
                         **{'%s_labels' % k: v[0] for k, v in parc.items()},
                         **{'%s_agreement' % k: v[1] for k, v in parc.items()})
     json.dump(dict(frame_checks=checks, models=list(a.models), full=bool(a.full),

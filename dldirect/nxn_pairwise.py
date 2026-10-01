@@ -251,6 +251,50 @@ def place_surfaces(SD, LV, tv, ltas, Ah, out, t0, tol=0.06):
 
 
 # --------------------------------------------------------------------------
+# stage 4b: rebuild the scan's PV maps from the surface we will propagate from
+# --------------------------------------------------------------------------
+
+def match_natives(SD, WV, tf, t0):
+    """Re-rasterise seg/gmT/wmT from the PLACED template surface, per scan.
+
+    build_natives rasterises wmT from surface_seg's own mesh, but the
+    propagation starts from the template projected onto that scan, so the
+    velocity field is shaped around a boundary the starting surface does not sit
+    on. surface_seg's own `wm_surfaces` note records that this same mismatch
+    previously invalidated a 36-hemisphere comparison. It cannot be avoided in
+    build_natives -- the template does not exist until the levelsets have been
+    averaged -- so it is corrected here, in a second pass. Not circular: the
+    template is built from the original levelsets and only the PV maps the solve
+    consumes are rebuilt.
+
+    Measured on a Trio/mMR pair: WM Dice between the two boundaries is 0.989,
+    and the 1% that disagrees sits where the template and the per-scan mesh
+    diverge most -- the frontal and temporal poles, which is exactly where the
+    scanner map disagreed with an independently built surface and with
+    FreeSurfer 6 cross-sectional. Matching the boundary closes 92% (lh) and 53%
+    (rh) of the frontal-pole gap and moves the undisputed parcels by <=0.017 mm.
+    It also raises global thickness ~0.06 mm, so it is not scale-neutral.
+
+    The GM envelope is unchanged: pv_gm is recovered as gmT + wmT from the
+    original build and only the WM boundary is replaced.
+    """
+    from dldirect.field_pial_prototype import make_transforms, rasterize_mesh_pv
+    for key, d in SD.items():
+        gm = np.clip(np.asarray(d['gmT'], np.float32), 0, 1)
+        wm = np.clip(np.asarray(d['wmT'], np.float32), 0, 1)
+        pv_gm = np.clip(gm + wm, 0, 1)
+        tovox, _ = make_transforms(d['ref_img'])
+        shape = np.asarray(d['seg']).shape
+        pv_wm = np.clip(rasterize_mesh_pv(tovox(WV[key]), tf, shape, 3)
+                        .astype(np.float32), 0, 1)
+        d['seg'] = np.where(pv_wm > 0.5, 3, np.where(pv_gm > 0.5, 2, 0)).astype(np.uint8)
+        d['gmT'] = np.clip(pv_gm - pv_wm, 0, 1).astype(np.float32)
+        d['wmT'] = pv_wm
+    log('PV maps re-rasterised from the placed surfaces (%d scans)' % len(SD), t0)
+    return SD
+
+
+# --------------------------------------------------------------------------
 # stage 5: the solves
 # --------------------------------------------------------------------------
 
@@ -286,7 +330,7 @@ def solve_cells(SD, WV, tf, models, out, t0, full=False, crop_margin=4):
     THK = np.full((len(tps), n, n), np.nan)
     for ti in tps:
         for a, i in enumerate(models):
-            ck = os.path.join(out, 'cells_t%d_%s.npz' % (ti + 1, i))
+            ck = os.path.join(out, 'cells2_t%d_%s.npz' % (ti + 1, i))   # cells_* are pre-match_natives
             if os.path.exists(ck):
                 z = np.load(ck)
                 PIAL[ti, a] = z['PIAL']; TRAV[ti, a] = z['TRAV']; THK[ti, a] = z['THK']
@@ -550,6 +594,7 @@ def main(argv=None):
     SD, LV = build_natives(keyed, a.out, t0, nsmooth=a.nsmooth)
     tv, tf, Ah, SH = joint_template(SD, LV, hw, ltas, a.out, t0)
     WV, checks, dev = place_surfaces(SD, LV, tv, ltas, Ah, a.out, t0)
+    SD = match_natives(SD, WV, tf, t0)
     PIAL, TRAV, THK = solve_cells(SD, WV, tf, a.models, a.out, t0,
                                   full=a.full, crop_margin=a.crop_margin)
     parc = parcellate(keyed, WV, PIAL, list(a.models), a.out, t0)
